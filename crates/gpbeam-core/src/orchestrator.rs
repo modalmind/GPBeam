@@ -63,8 +63,34 @@ pub fn run_offload(
     let mut copied = 0usize;
     let mut failed = 0usize;
     let mut bytes = 0u64;
+    let mut skipped_recovered = 0usize;
 
     for (i, item) in plan.iter().enumerate() {
+        // Record-or-recover: a verified dest file may already exist from a prior
+        // run that crashed after copy+verify but before record() committed. The
+        // scanner, seeing that on-disk file, has already bumped `dest_path` to a
+        // `_1` collision name; the original verified file sits at the un-bumped
+        // `canonical_dest_path`. If that file is present with the expected byte
+        // length and the ledger has no matching row, adopt it (record) rather than
+        // re-copying under the `_1` suffix.
+        if !ledger.is_imported(serial_key, &item.name, item.size, item.mtime_unix)? {
+            if let Ok(meta) = std::fs::metadata(&item.canonical_dest_path) {
+                if meta.is_file() && meta.len() == item.size {
+                    ledger.record(
+                        serial_key,
+                        &item.name,
+                        item.size,
+                        item.mtime_unix,
+                        &item.canonical_dest_path.to_string_lossy(),
+                        None,
+                    )?;
+                    skipped_recovered += 1;
+                    emit(RunEvent::Skipped { file: item.name.clone() });
+                    continue;
+                }
+            }
+        }
+
         emit(RunEvent::Copying { file: item.name.clone(), index: i + 1, total });
         // M1: no streaming progress from the orchestrator (the UI Channel is M3).
         // Passing a no-op callback avoids borrowing `emit` twice. We emit one
@@ -72,10 +98,7 @@ pub fn run_offload(
         match copy_verified(&item.src, &item.dest_path, cfg.verify, &mut |_| {}) {
             Ok(out) => {
                 let n = out.bytes;
-                // KNOWN (deferred to M2): if this record() fails after a verified
-                // copy, the file is on disk but unrecorded; the next run re-copies
-                // it under a collision-suffixed name. Acceptable for M1.
-                let _imported_id = ledger.record(
+                ledger.record(
                     serial_key,
                     &item.name,
                     item.size,
@@ -95,6 +118,7 @@ pub fn run_offload(
         }
     }
 
+    let skipped = skipped + skipped_recovered;
     let summary = RunSummary { copied, skipped, failed, bytes };
     emit(RunEvent::RunComplete { copied, skipped, failed, bytes });
     Ok(summary)
@@ -172,6 +196,63 @@ mod tests {
         run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.skipped, 4);
+        assert_eq!(s2.copied, 0);
+    }
+
+    #[test]
+    fn unrecorded_verified_dest_is_adopted_not_recopied() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        // Plan the copies to learn the exact dest paths + bytes the scanner expects.
+        // Use the same serial/model `run_offload` derives from version.txt so the
+        // dedup key and resolved dest paths line up exactly.
+        let plan = crate::scanner::scan_card(
+            card.root(),
+            &cfg,
+            &ledger,
+            Some("C3461324500001"),
+            Some("HERO11"),
+        )
+        .unwrap();
+        assert!(!plan.is_empty(), "fixture must produce a non-empty plan");
+
+        // Pre-place every planned file at its dest path with identical bytes + mtime,
+        // simulating a previous run that copied+verified but crashed before record().
+        for item in &plan {
+            std::fs::copy(&item.src, &item.dest_path).unwrap();
+            let mtime = UNIX_EPOCH + Duration::from_secs(item.mtime_unix as u64);
+            filetime::set_file_mtime(
+                &item.dest_path,
+                filetime::FileTime::from_system_time(mtime),
+            )
+            .unwrap();
+        }
+        let before: usize = std::fs::read_dir(dest.path()).unwrap().count();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        // Adopted, not re-copied: 0 fresh copies, and the recovered files are recorded.
+        assert_eq!(summary.copied, 0, "files already on disk must be adopted, not re-copied");
+        assert_eq!(summary.failed, 0);
+        assert!(summary.skipped >= plan.len());
+
+        // No `_1` collision-suffixed duplicates were created.
+        let names: Vec<String> = std::fs::read_dir(dest.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.contains("_1.")), "no collision-suffixed copies: {names:?}");
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), before, "no new files on disk");
+
+        // Idempotent on a second run too.
+        let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.copied, 0);
     }
 }

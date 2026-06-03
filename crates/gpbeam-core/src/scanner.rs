@@ -16,6 +16,13 @@ pub struct PlannedCopy {
     pub mtime_unix: i64,
     pub dest_name: String,
     pub dest_path: PathBuf,
+    /// The rendered destination path BEFORE collision resolution (no `_N` suffix).
+    /// When a prior run copied+verified here but crashed before `record()`, the
+    /// next scan finds the file on disk and bumps `dest_path` to `_1`; this field
+    /// preserves the original target so the orchestrator can adopt (record) the
+    /// already-verified file instead of re-copying it. Equals `dest_path` when no
+    /// collision occurred.
+    pub canonical_dest_path: PathBuf,
 }
 
 /// Like `scan_card`, but also returns the count of files skipped because they
@@ -80,6 +87,9 @@ pub fn scan_with_skips(
 
             let cap: Captured = resolve_capture(&src, kind, mtime);
             let dest_name = render_name(&cfg.filename_template, &name, &cap, serial, model);
+            // The rendered target before any collision suffix — retained so the
+            // orchestrator can adopt a crashed-mid-run verified file at this path.
+            let canonical_dest_path = cfg.dest_root.join(&dest_name);
             // Resolve collisions against the real fs AND names already planned this run.
             let dest_path = resolve_collision(&cfg.dest_root, &dest_name, &used_names);
             used_names.insert(dest_path.clone());
@@ -97,6 +107,7 @@ pub fn scan_with_skips(
                     .unwrap()
                     .to_string(),
                 dest_path,
+                canonical_dest_path,
             });
         }
     }
