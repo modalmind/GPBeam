@@ -19,6 +19,7 @@ pub enum RunEvent {
     Skipped { file: String },
     Failed { file: String, error: String },
     CloudQueued { file: String },
+    CardFileDeleted { file: String },
     RunComplete { copied: usize, skipped: usize, failed: usize, bytes: u64 },
 }
 
@@ -151,6 +152,25 @@ pub fn run_offload(
                         )?;
                         queued += 1;
                         emit(RunEvent::CloudQueued { file: item.name.clone() });
+                    }
+                }
+
+                // delete-after-verify (opt-in, default OFF): once the file is
+                // verified locally, delete the card SOURCE for the non-Auto path.
+                // Under Auto, deletion is deferred to the cloud worker after the
+                // upload reaches Done (the card_src is retained on the queued job).
+                let mirror = cfg
+                    .cloud
+                    .as_ref()
+                    .map(|c| c.mirror_mode)
+                    .unwrap_or(MirrorMode::Off);
+                if cfg.delete_after_verify && should_delete_card(true, mirror) {
+                    match std::fs::remove_file(&item.src) {
+                        Ok(()) => emit(RunEvent::CardFileDeleted { file: item.name.clone() }),
+                        Err(e) => emit(RunEvent::Failed {
+                            file: item.name.clone(),
+                            error: format!("delete-after-verify failed: {e}"),
+                        }),
                     }
                 }
             }
@@ -351,6 +371,80 @@ mod tests {
         assert!(!should_delete_card(false, Off));
         assert!(!should_delete_card(false, Manual));
         assert!(!should_delete_card(false, Auto));
+    }
+
+    /// Copy a fixture card into a fresh writable tempdir so the test may delete
+    /// its "card source" files without touching the original fixture tempdir.
+    fn writable_card_copy(src: &std::path::Path) -> tempfile::TempDir {
+        let dst = tempfile::TempDir::new().unwrap();
+        copy_tree(src, dst.path());
+        dst
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn delete_after_verify_off_mirror_removes_card_source() {
+        let fixture = fixtures::hero11_card();
+        let card = writable_card_copy(fixture.root());
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.delete_after_verify = true; // mirror Off (cloud == None)
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let media = card.path().join("DCIM/100GOPRO/GX010001.MP4");
+        assert!(media.exists());
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.path(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        assert!(!media.exists(), "card source deleted after local verify");
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+    }
+
+    #[test]
+    fn delete_after_verify_auto_mirror_keeps_card_source() {
+        let fixture = fixtures::hero11_card();
+        let card = writable_card_copy(fixture.root());
+        let dest = fixtures::dest();
+        let mut cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Auto);
+        cfg.delete_after_verify = true; // but mirror == Auto -> defer to worker
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let media = card.path().join("DCIM/100GOPRO/GX010001.MP4");
+        let mut events = Vec::new();
+        run_offload(card.path(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert!(media.exists(), "Auto mirror must NOT delete inline; worker deletes after Done");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        // The card_src is recorded on the queued job for the worker to delete later.
+        let jobs = ledger.list_cloud_jobs(None).unwrap();
+        assert!(jobs.iter().all(|j| j.card_src.is_some()));
+    }
+
+    #[test]
+    fn delete_after_verify_off_when_flag_unset() {
+        let fixture = fixtures::hero11_card();
+        let card = writable_card_copy(fixture.root());
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf()); // delete_after_verify = false
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let media = card.path().join("DCIM/100GOPRO/GX010001.MP4");
+        run_offload(card.path(), &cfg, &mut ledger, &mut |_| {}).unwrap();
+        assert!(media.exists(), "deletion is opt-in; flag off keeps card source");
     }
 
     #[test]
