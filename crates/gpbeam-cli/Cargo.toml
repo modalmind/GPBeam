@@ -1,0 +1,8 @@
+[package]
+name = "gpbeam-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpbeam-core = { path = "../gpbeam-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
