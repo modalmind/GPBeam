@@ -24,7 +24,7 @@ fn split_config(args: &[String]) -> (Vec<String>, Option<PathBuf>) {
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (args, config) = split_config(&raw);
-    let usage = "usage: gpbeam-cli [--config <path>] offload <card> <dest> | watch <dest>";
+    let usage = "usage: gpbeam-cli [--config <path>] offload <card> <dest> | watch <dest> | mirror-status <dest> | retry-cloud <dest>";
 
     match args.first().map(|s| s.as_str()) {
         Some("offload") => {
@@ -62,6 +62,36 @@ async fn main() {
                 .await
                 {
                     eprintln!("error: {e}");
+                }
+            }
+        }
+        Some("mirror-status") => {
+            let Some(dest) = args.get(1) else {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            };
+            match gpbeam_cli::mirror_status_lines(&PathBuf::from(dest)) {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("retry-cloud") => {
+            let Some(dest) = args.get(1) else {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            };
+            match gpbeam_cli::retry_cloud(&PathBuf::from(dest)) {
+                Ok(n) => println!("[retry] re-queued {n} failed job(s)"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
                 }
             }
         }

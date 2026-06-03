@@ -208,3 +208,13 @@ pub fn mirror_status_lines(dest: &Path) -> Result<Vec<String>> {
     lines.push(format!("pending: {pending}"));
     Ok(lines)
 }
+
+/// Re-queue every terminally-`Failed` cloud job (one the worker gave up on:
+/// `next_retry_at IS NULL`) back to `Queued` with `attempts = 0`, so the next
+/// worker pass uploads it again. Opens its own Ledger at `dest` (pure ledger
+/// edit; no uploads). Returns how many jobs were re-queued.
+pub fn retry_cloud(dest: &Path) -> Result<usize> {
+    let lpath = ledger_path_for(dest);
+    let mut ledger = Ledger::open(&lpath)?;
+    ledger.requeue_failed_cloud_jobs()
+}

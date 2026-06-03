@@ -373,6 +373,21 @@ impl Ledger {
         )?;
         Ok(())
     }
+
+    /// Requeue every terminally-`Failed` cloud job (a `Failed` job whose
+    /// `next_retry_at` is NULL — i.e. the worker gave up): reset it to `Queued`
+    /// with `attempts = 0`, `next_retry_at = NULL`, and the error cleared, so the
+    /// next worker pass picks it up immediately. Failed-but-pending-retry jobs
+    /// (non-NULL `next_retry_at`) are left alone. Returns how many were requeued.
+    pub fn requeue_failed_cloud_jobs(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE cloud_jobs
+             SET state=?1, attempts=0, next_retry_at=NULL, last_error=NULL
+             WHERE state=?2 AND next_retry_at IS NULL",
+            rusqlite::params![JobState::Queued.as_str(), JobState::Failed.as_str()],
+        )?;
+        Ok(n)
+    }
 }
 
 /// Map a `cloud_jobs` row to a [`CloudJob`]. The SELECT column order is fixed
