@@ -1,5 +1,6 @@
+use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Layout {
@@ -89,6 +90,15 @@ impl Config {
     }
 }
 
+/// Read and parse a `gpbeam.toml` configuration file.
+///
+/// IO failures map to [`CoreError::Io`]; toml/serde parse failures map to
+/// [`CoreError::Config`].
+pub fn load_config(path: &Path) -> Result<Config> {
+    let text = std::fs::read_to_string(path).map_err(crate::error::io_at(path))?;
+    toml::from_str::<Config>(&text).map_err(|e| CoreError::Config(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +163,65 @@ mod tests {
             toml::from_str::<K>("v = \"nextcloud\"").unwrap().v,
             CloudKind::Nextcloud
         );
+    }
+
+    #[test]
+    fn load_config_parses_full_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let sample = r#"
+            dest_root = "/Users/alice/GPBeam"
+            filename_template = "{date}_{original}"
+            include_proxies = false
+            include_thumbnails = false
+            layout = "Flat"
+            verify = true
+            space_headroom = 1073741824
+            delete_after_verify = true
+            auto_eject = false
+
+            [cloud]
+            kind = "nextcloud"
+            destination_id = "nc1"
+            base_url = "https://cloud.example.com"
+            username = "alice"
+            remote_root = "GoPro"
+            mirror_mode = "auto"
+        "#;
+        std::fs::write(&path, sample).unwrap();
+
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.dest_root, PathBuf::from("/Users/alice/GPBeam"));
+        assert!(cfg.delete_after_verify);
+        assert!(!cfg.auto_eject);
+
+        let cloud = cfg.cloud.expect("cloud table present");
+        assert_eq!(cloud.kind, CloudKind::Nextcloud);
+        assert_eq!(cloud.destination_id, "nc1");
+        assert_eq!(cloud.base_url, "https://cloud.example.com");
+        assert_eq!(cloud.username, "alice");
+        assert_eq!(cloud.remote_root, "GoPro");
+        assert_eq!(cloud.mirror_mode, MirrorMode::Auto);
+        // chunk_threshold omitted in the sample -> defaults to 50 MiB.
+        assert_eq!(cloud.chunk_threshold, 50 * 1024 * 1024);
+        assert_eq!(cloud.max_concurrency, 2);
+        assert_eq!(cloud.max_attempts, 8);
+    }
+
+    #[test]
+    fn load_config_invalid_toml_maps_to_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is = = not valid toml").unwrap();
+        let err = load_config(&path).unwrap_err();
+        assert!(matches!(err, crate::error::CoreError::Config(_)));
+    }
+
+    #[test]
+    fn load_config_missing_file_maps_to_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        let err = load_config(&path).unwrap_err();
+        assert!(matches!(err, crate::error::CoreError::Io { .. }));
     }
 }
