@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use reqwest::{Body, Client, Method};
 use std::path::Path;
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::cloud::{CloudUploader, ResumeState, UploadOutcome};
@@ -107,6 +108,24 @@ pub(crate) fn read_etag(resp: &reqwest::Response) -> Option<String> {
         .or_else(|| resp.headers().get("etag"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
+}
+
+/// Chunk upper bound used to size parts (5 MiB), and the hard cap of 10000 parts.
+pub(crate) const CHUNK_SIZE: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_CHUNKS: u32 = 10_000;
+
+/// Zero-padded width-5 chunk name so lexical sort == numeric sort (00001..10000).
+pub(crate) fn chunk_name(n: u32) -> String {
+    format!("{n:05}")
+}
+
+/// Pick a chunk size so the file fits in <= MAX_CHUNKS parts (>= CHUNK_SIZE floor).
+pub(crate) fn pick_chunk_size(total: u64) -> u64 {
+    let mut size = CHUNK_SIZE;
+    while total.div_ceil(size) > MAX_CHUNKS as u64 {
+        size *= 2;
+    }
+    size
 }
 
 /// Percent-encode each path segment, preserving the `/` separators. Encodes
@@ -383,6 +402,170 @@ impl NextcloudUploader {
     }
 }
 
+#[allow(dead_code)]
+impl NextcloudUploader {
+    /// Chunked upload (Nextcloud chunking v2). MKCOL the upload dir, PUT each
+    /// numbered part with `Destination` + `OC-Total-Length`, then MOVE `.file`
+    /// to the final path. `progress` reports cumulative uploaded bytes.
+    pub(crate) async fn put_chunked(
+        &self,
+        local: &Path,
+        remote_rel: &str,
+        total: u64,
+        resume: Option<ResumeState>,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<UploadOutcome> {
+        let dest = files_url(&self.base_url, &self.username, remote_rel);
+
+        // Determine upload id (reuse on resume; fresh otherwise).
+        let upload_id = match resume.as_ref().and_then(|r| r.upload_id.clone()) {
+            Some(id) => id,
+            None => format!("gpbeam-{}", uuid::Uuid::new_v4()),
+        };
+        let dir = uploads_url(&self.base_url, &self.username, &upload_id, None);
+
+        // Which chunks are already present (Task 2.8 fills this from PROPFIND).
+        let present = self.resume_present_chunks(&dir, resume.as_ref()).await?;
+
+        // MKCOL the upload dir unless we're resuming into an existing one.
+        if present.is_empty() {
+            self.mkcol_upload_dir(&dir, &dest).await?;
+        }
+
+        let chunk_size = pick_chunk_size(total);
+        let n_chunks = total.div_ceil(chunk_size).max(1) as u32;
+        let mut uploaded: u64 = 0;
+
+        for i in 1..=n_chunks {
+            let offset = (i as u64 - 1) * chunk_size;
+            let len = chunk_size.min(total - offset);
+            if present.get(&i).copied() == Some(len) {
+                // Already fully stored — count it and skip.
+                uploaded += len;
+                progress(uploaded);
+                continue;
+            }
+            self.put_chunk(&dir, &dest, i, local, offset, len, total)
+                .await?;
+            uploaded += len;
+            progress(uploaded);
+        }
+
+        let etag = self.move_assemble(&dir, &dest, total, local).await?;
+        Ok(UploadOutcome {
+            remote_ref: remote_rel.to_string(),
+            bytes: total,
+            etag,
+        })
+    }
+
+    async fn mkcol_upload_dir(&self, dir: &str, dest: &str) -> Result<()> {
+        let method = Method::from_bytes(b"MKCOL").expect("valid method");
+        let resp = self
+            .client
+            .request(method, dir)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header("Destination", dest)
+            .send()
+            .await
+            .map_err(transport_err)?;
+        match resp.status().as_u16() {
+            201 | 405 => Ok(()),
+            401 => Err(CoreError::CloudAuth(
+                "MKCOL upload dir rejected (401)".into(),
+            )),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("MKCOL {dir} -> {s}"),
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_chunk(
+        &self,
+        dir: &str,
+        dest: &str,
+        part: u32,
+        local: &Path,
+        offset: u64,
+        len: u64,
+        total: u64,
+    ) -> Result<()> {
+        let url = format!("{dir}/{}", chunk_name(part));
+        let mut file = File::open(local).await.map_err(|e| CoreError::Io {
+            path: local.to_path_buf(),
+            source: e,
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| CoreError::Io {
+                path: local.to_path_buf(),
+                source: e,
+            })?;
+        let limited = file.take(len);
+        let body = Body::wrap_stream(ReaderStream::new(limited));
+
+        let resp = self
+            .client
+            .put(&url)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header("Destination", dest)
+            .header("OC-Total-Length", total.to_string())
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(body)
+            .send()
+            .await
+            .map_err(transport_err)?;
+        match resp.status().as_u16() {
+            201 | 204 => Ok(()),
+            401 => Err(CoreError::CloudAuth("chunk PUT rejected (401)".into())),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("PUT chunk {url} -> {s}"),
+            }),
+        }
+    }
+
+    async fn move_assemble(
+        &self,
+        dir: &str,
+        dest: &str,
+        total: u64,
+        local: &Path,
+    ) -> Result<Option<String>> {
+        let url = format!("{dir}/.file");
+        let method = Method::from_bytes(b"MOVE").expect("valid method");
+        let mut req = self
+            .client
+            .request(method, &url)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header("Destination", dest)
+            .header("OC-Total-Length", total.to_string());
+        if let Some(m) = mtime_secs(local) {
+            req = req.header("X-OC-Mtime", m.to_string());
+        }
+        let resp = req.send().await.map_err(transport_err)?;
+        match resp.status().as_u16() {
+            201 | 204 => Ok(read_etag(&resp)),
+            401 => Err(CoreError::CloudAuth("MOVE rejected (401)".into())),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("MOVE {url} -> {s}"),
+            }),
+        }
+    }
+
+    /// Stubbed for Task 2.7; real PROPFIND-based resume logic added in Task 2.8.
+    async fn resume_present_chunks(
+        &self,
+        _dir: &str,
+        _resume: Option<&ResumeState>,
+    ) -> Result<std::collections::HashMap<u32, u64>> {
+        Ok(std::collections::HashMap::new())
+    }
+}
+
 /// Map a reqwest transport error to a retryable `Http { status: None, .. }`.
 pub(crate) fn transport_err(e: reqwest::Error) -> CoreError {
     CoreError::Http { status: None, msg: e.to_string() }
@@ -636,5 +819,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.etag.as_deref(), Some("\"e2\""));
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::header_exists;
+    use wiremock::{Match, Request};
+
+    /// Custom matcher: assert the chunk PUT carries Destination + OC-Total-Length.
+    struct ChunkHeadersOk {
+        expected_total: u64,
+        seen_dest: Arc<AtomicU64>, // 1 if Destination header present and correct
+    }
+    impl Match for ChunkHeadersOk {
+        fn matches(&self, req: &Request) -> bool {
+            let dest_ok = req
+                .headers
+                .get("destination")
+                .map(|v| {
+                    v.to_str()
+                        .unwrap_or("")
+                        .contains("/remote.php/dav/files/alice/GoPro/big.mp4")
+                })
+                .unwrap_or(false);
+            let total_ok = req
+                .headers
+                .get("oc-total-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(self.expected_total);
+            if dest_ok && total_ok {
+                self.seen_dest.store(1, Ordering::SeqCst);
+            }
+            dest_ok && total_ok
+        }
+    }
+
+    #[tokio::test]
+    async fn put_chunked_mkcol_put_move_201() {
+        let server = MockServer::start().await;
+        let total: u64 = 12 * 1024 * 1024; // > 5 MiB => 3 chunks at 5 MiB
+        let seen = Arc::new(AtomicU64::new(0));
+
+        // MKCOL upload dir.
+        Mock::given(wm_method("MKCOL"))
+            .and(header_exists("Destination"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Chunk PUTs with required headers.
+        Mock::given(wm_method("PUT"))
+            .and(ChunkHeadersOk {
+                expected_total: total,
+                seen_dest: seen.clone(),
+            })
+            .respond_with(ResponseTemplate::new(201))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        // MOVE .file -> final.
+        Mock::given(wm_method("MOVE"))
+            .and(header_exists("Destination"))
+            .and(header("OC-Total-Length", total.to_string()))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"chunked-etag\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let f = tmp_file(&vec![7u8; total as usize]);
+        let mut last = 0u64;
+        let mut cb = |n: u64| last = n;
+
+        let out = up
+            .put_chunked(f.path(), "GoPro/big.mp4", total, None, &mut cb)
+            .await
+            .unwrap();
+
+        assert_eq!(out.bytes, total);
+        assert_eq!(out.etag.as_deref(), Some("\"chunked-etag\""));
+        assert_eq!(last, total, "progress reached total");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "Destination+OC-Total-Length asserted on a chunk PUT"
+        );
     }
 }
