@@ -275,23 +275,89 @@ impl NextcloudUploader {
     ) -> Result<UploadOutcome> {
         let url = files_url(&self.base_url, &self.username, remote_rel);
         let resp = self.send_put(local, &url, total).await?;
-        match resp.status().as_u16() {
-            201 | 204 => {
-                progress(total);
-                Ok(UploadOutcome {
-                    remote_ref: remote_rel.to_string(),
-                    bytes: total,
-                    etag: read_etag(&resp),
-                })
-            }
-            401 => Err(CoreError::CloudAuth(
-                "PUT rejected (401); generate a Nextcloud app password".into(),
-            )),
-            s => Err(CoreError::Http {
-                status: Some(s),
-                msg: format!("PUT {url} -> {s}"),
-            }),
+        let status = resp.status().as_u16();
+        if status == 201 || status == 204 {
+            progress(total);
+            return Ok(UploadOutcome {
+                remote_ref: remote_rel.to_string(),
+                bytes: total,
+                etag: read_etag(&resp),
+            });
         }
+        if status == 409 || status == 404 {
+            // Parent collection(s) missing on a server without AutoMkcol — create
+            // them top-down and retry the PUT exactly once.
+            self.mkcol_parents(remote_rel).await?;
+            let resp2 = self.send_put(local, &url, total).await?;
+            return match resp2.status().as_u16() {
+                201 | 204 => {
+                    progress(total);
+                    Ok(UploadOutcome {
+                        remote_ref: remote_rel.to_string(),
+                        bytes: total,
+                        etag: read_etag(&resp2),
+                    })
+                }
+                401 => Err(CoreError::CloudAuth(
+                    "PUT rejected (401); generate a Nextcloud app password".into(),
+                )),
+                s => Err(CoreError::Http {
+                    status: Some(s),
+                    msg: format!("PUT (retry) {url} -> {s}"),
+                }),
+            };
+        }
+        if status == 401 {
+            return Err(CoreError::CloudAuth(
+                "PUT rejected (401); generate a Nextcloud app password".into(),
+            ));
+        }
+        Err(CoreError::Http {
+            status: Some(status),
+            msg: format!("PUT {url} -> {status}"),
+        })
+    }
+
+    /// MKCOL each ancestor collection of `remote_rel`, top-down. Treats 201
+    /// (created) and 405 (already exists) as success.
+    async fn mkcol_parents(&self, remote_rel: &str) -> Result<()> {
+        let mut prefix = String::new();
+        let segs: Vec<&str> = remote_rel.split('/').collect();
+        // Skip the last segment (the file itself).
+        for seg in &segs[..segs.len().saturating_sub(1)] {
+            if seg.is_empty() {
+                continue;
+            }
+            if prefix.is_empty() {
+                prefix = (*seg).to_string();
+            } else {
+                prefix = format!("{prefix}/{seg}");
+            }
+            let url = files_url(&self.base_url, &self.username, &prefix);
+            let method = Method::from_bytes(b"MKCOL").expect("valid method");
+            let resp = self
+                .client
+                .request(method, &url)
+                .basic_auth(&self.username, Some(&self.app_password))
+                .send()
+                .await
+                .map_err(transport_err)?;
+            match resp.status().as_u16() {
+                201 | 405 => {}
+                401 => {
+                    return Err(CoreError::CloudAuth(
+                        "MKCOL rejected (401); generate a Nextcloud app password".into(),
+                    ))
+                }
+                s => {
+                    return Err(CoreError::Http {
+                        status: Some(s),
+                        msg: format!("MKCOL {url} -> {s}"),
+                    })
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Build and send one streaming PUT. Shared by put_simple and the AutoMkcol retry.
@@ -527,5 +593,48 @@ mod tests {
         assert_eq!(out.bytes, total);
         assert_eq!(out.etag.as_deref(), Some("\"etag-1\""));
         assert_eq!(seen, total);
+    }
+
+    #[tokio::test]
+    async fn put_simple_409_then_mkcol_then_retry_ok() {
+        let server = MockServer::start().await;
+
+        // First PUT: parent missing -> 409 (scoped to a single call).
+        let _guard = Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/sub/clip.mp4"))
+            .respond_with(ResponseTemplate::new(409))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // MKCOL of each parent collection succeeds (201). Tolerates repeats.
+        Mock::given(wm_method("MKCOL"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("MKCOL"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/sub"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        // Retry PUT now succeeds.
+        Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/sub/clip.mp4"))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"e2\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let f = tmp_file(b"data");
+        let mut cb = |_n: u64| {};
+        let out = up
+            .put_simple(f.path(), "GoPro/sub/clip.mp4", 4, &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.etag.as_deref(), Some("\"e2\""));
     }
 }
