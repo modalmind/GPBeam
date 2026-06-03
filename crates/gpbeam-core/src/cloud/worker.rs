@@ -1,7 +1,7 @@
 use crate::backoff::backoff_delay;
 use crate::cloud::{CloudEvent, CloudUploader, ResumeState, UploadOutcome};
 use crate::error::{is_retryable, Result};
-use crate::ledger::{CloudJob, Ledger};
+use crate::ledger::{CloudJob, JobState, Ledger};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -156,13 +156,65 @@ impl CloudWorker {
         Ok(terminal)
     }
 
-    /// Loop `run_once` until no cloud jobs remain. Implemented in Task 3.5.
+    /// Loop `run_once` until no cloud jobs remain. When a pass makes no terminal
+    /// progress but jobs are still pending (parked in `Failed` awaiting a future
+    /// `next_retry_at`), sleep until the nearest retry is due before looping
+    /// again, so the loop never busy-spins.
     pub async fn run_until_drained(
         &self,
-        _emit: &mut (dyn FnMut(CloudEvent) + Send),
+        emit: &mut (dyn FnMut(CloudEvent) + Send),
     ) -> Result<()> {
-        Ok(()) // stub — replaced in Task 3.5
+        loop {
+            // Are there any jobs left to do (Queued or retry-due/parked Failed)?
+            let pending = {
+                let ledger = Ledger::open(&self.ledger_path)?;
+                ledger.pending_cloud_count()?
+            };
+            if pending == 0 {
+                return Ok(());
+            }
+
+            let now = now_unix();
+            let terminal = self.run_once(now, emit).await?;
+
+            if terminal == 0 {
+                // No job became terminal this pass. Either nothing was due yet
+                // (all parked Failed with a future next_retry_at) or all due jobs
+                // got rescheduled. Sleep until the soonest retry to avoid spinning.
+                let sleep_secs = self.secs_until_next_retry(now)?;
+                if let Some(secs) = sleep_secs {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                } else {
+                    // Pending but nothing due and no retry time known: yield once,
+                    // then re-check. Prevents a hot loop in degenerate states.
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
     }
+
+    /// Seconds until the soonest `next_retry_at` among parked Failed jobs that are
+    /// still in the future relative to `now`. `None` if nothing is scheduled.
+    fn secs_until_next_retry(&self, now: i64) -> Result<Option<u64>> {
+        let ledger = Ledger::open(&self.ledger_path)?;
+        let failed = ledger.list_cloud_jobs(Some(JobState::Failed))?;
+        let soonest = failed
+            .iter()
+            .filter_map(|j| j.next_retry_at)
+            .filter(|&t| t > now)
+            .min();
+        Ok(soonest.map(|t| (t - now).max(0) as u64))
+    }
+}
+
+/// Current Unix time in seconds. Isolated so production code has a single
+/// clock source; tests drive `run_once` with explicit timestamps instead.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -504,5 +556,53 @@ mod tests {
             assert_eq!(done[0].uploaded_bytes, 100_000);
             assert_eq!(l.pending_cloud_count().unwrap(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn run_until_drained_finishes_all_queued_jobs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let (id_a, id_b) = {
+            let mut l = Ledger::open(&path).unwrap();
+            let imp_a = l
+                .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", Some("h"))
+                .unwrap();
+            let imp_b = l
+                .record("C346", "GX010002.MP4", 8192, 1001, "/dest/GX010002.MP4", Some("h"))
+                .unwrap();
+            let a = l
+                .enqueue_cloud_job(imp_a, "nc1", "/dest/GX010001.MP4", "GX010001.MP4", 4096, None)
+                .unwrap();
+            let b = l
+                .enqueue_cloud_job(imp_b, "nc1", "/dest/GX010002.MP4", "GX010002.MP4", 8192, None)
+                .unwrap();
+            (a, b)
+        };
+
+        // Always succeeds; behavior round-robins the last entry across both jobs.
+        let uploader = Arc::new(MockUploader::ok(0)); // 0 => report `total`
+        // max_concurrency = 1 forces TWO run_once passes, exercising the loop.
+        let worker = CloudWorker::new(path.clone(), uploader.clone(), "nc1".into(), 1, 8, false);
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        worker
+            .run_until_drained(&mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0, "queue fully drained");
+        let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
+        let done_ids: Vec<i64> = done.iter().map(|j| j.id).collect();
+        assert!(done_ids.contains(&id_a));
+        assert!(done_ids.contains(&id_b));
+        assert_eq!(done.len(), 2);
+
+        // Both files mirrored.
+        let mirrored = events
+            .iter()
+            .filter(|e| matches!(e, CloudEvent::Mirrored { .. }))
+            .count();
+        assert_eq!(mirrored, 2);
     }
 }
