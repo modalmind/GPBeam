@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub mod nextcloud;
+pub mod worker;
 
 /// Per-job resume cursor for chunked uploads. Persisted as JSON TEXT in
 /// `cloud_jobs.resume_state`.
