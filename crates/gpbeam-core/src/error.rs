@@ -6,6 +6,8 @@ pub enum CoreError {
     Io { path: PathBuf, #[source] source: std::io::Error },
     #[error("db error: {0}")]
     Db(#[from] rusqlite::Error),
+    /// Reserved for a future strict mode. M1 reports non-GoPro volumes via
+    /// `RunEvent::NotGoPro` and returns an empty summary instead of this error.
     #[error("not a GoPro card: {0}")]
     NotGoProCard(PathBuf),
     #[error("insufficient space on destination: need {need} bytes, have {have}")]

@@ -46,7 +46,7 @@ pub fn run_offload(
         .map(|m| m.to_string());
     emit(RunEvent::CardDetected { model: model.clone(), serial: serial.clone() });
 
-    let (plan, skipped) = scan_with_skips(card_root, cfg, ledger, serial.as_deref())?;
+    let (plan, skipped) = scan_with_skips(card_root, cfg, ledger, serial.as_deref(), model.as_deref())?;
     let total_bytes: u64 = plan.iter().map(|p| p.size).sum();
     emit(RunEvent::Scanned { new_files: plan.len(), total_bytes });
 
@@ -72,6 +72,9 @@ pub fn run_offload(
         match copy_verified(&item.src, &item.dest_path, cfg.verify, &mut |_| {}) {
             Ok(out) => {
                 let n = out.bytes;
+                // KNOWN (deferred to M2): if this record() fails after a verified
+                // copy, the file is on disk but unrecorded; the next run re-copies
+                // it under a collision-suffixed name. Acceptable for M1.
                 ledger.record(serial_key, &item.name, item.size, item.mtime_unix,
                               &item.dest_path.to_string_lossy(), out.hash.as_deref())?;
                 bytes += n;
@@ -92,6 +95,7 @@ pub fn run_offload(
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)]
 #[path = "../tests/fixtures.rs"]
 mod fixtures;
 

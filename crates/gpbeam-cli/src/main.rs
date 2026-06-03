@@ -29,6 +29,7 @@ fn print_event(e: RunEvent) {
 }
 
 fn offload_once(card: PathBuf, dest: PathBuf) -> Result<(), String> {
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     let cfg = Config::new(dest);
     let mut ledger = Ledger::open(&ledger_path()).map_err(|e| e.to_string())?;
     run_offload(&card, &cfg, &mut ledger, &mut print_event).map_err(|e| e.to_string())?;
@@ -57,7 +58,11 @@ async fn main() {
             while let Some(mount) = rx.recv().await {
                 println!("[watch] volume mounted: {}", mount.display());
                 let dest = dest.clone();
-                if let Err(e) = offload_once(mount, dest) { eprintln!("error: {e}"); }
+                match tokio::task::spawn_blocking(move || offload_once(mount, dest)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("error: {e}"),
+                    Err(e) => eprintln!("task error: {e}"),
+                }
             }
         }
         _ => { eprintln!("{usage}"); std::process::exit(2); }

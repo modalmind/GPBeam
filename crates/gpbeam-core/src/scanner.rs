@@ -25,6 +25,7 @@ pub fn scan_with_skips(
     cfg: &Config,
     ledger: &Ledger,
     serial: Option<&str>,
+    model: Option<&str>,
 ) -> Result<(Vec<PlannedCopy>, usize)> {
     let dcim = card_root.join("DCIM");
     let mut plan: Vec<PlannedCopy> = Vec::new();
@@ -78,7 +79,7 @@ pub fn scan_with_skips(
             }
 
             let cap: Captured = resolve_capture(&src, kind, mtime);
-            let dest_name = render_name(&cfg.filename_template, &name, &cap, serial, None);
+            let dest_name = render_name(&cfg.filename_template, &name, &cap, serial, model);
             // Resolve collisions against the real fs AND names already planned this run.
             let dest_path = resolve_collision(&cfg.dest_root, &dest_name, &used_names);
             used_names.insert(dest_path.clone());
@@ -110,11 +111,13 @@ pub fn scan_card(
     cfg: &Config,
     ledger: &Ledger,
     serial: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Vec<PlannedCopy>> {
-    Ok(scan_with_skips(card_root, cfg, ledger, serial)?.0)
+    Ok(scan_with_skips(card_root, cfg, ledger, serial, model)?.0)
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)]
 #[path = "../tests/fixtures.rs"]
 mod fixtures;
 
@@ -129,7 +132,7 @@ mod tests {
         let dest = fixtures::dest();
         let cfg = Config::new(dest.path().to_path_buf());
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"GX010001.MP4"));
         assert!(names.contains(&"GS010003.360"));
@@ -145,7 +148,7 @@ mod tests {
         let mut cfg = Config::new(dest.path().to_path_buf());
         cfg.include_proxies = true;
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert!(plan.iter().any(|p| p.name.ends_with(".LRV")));
     }
 
@@ -155,7 +158,7 @@ mod tests {
         let dest = fixtures::dest();
         let cfg = Config::new(dest.path().to_path_buf());
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         let mp4 = plan.iter().find(|p| p.name == "GX010001.MP4").unwrap();
         // default template {date}_{original}; date derived from mtime (varies), so just check shape
         assert!(mp4.dest_name.ends_with("_GX010001.MP4"));
@@ -169,7 +172,7 @@ mod tests {
         let mut cfg = Config::new(dest.path().to_path_buf());
         cfg.include_thumbnails = true;
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert!(plan.iter().any(|p| p.name.ends_with(".THM")));
     }
 
@@ -182,7 +185,7 @@ mod tests {
         let dest = fixtures::dest();
         let cfg = Config::new(dest.path().to_path_buf());
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346"), None).unwrap();
         assert!(plan.iter().any(|p| p.name == "GX010001.XYZ"), "unknown media must still be copied");
     }
 
@@ -197,7 +200,7 @@ mod tests {
         let dest = fixtures::dest();
         let cfg = Config::new(dest.path().to_path_buf());
         let ledger = Ledger::open_in_memory().unwrap();
-        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346"), None).unwrap();
         let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"GX010001.MP4"));
         assert!(!names.contains(&"IMG_0001.JPG"), "non-GoPro DCIM folders must be ignored");
@@ -215,7 +218,7 @@ mod tests {
         let mtime = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         ledger.record("C346", "GX010001.MP4", md.len(), mtime, "/old", None).unwrap();
 
-        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
         assert!(plan.iter().any(|p| p.name == "GS010003.360")); // others still planned
     }
@@ -230,8 +233,19 @@ mod tests {
         let md = std::fs::metadata(&src).unwrap();
         let mtime = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         ledger.record("C346", "GX010001.MP4", md.len(), mtime, "/old", None).unwrap();
-        let (plan, skipped) = scan_with_skips(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        let (plan, skipped) = scan_with_skips(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert_eq!(skipped, 1);
         assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
+    }
+
+    #[test]
+    fn dest_name_uses_model_token() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.filename_template = "{model}_{original}".into();
+        let ledger = Ledger::open_in_memory().unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
+        assert!(plan.iter().any(|p| p.dest_name == "HERO11_GX010001.MP4"));
     }
 }

@@ -131,6 +131,7 @@ pub fn hero_group_key(stem: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)]
 #[path = "../tests/fixtures.rs"]
 mod fixtures;
 
