@@ -3,16 +3,14 @@
 //! offload + cloud-mirror orchestration lives here so integration tests can
 //! drive it directly.
 
-use gpbeam_core::cloud::nextcloud::NextcloudUploader;
 use gpbeam_core::cloud::worker::CloudWorker;
-use gpbeam_core::cloud::CloudEvent;
+use gpbeam_core::cloud::{build_uploader, CloudEvent};
 use gpbeam_core::config::{Config, MirrorMode};
-use gpbeam_core::credentials::{CredentialStore, EnvConfigStore};
+use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::error::{CoreError, Result};
 use gpbeam_core::ledger::{CloudJob, JobState, Ledger};
 use gpbeam_core::orchestrator::{run_offload, RunEvent};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Where the SQLite ledger lives for a given destination root. The async cloud
 /// worker opens its OWN connection to this same file (WAL + busy_timeout handle
@@ -103,6 +101,39 @@ pub fn load_or_default_config(dest: &Path, config_path: Option<&Path>) -> Result
     }
 }
 
+/// Build the async `CloudWorker` for a loaded config, or `Ok(None)` when no
+/// `[cloud]` section is configured. Shared by `run_offload_and_mirror` (Auto
+/// drain after offload) and `run_mirror` (on-demand drain regardless of mode),
+/// so the uploader + worker wiring lives in exactly one place.
+///
+/// Credentials come from the SAME toml bytes the config was parsed from, with
+/// `GPBEAM_NC_*` env overrides (Contract C5). The uploader is built via
+/// `gpbeam_core::cloud::build_uploader` (which does the secret lookup), and the
+/// worker carries `cfg.delete_after_verify` (Contract C4).
+fn build_cloud_worker(
+    cfg: &Config,
+    toml_text: &str,
+    ledger_path: PathBuf,
+) -> Result<Option<CloudWorker>> {
+    let Some(cloud) = cfg.cloud.as_ref() else {
+        return Ok(None);
+    };
+    let store = EnvConfigStore::from_toml_str(
+        toml_text,
+        std::env::var("GPBEAM_NC_USERNAME").ok(),
+        std::env::var("GPBEAM_NC_APP_PASSWORD").ok(),
+    )?;
+    let uploader = build_uploader(cloud, &store)?;
+    Ok(Some(CloudWorker::new(
+        ledger_path,
+        uploader,
+        cloud.destination_id.clone(),
+        cloud.max_concurrency,
+        cloud.max_attempts,
+        cfg.delete_after_verify,
+    )))
+}
+
 /// Run one synchronous offload pass and, when the config requests Auto cloud
 /// mirroring, drain the cloud upload queue. `emit` receives one preformatted
 /// line per event from both the sync and async phases.
@@ -145,35 +176,47 @@ pub async fn run_offload_and_mirror(
             .map_err(|e| CoreError::Config(format!("offload task panicked: {e}")))??;
     }
 
-    // --- Async cloud mirror, only for Auto mode with a configured cloud. ---
+    // --- Async cloud mirror, only for Auto mode with a configured cloud.
+    //     Manual-queued jobs are flushed on demand by `run_mirror`. ---
     let Some(cloud) = cfg.cloud.as_ref() else {
         return Ok(());
     };
     if cloud.mirror_mode != MirrorMode::Auto {
         return Ok(());
     }
+    let Some(worker) = build_cloud_worker(&cfg, &toml_text, lpath)? else {
+        return Ok(());
+    };
+    worker
+        .run_until_drained(&mut |ev: CloudEvent| emit(format_cloud_event(&ev)))
+        .await?;
+    Ok(())
+}
 
-    // Credentials come from the SAME toml bytes, with env overrides (C5).
-    let store = EnvConfigStore::from_toml_str(
-        &toml_text,
-        std::env::var("GPBEAM_NC_USERNAME").ok(),
-        std::env::var("GPBEAM_NC_APP_PASSWORD").ok(),
-    )?;
-    let secret = store.get(&cloud.destination_id)?.ok_or_else(|| {
-        CoreError::Config(format!(
-            "no credentials for destination '{}'",
-            cloud.destination_id
-        ))
-    })?;
-    let uploader = NextcloudUploader::new(cloud, &secret)?;
-    let worker = CloudWorker::new(
-        lpath,
-        Arc::new(uploader),
-        cloud.destination_id.clone(),
-        cloud.max_concurrency,
-        cloud.max_attempts,
-        cfg.delete_after_verify,
-    );
+/// Flush the cloud upload queue ON DEMAND: build the worker from the CLI cloud
+/// config + safety flags (the SAME path `run_offload_and_mirror` uses) and
+/// `run_until_drained` to drain ALL pending jobs, irrespective of the
+/// `mirror_mode` (Auto or Manual). This is what makes `MirrorMode::Manual`
+/// usable — jobs the orchestrator enqueued (but never auto-drained) get
+/// uploaded here. `emit` receives one preformatted line per `CloudEvent`.
+///
+/// Returns `CoreError::Config` when the config has no `[cloud]` section, since
+/// there is nothing to flush to.
+pub async fn run_mirror(
+    dest: &Path,
+    config_path: Option<&Path>,
+    flags: &SafetyFlags,
+    emit: &mut (dyn FnMut(String) + Send),
+) -> Result<()> {
+    let (mut cfg, toml_text) = load_or_default_config(dest, config_path)?;
+    apply_safety_overrides(&mut cfg, flags);
+    let lpath = ledger_path_for(dest);
+
+    let Some(worker) = build_cloud_worker(&cfg, &toml_text, lpath)? else {
+        return Err(CoreError::Config(
+            "no [cloud] destination configured; nothing to mirror".into(),
+        ));
+    };
     worker
         .run_until_drained(&mut |ev: CloudEvent| emit(format_cloud_event(&ev)))
         .await?;

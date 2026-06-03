@@ -25,7 +25,7 @@ async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (after_config, config) = split_config(&raw);
     let (args, flags) = gpbeam_cli::parse_safety_flags(&after_config);
-    let usage = "usage: gpbeam-cli [--config <path>] [--delete-after-verify] [--auto-eject] offload <card> <dest> | watch <dest> | mirror-status <dest> | retry-cloud <dest>";
+    let usage = "usage: gpbeam-cli [--config <path>] [--delete-after-verify] [--auto-eject] offload <card> <dest> | watch <dest> | mirror <dest> | mirror-status <dest> | retry-cloud <dest>";
 
     match args.first().map(|s| s.as_str()) {
         Some("offload") => {
@@ -65,6 +65,20 @@ async fn main() {
                 {
                     eprintln!("error: {e}");
                 }
+            }
+        }
+        Some("mirror") => {
+            let Some(dest) = args.get(1) else {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            };
+            let dest = PathBuf::from(dest);
+            if let Err(e) =
+                gpbeam_cli::run_mirror(&dest, config.as_deref(), &flags, &mut |l| println!("{l}"))
+                    .await
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
         Some("mirror-status") => {
