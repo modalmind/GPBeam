@@ -4,8 +4,10 @@ use crate::config::CloudConfig;
 use crate::credentials::Secret;
 use crate::error::{CoreError, Result};
 use async_trait::async_trait;
-use reqwest::{Client, Method};
+use reqwest::{Body, Client, Method};
 use std::path::Path;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 
 use crate::cloud::{CloudUploader, ResumeState, UploadOutcome};
 
@@ -64,6 +66,47 @@ fn local_name_eq(qname: &[u8], local: &[u8]) -> bool {
         None => qname,
     };
     tail == local
+}
+
+/// Lowercase-hex md5 of a file's contents, for the `OC-Checksum` metadata header.
+///
+/// First consumed by `send_put`/`put_simple`; wired into the public `upload`
+/// dispatcher in Task 2.9, so `allow(dead_code)` keeps the incremental build
+/// warning-clean until then.
+#[allow(dead_code)]
+pub(crate) fn md5_hex_of(path: &Path) -> Result<String> {
+    use md5::{Digest, Md5};
+    let bytes = std::fs::read(path).map_err(|e| CoreError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let mut hasher = Md5::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// File mtime as Unix seconds (positive int), if available.
+#[allow(dead_code)]
+pub(crate) fn mtime_secs(path: &Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let secs = dur.as_secs() as i64;
+    if secs > 0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+/// Read the `OC-ETag` (or `ETag`) header from a response.
+#[allow(dead_code)]
+pub(crate) fn read_etag(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("oc-etag")
+        .or_else(|| resp.headers().get("etag"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
 }
 
 /// Percent-encode each path segment, preserving the `/` separators. Encodes
@@ -212,6 +255,65 @@ impl NextcloudUploader {
                 msg: format!("PROPFIND {url} -> {s}"),
             }),
         }
+    }
+}
+
+/// PUT helpers. `put_simple`/`send_put` are wired into the public `upload`
+/// dispatcher in Task 2.9; `allow(dead_code)` keeps the incremental build
+/// warning-clean until then.
+#[allow(dead_code)]
+impl NextcloudUploader {
+    /// PUT a whole file in one streaming request. Sends `X-OC-Mtime`,
+    /// `OC-Checksum: md5:<hex>`, and `X-NC-WebDAV-AutoMkcol: 1`. Treats 201/204
+    /// as success, reports `progress(total)`, and returns the server ETag.
+    pub(crate) async fn put_simple(
+        &self,
+        local: &Path,
+        remote_rel: &str,
+        total: u64,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<UploadOutcome> {
+        let url = files_url(&self.base_url, &self.username, remote_rel);
+        let resp = self.send_put(local, &url, total).await?;
+        match resp.status().as_u16() {
+            201 | 204 => {
+                progress(total);
+                Ok(UploadOutcome {
+                    remote_ref: remote_rel.to_string(),
+                    bytes: total,
+                    etag: read_etag(&resp),
+                })
+            }
+            401 => Err(CoreError::CloudAuth(
+                "PUT rejected (401); generate a Nextcloud app password".into(),
+            )),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("PUT {url} -> {s}"),
+            }),
+        }
+    }
+
+    /// Build and send one streaming PUT. Shared by put_simple and the AutoMkcol retry.
+    async fn send_put(&self, local: &Path, url: &str, total: u64) -> Result<reqwest::Response> {
+        let md5 = md5_hex_of(local)?;
+        let file = File::open(local).await.map_err(|e| CoreError::Io {
+            path: local.to_path_buf(),
+            source: e,
+        })?;
+        let body = Body::wrap_stream(ReaderStream::new(file));
+
+        let mut req = self
+            .client
+            .put(url)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header(reqwest::header::CONTENT_LENGTH, total)
+            .header("OC-Checksum", format!("md5:{md5}"))
+            .header("X-NC-WebDAV-AutoMkcol", "1");
+        if let Some(m) = mtime_secs(local) {
+            req = req.header("X-OC-Mtime", m.to_string());
+        }
+        req.body(body).send().await.map_err(transport_err)
     }
 }
 
@@ -388,5 +490,42 @@ mod tests {
         </d:response></d:multistatus>"#;
         assert_eq!(parse_first_contentlength(xml), Some(4096));
         assert_eq!(parse_first_contentlength("<empty/>"), None);
+    }
+
+    use std::io::Write as _;
+
+    fn tmp_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn put_simple_201_returns_etag() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/clip.mp4"))
+            .and(header("X-NC-WebDAV-AutoMkcol", "1"))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"etag-1\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let f = tmp_file(b"hello gopro");
+        let total = b"hello gopro".len() as u64;
+        let mut seen = 0u64;
+        let mut cb = |n: u64| seen = n;
+
+        let out = up
+            .put_simple(f.path(), "GoPro/clip.mp4", total, &mut cb)
+            .await
+            .unwrap();
+
+        assert_eq!(out.remote_ref, "GoPro/clip.mp4");
+        assert_eq!(out.bytes, total);
+        assert_eq!(out.etag.as_deref(), Some("\"etag-1\""));
+        assert_eq!(seen, total);
     }
 }
