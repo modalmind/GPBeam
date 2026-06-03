@@ -1,6 +1,7 @@
 use crate::config::{Config, MirrorMode};
 use crate::copy::copy_verified;
 use crate::diskguard;
+use crate::eject::{default_ejector, Ejector};
 use crate::error::{CoreError, Result};
 use crate::gopro::{is_gopro_card, model_family, read_version};
 use crate::ledger::Ledger;
@@ -20,6 +21,7 @@ pub enum RunEvent {
     Failed { file: String, error: String },
     CloudQueued { file: String },
     CardFileDeleted { file: String },
+    Ejected { mount: String },
     RunComplete { copied: usize, skipped: usize, failed: usize, bytes: u64 },
 }
 
@@ -47,13 +49,37 @@ pub fn should_delete_card(local_verified: bool, mirror: MirrorMode) -> bool {
     local_verified && mirror != MirrorMode::Auto
 }
 
-/// Run one offload pass for a mounted volume `card_root` into `cfg.dest_root`.
-/// Emits `RunEvent`s for UI/CLI/notification consumers. Non-destructive: never
-/// touches the card. Idempotent: ledger dedup prevents re-copying.
+/// Whether the card should be auto-ejected after a run. Opt-in (`auto_eject`),
+/// but suppressed when `delete_after_verify && mirror == Auto`: in that combo
+/// the cloud worker still needs the card mounted to delete each source file
+/// after its upload reaches `Done`, so ejecting here would break it (M2
+/// limitation — see Contract G4).
+pub fn should_auto_eject(auto_eject: bool, delete_after_verify: bool, mirror: MirrorMode) -> bool {
+    auto_eject && !(delete_after_verify && mirror == MirrorMode::Auto)
+}
+
+/// Run one offload pass for a mounted volume `card_root` into `cfg.dest_root`,
+/// using the platform default ejector for `auto_eject`.
+///
+/// Emits `RunEvent`s for UI/CLI/notification consumers. Non-destructive to the
+/// card's media unless the opt-in `delete_after_verify`/`auto_eject` flags are
+/// set. Idempotent: ledger dedup prevents re-copying.
 pub fn run_offload(
     card_root: &Path,
     cfg: &Config,
     ledger: &mut Ledger,
+    emit: &mut dyn FnMut(RunEvent),
+) -> Result<RunSummary> {
+    let ejector = default_ejector();
+    run_offload_with_ejector(card_root, cfg, ledger, ejector.as_ref(), emit)
+}
+
+/// Like `run_offload`, but with an injected `Ejector` (for tests / custom seams).
+pub fn run_offload_with_ejector(
+    card_root: &Path,
+    cfg: &Config,
+    ledger: &mut Ledger,
+    ejector: &dyn Ejector,
     emit: &mut dyn FnMut(RunEvent),
 ) -> Result<RunSummary> {
     if !is_gopro_card(card_root) {
@@ -184,6 +210,26 @@ pub fn run_offload(
     let skipped = skipped + skipped_recovered;
     let summary = RunSummary { copied, skipped, failed, bytes, queued };
     emit(RunEvent::RunComplete { copied, skipped, failed, bytes });
+
+    // Auto-eject (opt-in, default OFF; sync-path only — Contract G4). Gated by
+    // `should_auto_eject`: suppressed for the `delete_after_verify && Auto`
+    // combo, where the worker still needs the card mounted. The non-GoPro early
+    // return above means a non-GoPro volume is never ejected.
+    let mirror = cfg
+        .cloud
+        .as_ref()
+        .map(|c| c.mirror_mode)
+        .unwrap_or(MirrorMode::Off);
+    if should_auto_eject(cfg.auto_eject, cfg.delete_after_verify, mirror) {
+        match ejector.eject(card_root) {
+            Ok(()) => emit(RunEvent::Ejected { mount: card_root.to_string_lossy().into_owned() }),
+            Err(e) => emit(RunEvent::Failed {
+                file: card_root.to_string_lossy().into_owned(),
+                error: format!("auto-eject failed: {e}"),
+            }),
+        }
+    }
+
     Ok(summary)
 }
 
@@ -502,5 +548,104 @@ mod tests {
         // Idempotent on a second run too.
         let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.copied, 0);
+    }
+
+    use crate::eject::Ejector;
+    use std::path::Path as StdPath;
+    use std::sync::Mutex;
+
+    struct RecordingEjector {
+        calls: Mutex<Vec<std::path::PathBuf>>,
+    }
+    impl RecordingEjector {
+        fn new() -> Self { RecordingEjector { calls: Mutex::new(Vec::new()) } }
+    }
+    impl Ejector for RecordingEjector {
+        fn eject(&self, mount: &StdPath) -> Result<()> {
+            self.calls.lock().unwrap().push(mount.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn should_auto_eject_truth_table() {
+        use crate::config::MirrorMode::{Auto, Manual, Off};
+        // Flag off -> never eject, whatever the rest.
+        assert!(!should_auto_eject(false, false, Off));
+        assert!(!should_auto_eject(false, true, Auto));
+        // Flag on, no delete-after-verify -> eject for every mirror mode.
+        assert!(should_auto_eject(true, false, Off));
+        assert!(should_auto_eject(true, false, Manual));
+        assert!(should_auto_eject(true, false, Auto));
+        // Flag on + delete-after-verify: only the Auto combo is suppressed
+        // (worker still needs the card); Off/Manual still eject.
+        assert!(should_auto_eject(true, true, Off));
+        assert!(should_auto_eject(true, true, Manual));
+        assert!(!should_auto_eject(true, true, Auto));
+    }
+
+    #[test]
+    fn auto_eject_true_calls_ejector_once_with_mount() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.auto_eject = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let ej = RecordingEjector::new();
+
+        let summary = run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        let calls = ej.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "ejected exactly once");
+        assert_eq!(calls[0], card.root());
+    }
+
+    #[test]
+    fn auto_eject_false_does_not_call_ejector() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf()); // auto_eject = false
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let ej = RecordingEjector::new();
+
+        run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
+
+        assert!(ej.calls.lock().unwrap().is_empty(), "deletion opt-in; flag off => no eject");
+    }
+
+    #[test]
+    fn auto_eject_skipped_for_non_gopro_volume() {
+        let card = fixtures::not_a_gopro();
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.auto_eject = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let ej = RecordingEjector::new();
+
+        run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
+
+        assert!(ej.calls.lock().unwrap().is_empty(), "non-GoPro volume is never ejected");
+    }
+
+    #[test]
+    fn auto_eject_suppressed_when_delete_after_verify_and_auto_mirror() {
+        // Contract G4: with delete_after_verify + Auto mirror, the worker still
+        // needs the card mounted to delete sources after upload, so the sync
+        // path must NOT eject even though auto_eject is on.
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let mut cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Auto);
+        cfg.auto_eject = true;
+        cfg.delete_after_verify = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let ej = RecordingEjector::new();
+
+        run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
+
+        assert!(
+            ej.calls.lock().unwrap().is_empty(),
+            "delete_after_verify + Auto must defer eject (worker needs the card)"
+        );
     }
 }

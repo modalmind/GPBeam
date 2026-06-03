@@ -25,6 +25,7 @@ fn print_event(e: RunEvent) {
         RunEvent::Failed { file, error } => eprintln!("  [FAIL] {file}: {error}"),
         RunEvent::CloudQueued { file } => println!("  [queued] {file}"),
         RunEvent::CardFileDeleted { file } => println!("  [deleted] {file}"),
+        RunEvent::Ejected { mount } => println!("[ejected] {mount}"),
         RunEvent::RunComplete { copied, skipped, failed, bytes } =>
             println!("[done] copied {copied}, skipped {skipped}, failed {failed}, {bytes} bytes"),
     }
