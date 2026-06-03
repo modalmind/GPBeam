@@ -81,13 +81,65 @@ impl Ledger {
         Ok(n > 0)
     }
 
-    pub fn record(&mut self, serial: &str, name: &str, size: u64, mtime_unix: i64,
-                  dest_path: &str, hash: Option<&str>) -> Result<()> {
+    /// Record (or update) an imported file. Returns the `imported` row id,
+    /// read back via the UNIQUE key so it is correct even when
+    /// `INSERT OR REPLACE` allocates a fresh rowid.
+    pub fn record(
+        &mut self,
+        serial: &str,
+        name: &str,
+        size: u64,
+        mtime_unix: i64,
+        dest_path: &str,
+        hash: Option<&str>,
+    ) -> Result<i64> {
+        // Upsert (ON CONFLICT DO UPDATE) rather than INSERT OR REPLACE so the
+        // existing rowid is preserved on a re-record of the same UNIQUE key
+        // (REPLACE would delete + re-insert, allocating a fresh rowid).
         self.conn.execute(
-            "INSERT OR REPLACE INTO imported
+            "INSERT INTO imported
              (camera_serial, name, size, mtime_unix, dest_path, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(camera_serial, name, size, mtime_unix)
+             DO UPDATE SET dest_path=excluded.dest_path, hash=excluded.hash",
             rusqlite::params![serial, name, size as i64, mtime_unix, dest_path, hash],
+        )?;
+        // Read the id back by UNIQUE key (robust to rowid reassignment).
+        let id = self
+            .imported_id(serial, name, size, mtime_unix)?
+            .expect("row just inserted must exist");
+        Ok(id)
+    }
+
+    /// Look up the `imported` row id for a UNIQUE key, if present.
+    pub fn imported_id(
+        &self,
+        serial: &str,
+        name: &str,
+        size: u64,
+        mtime_unix: i64,
+    ) -> Result<Option<i64>> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM imported
+                 WHERE camera_serial=?1 AND name=?2 AND size=?3 AND mtime_unix=?4",
+                rusqlite::params![serial, name, size as i64, mtime_unix],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(id)
+    }
+
+    /// Stamp the per-file cloud status (e.g. "queued", "done").
+    pub fn set_cloud_status(&self, imported_id: i64, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE imported SET cloud_status=?2 WHERE id=?1",
+            rusqlite::params![imported_id, status],
         )?;
         Ok(())
     }
@@ -202,5 +254,51 @@ mod tests {
         l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None).unwrap();
         l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", Some("hash")).unwrap(); // no error
         assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+    }
+
+    #[test]
+    fn record_returns_positive_id_and_is_stable_for_same_key() {
+        let mut l = mem();
+        let id1 = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/d/a", Some("h1"))
+            .unwrap();
+        assert!(id1 > 0, "expected a positive imported id, got {id1}");
+
+        // INSERT OR REPLACE on the same UNIQUE key must resolve to the same row id.
+        let id2 = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/d/a", Some("h2"))
+            .unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn imported_id_finds_recorded_row_and_none_otherwise() {
+        let mut l = mem();
+        assert_eq!(l.imported_id("C346", "GX010001.MP4", 4096, 1000).unwrap(), None);
+        let id = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None)
+            .unwrap();
+        assert_eq!(
+            l.imported_id("C346", "GX010001.MP4", 4096, 1000).unwrap(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn set_cloud_status_updates_the_row() {
+        let mut l = mem();
+        let id = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None)
+            .unwrap();
+        l.set_cloud_status(id, "queued").unwrap();
+        let status: Option<String> = l
+            .conn
+            .query_row(
+                "SELECT cloud_status FROM imported WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status.as_deref(), Some("queued"));
     }
 }

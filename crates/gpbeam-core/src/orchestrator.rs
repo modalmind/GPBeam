@@ -75,8 +75,14 @@ pub fn run_offload(
                 // KNOWN (deferred to M2): if this record() fails after a verified
                 // copy, the file is on disk but unrecorded; the next run re-copies
                 // it under a collision-suffixed name. Acceptable for M1.
-                ledger.record(serial_key, &item.name, item.size, item.mtime_unix,
-                              &item.dest_path.to_string_lossy(), out.hash.as_deref())?;
+                let _imported_id = ledger.record(
+                    serial_key,
+                    &item.name,
+                    item.size,
+                    item.mtime_unix,
+                    &item.dest_path.to_string_lossy(),
+                    out.hash.as_deref(),
+                )?;
                 bytes += n;
                 copied += 1;
                 emit(RunEvent::Progress { file: item.name.clone(), copied: n, total: n });
