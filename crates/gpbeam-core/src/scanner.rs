@@ -18,18 +18,18 @@ pub struct PlannedCopy {
     pub dest_path: PathBuf,
 }
 
-/// Walk `<card_root>/DCIM/<NNN>GOPRO/*`, classify each file, drop proxies/
-/// thumbnails unless enabled, skip files already in the ledger, and compute a
-/// destination path (Flat layout) via the filename template. Returns the plan.
-pub fn scan_card(
+/// Like `scan_card`, but also returns the count of files skipped because they
+/// were already recorded in the ledger.
+pub fn scan_with_skips(
     card_root: &Path,
     cfg: &Config,
     ledger: &Ledger,
     serial: Option<&str>,
-) -> Result<Vec<PlannedCopy>> {
+) -> Result<(Vec<PlannedCopy>, usize)> {
     let dcim = card_root.join("DCIM");
     let mut plan: Vec<PlannedCopy> = Vec::new();
     let mut used_names: HashSet<PathBuf> = HashSet::new();
+    let mut skipped = 0usize;
 
     let folders = std::fs::read_dir(&dcim).map_err(io_at(&dcim))?;
     let mut media_dirs: Vec<PathBuf> = folders
@@ -73,6 +73,7 @@ pub fn scan_card(
                 .unwrap_or(0);
 
             if ledger.is_imported(serial_key, &name, size, mtime_unix)? {
+                skipped += 1;
                 continue;
             }
 
@@ -98,7 +99,19 @@ pub fn scan_card(
             });
         }
     }
-    Ok(plan)
+    Ok((plan, skipped))
+}
+
+/// Walk `<card_root>/DCIM/<NNN>GOPRO/*`, classify each file, drop proxies/
+/// thumbnails unless enabled, skip files already in the ledger, and compute a
+/// destination path (Flat layout) via the filename template. Returns the plan.
+pub fn scan_card(
+    card_root: &Path,
+    cfg: &Config,
+    ledger: &Ledger,
+    serial: Option<&str>,
+) -> Result<Vec<PlannedCopy>> {
+    Ok(scan_with_skips(card_root, cfg, ledger, serial)?.0)
 }
 
 #[cfg(test)]
@@ -205,5 +218,20 @@ mod tests {
         let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
         assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
         assert!(plan.iter().any(|p| p.name == "GS010003.360")); // others still planned
+    }
+
+    #[test]
+    fn reports_skipped_count() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let src = card.root().join("DCIM/100GOPRO/GX010001.MP4");
+        let md = std::fs::metadata(&src).unwrap();
+        let mtime = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        ledger.record("C346", "GX010001.MP4", md.len(), mtime, "/old", None).unwrap();
+        let (plan, skipped) = scan_with_skips(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        assert_eq!(skipped, 1);
+        assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
     }
 }
