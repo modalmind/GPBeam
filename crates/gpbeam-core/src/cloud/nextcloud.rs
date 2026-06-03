@@ -69,6 +69,71 @@ fn local_name_eq(qname: &[u8], local: &[u8]) -> bool {
     tail == local
 }
 
+/// Parse a chunk-dir PROPFIND Depth:1 207 body into `{part_number -> stored bytes}`.
+/// Matches `<d:response>` blocks whose href tail is a zero-padded chunk name.
+pub(crate) fn parse_chunk_listing(xml: &str) -> std::collections::HashMap<u32, u64> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut map = std::collections::HashMap::new();
+    let mut buf = Vec::new();
+
+    let mut cur_part: Option<u32> = None;
+    let mut cur_len: Option<u64> = None;
+    let mut in_href = false;
+    let mut in_len = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                if local_name_eq(name.as_ref(), b"response") {
+                    cur_part = None;
+                    cur_len = None;
+                } else if local_name_eq(name.as_ref(), b"href") {
+                    in_href = true;
+                } else if local_name_eq(name.as_ref(), b"getcontentlength") {
+                    in_len = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Ok(s) = t.unescape() {
+                    if in_href {
+                        let tail = s.trim().trim_end_matches('/');
+                        let tail = tail.rsplit('/').next().unwrap_or("");
+                        if tail.len() == 5 {
+                            if let Ok(n) = tail.parse::<u32>() {
+                                cur_part = Some(n);
+                            }
+                        }
+                    } else if in_len {
+                        cur_len = s.trim().parse::<u64>().ok();
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                if local_name_eq(name.as_ref(), b"href") {
+                    in_href = false;
+                } else if local_name_eq(name.as_ref(), b"getcontentlength") {
+                    in_len = false;
+                } else if local_name_eq(name.as_ref(), b"response") {
+                    if let (Some(p), Some(l)) = (cur_part, cur_len) {
+                        map.insert(p, l);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    map
+}
+
 /// Lowercase-hex md5 of a file's contents, for the `OC-Checksum` metadata header.
 ///
 /// First consumed by `send_put`/`put_simple`; wired into the public `upload`
@@ -418,16 +483,28 @@ impl NextcloudUploader {
         let dest = files_url(&self.base_url, &self.username, remote_rel);
 
         // Determine upload id (reuse on resume; fresh otherwise).
-        let upload_id = match resume.as_ref().and_then(|r| r.upload_id.clone()) {
-            Some(id) => id,
-            None => format!("gpbeam-{}", uuid::Uuid::new_v4()),
-        };
+        let resumed_id = resume.as_ref().and_then(|r| r.upload_id.clone());
+        let upload_id = resumed_id
+            .clone()
+            .unwrap_or_else(|| format!("gpbeam-{}", uuid::Uuid::new_v4()));
         let dir = uploads_url(&self.base_url, &self.username, &upload_id, None);
 
-        // Which chunks are already present (Task 2.8 fills this from PROPFIND).
-        let present = self.resume_present_chunks(&dir, resume.as_ref()).await?;
+        // Probe existing chunks (empty unless resuming).
+        let mut present = self.resume_present_chunks(&dir, resume.as_ref()).await?;
 
-        // MKCOL the upload dir unless we're resuming into an existing one.
+        // Resume requested but the dir was gone (404 => empty map) => start over
+        // with a fresh id + MKCOL.
+        let (upload_id, dir) = if resumed_id.is_some() && present.is_empty() {
+            let fresh = format!("gpbeam-{}", uuid::Uuid::new_v4());
+            let fresh_dir = uploads_url(&self.base_url, &self.username, &fresh, None);
+            present = std::collections::HashMap::new();
+            (fresh, fresh_dir)
+        } else {
+            (upload_id, dir)
+        };
+        let _ = &upload_id; // id retained for ResumeState persistence by the worker
+
+        // MKCOL the upload dir unless we're continuing an existing one.
         if present.is_empty() {
             self.mkcol_upload_dir(&dir, &dest).await?;
         }
@@ -556,13 +633,41 @@ impl NextcloudUploader {
         }
     }
 
-    /// Stubbed for Task 2.7; real PROPFIND-based resume logic added in Task 2.8.
+    /// On resume, PROPFIND Depth:1 the upload dir and return present chunk sizes.
+    /// A 404 means the upload expired -> return empty (caller MKCOLs a fresh dir;
+    /// the upload_id was already regenerated when resume.upload_id was None).
     async fn resume_present_chunks(
         &self,
-        _dir: &str,
-        _resume: Option<&ResumeState>,
+        dir: &str,
+        resume: Option<&ResumeState>,
     ) -> Result<std::collections::HashMap<u32, u64>> {
-        Ok(std::collections::HashMap::new())
+        // No prior session id => nothing to resume.
+        if resume.and_then(|r| r.upload_id.as_ref()).is_none() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let method = Method::from_bytes(b"PROPFIND").expect("valid method");
+        let resp = self
+            .client
+            .request(method, dir)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header("Depth", "1")
+            .header(reqwest::header::CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/></d:prop></d:propfind>"#)
+            .send()
+            .await
+            .map_err(transport_err)?;
+        match resp.status().as_u16() {
+            207 => {
+                let body = resp.text().await.map_err(transport_err)?;
+                Ok(parse_chunk_listing(&body))
+            }
+            404 => Ok(std::collections::HashMap::new()),
+            401 => Err(CoreError::CloudAuth("PROPFIND upload dir rejected (401)".into())),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("PROPFIND {dir} -> {s}"),
+            }),
+        }
     }
 }
 
@@ -907,5 +1012,68 @@ mod tests {
             1,
             "Destination+OC-Total-Length asserted on a chunk PUT"
         );
+    }
+
+    #[tokio::test]
+    async fn put_chunked_resumes_skipping_present_part1() {
+        let server = MockServer::start().await;
+        let total: u64 = 10 * 1024 * 1024; // 2 chunks @ 5 MiB
+        let chunk = 5u64 * 1024 * 1024;
+
+        // PROPFIND of the upload dir lists part 00001 already stored at full size.
+        let listing = format!(
+            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/uploads/alice/gpbeam-resume-1/00001</d:href>
+    <d:propstat><d:prop><d:getcontentlength>{chunk}</d:getcontentlength></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"#
+        );
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1"))
+            .respond_with(ResponseTemplate::new(207).set_body_raw(listing, "application/xml"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Only part 00002 should be PUT (00001 is skipped). No MKCOL expected.
+        Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/00002"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Guard against part 1 being re-uploaded.
+        Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/00001"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        Mock::given(wm_method("MOVE"))
+            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/.file"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let f = tmp_file(&vec![3u8; total as usize]);
+        let resume = ResumeState {
+            upload_id: Some("gpbeam-resume-1".into()),
+            uploaded_bytes: chunk,
+        };
+        let mut last = 0u64;
+        let mut cb = |n: u64| last = n;
+
+        let out = up
+            .put_chunked(f.path(), "GoPro/big.mp4", total, Some(resume), &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.bytes, total);
+        assert_eq!(last, total);
     }
 }
