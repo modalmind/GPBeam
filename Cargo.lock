@@ -1598,7 +1598,12 @@ name = "gpbeam-cli"
 version = "0.1.0"
 dependencies = [
  "gpbeam-core",
+ "reqwest",
+ "serde",
+ "tempfile",
  "tokio",
+ "toml 0.8.2",
+ "wiremock",
 ]
 
 [[package]]
