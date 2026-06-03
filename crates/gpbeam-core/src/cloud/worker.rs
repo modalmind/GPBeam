@@ -12,14 +12,11 @@ use tokio::task::JoinSet;
 pub struct CloudWorker {
     ledger_path: PathBuf,
     uploader: Arc<dyn CloudUploader>,
-    // `destination_id`, `max_concurrency`, `max_attempts`, and
-    // `delete_after_verify` are part of the LOCKED ctor; some are consumed by
-    // later tasks (retry classification 3.3, delete-after-verify 4.4c).
+    // `destination_id` is part of the LOCKED ctor but not yet consumed.
     #[allow(dead_code)]
     destination_id: String,
     max_concurrency: usize,
     max_attempts: u32,
-    #[allow(dead_code)]
     delete_after_verify: bool,
 }
 
@@ -120,6 +117,23 @@ impl CloudWorker {
                     ledger.set_cloud_status(job.imported_id, "done")?;
                     emit(CloudEvent::Mirrored { file: job.remote_path.clone() });
                     let _ = outcome; // remote_ref/etag retained for future use
+
+                    // Auto-mirror delete-after-verify: now that the cloud copy is
+                    // Done, the on-card source may be removed. A post-upload delete
+                    // failure must NOT regress the successful upload — surface it via
+                    // CloudFailed (logged) per Corrections #Minor, but the Mirrored
+                    // success already stands.
+                    if self.delete_after_verify {
+                        if let Some(src) = job.card_src.as_deref() {
+                            match std::fs::remove_file(src) {
+                                Ok(()) => emit(CloudEvent::Deleted { file: src.to_string() }),
+                                Err(e) => emit(CloudEvent::CloudFailed {
+                                    file: src.to_string(),
+                                    error: format!("post-upload delete failed: {e}"),
+                                }),
+                            }
+                        }
+                    }
                     terminal += 1;
                 }
                 Err(e) => {
@@ -604,5 +618,91 @@ mod tests {
             .filter(|e| matches!(e, CloudEvent::Mirrored { .. }))
             .count();
         assert_eq!(mirrored, 2);
+    }
+
+    /// Fake uploader: succeeds or fails deterministically; never touches a network.
+    struct FakeUploader {
+        succeed: bool,
+    }
+
+    #[async_trait]
+    impl CloudUploader for FakeUploader {
+        async fn already_present(&self, _remote: &str, _size: u64) -> Result<bool> {
+            Ok(false)
+        }
+        async fn upload(
+            &self,
+            _local: &Path,
+            remote: &str,
+            total: u64,
+            _resume: Option<ResumeState>,
+            progress: &mut (dyn FnMut(u64) + Send),
+        ) -> Result<UploadOutcome> {
+            progress(total);
+            if self.succeed {
+                Ok(UploadOutcome { remote_ref: remote.to_string(), bytes: total, etag: Some("\"e\"".into()) })
+            } else {
+                Err(CoreError::Http { status: Some(500), msg: "boom".into() })
+            }
+        }
+    }
+
+    /// Seed an on-disk ledger with one queued job whose card_src points at a
+    /// real temp file (so the worker can actually delete it).
+    fn seed_job(succeed_card: &Path) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("ledger.sqlite");
+        let mut l = Ledger::open(&ledger_path).unwrap();
+        let imported_id = l
+            .record("C346", "GX010001.MP4", 8, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        l.enqueue_cloud_job(
+            imported_id,
+            "nc1",
+            "/dest/GX010001.MP4",
+            "GoPro/GX010001.MP4",
+            8,
+            Some(&succeed_card.to_string_lossy()),
+        )
+        .unwrap();
+        (dir, ledger_path)
+    }
+
+    #[tokio::test]
+    async fn worker_deletes_card_src_after_done() {
+        let card_dir = tempfile::TempDir::new().unwrap();
+        let card_file = card_dir.path().join("GX010001.MP4");
+        std::fs::write(&card_file, b"12345678").unwrap();
+
+        let (_keep, ledger_path) = seed_job(&card_file);
+        let uploader: Arc<dyn CloudUploader> = Arc::new(FakeUploader { succeed: true });
+        let worker = CloudWorker::new(ledger_path, uploader, "nc1".into(), 2, 8, true);
+
+        let mut events = Vec::new();
+        worker
+            .run_until_drained(&mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert!(!card_file.exists(), "card source deleted after cloud Done");
+        assert!(events.iter().any(|e| matches!(e, CloudEvent::Deleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn worker_keeps_card_src_on_failure() {
+        let card_dir = tempfile::TempDir::new().unwrap();
+        let card_file = card_dir.path().join("GX010001.MP4");
+        std::fs::write(&card_file, b"12345678").unwrap();
+
+        let (_keep, ledger_path) = seed_job(&card_file);
+        let uploader: Arc<dyn CloudUploader> = Arc::new(FakeUploader { succeed: false });
+        // max_attempts = 1 so the job exhausts in a single run_once.
+        let worker = CloudWorker::new(ledger_path, uploader, "nc1".into(), 2, 1, true);
+
+        let mut events = Vec::new();
+        worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+
+        assert!(card_file.exists(), "failed upload must NOT delete the card source");
+        assert!(!events.iter().any(|e| matches!(e, CloudEvent::Deleted { .. })));
     }
 }
