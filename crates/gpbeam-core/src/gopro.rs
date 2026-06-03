@@ -75,6 +75,61 @@ pub fn model_family(fw_version: &str) -> Option<&'static str> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Video, Video360, Photo, RawPhoto, Burst, LowResProxy, Thumbnail, Audio, Unknown,
+}
+
+impl MediaKind {
+    pub fn is_proxy(self) -> bool { matches!(self, MediaKind::LowResProxy) }
+    pub fn is_thumbnail(self) -> bool { matches!(self, MediaKind::Thumbnail) }
+    pub fn is_photo(self) -> bool { matches!(self, MediaKind::Photo | MediaKind::RawPhoto | MediaKind::Burst) }
+}
+
+/// Classify by name. Tier 1: known prefix+ext. Tier 2: extension-only fallback
+/// so media from an unknown/future camera is never dropped. `name` = file name only.
+pub fn classify(name: &str) -> MediaKind {
+    use MediaKind::*;
+    let upper = name.to_ascii_uppercase();
+    let (stem, ext) = match upper.rsplit_once('.') {
+        Some((s, e)) => (s, e),
+        None => return Unknown,
+    };
+    // Tier 1
+    match (stem, ext) {
+        (s, "MP4") if s.starts_with("GH") || s.starts_with("GX") || s.starts_with("GG") => return Video,
+        (s, "MP4") if s.starts_with("GOPR") || s.starts_with("GP") => return Video,
+        (s, "JPG") | (s, "JPEG") if s.starts_with("GOPR") || s.starts_with("GS") => return Photo,
+        (s, "360") if s.starts_with("GS") => return Video360,
+        (s, "JPG") if s.len() > 1 && s.starts_with('G') && s.as_bytes()[1].is_ascii_digit() => return Burst,
+        _ => {}
+    }
+    // Tier 2: extension-only fallback
+    match ext {
+        "LRV" => LowResProxy,
+        "THM" => Thumbnail,
+        "GPR" => RawPhoto,
+        "WAV" => Audio,
+        "360" => Video360,
+        "MP4" => Video,
+        "JPG" | "JPEG" => Photo,
+        _ => Unknown,
+    }
+}
+
+/// Recording-group key (file_number, chapter) so chapters+sidecars copy together.
+/// HERO/360 scheme: PREFIX + 2 chapter digits + 4 file-number digits.
+pub fn hero_group_key(stem: &str) -> Option<(u32, u32)> {
+    let digits: String = stem.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+    if digits.len() == 6 {
+        let chapter = digits[0..2].parse().ok()?;
+        let file_no = digits[2..6].parse().ok()?;
+        Some((file_no, chapter))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/fixtures.rs"]
 mod fixtures;
@@ -117,5 +172,28 @@ mod tests {
         assert_eq!(model_family("H24.02.00.00.00"), Some("MAX2"));
         assert_eq!(model_family("H26.01.00.00.00"), Some("MISSION 1 PRO"));
         assert_eq!(model_family("ZZ99.00"), None); // unknown -> fall through
+    }
+
+    #[test]
+    fn classifies_known_and_fallback() {
+        use MediaKind::*;
+        assert_eq!(classify("GX010001.MP4"), Video);
+        assert_eq!(classify("GH010001.MP4"), Video);
+        assert_eq!(classify("GS010003.360"), Video360);
+        assert_eq!(classify("GOPR0002.JPG"), Photo);
+        assert_eq!(classify("GX010001.LRV"), LowResProxy);
+        assert_eq!(classify("GX010001.THM"), Thumbnail);
+        assert_eq!(classify("GOPR0002.GPR"), RawPhoto);
+        // unknown future camera, unknown prefix, known media extension -> still copied
+        assert_eq!(classify("ZZ999999.MP4"), Video);
+        assert_eq!(classify("WHATEVER.XYZ"), Unknown);
+    }
+
+    #[test]
+    fn groups_chapters_by_file_number() {
+        // GX010001 and GX020001 are chapters 01,02 of file number 0001
+        assert_eq!(hero_group_key("GX010001"), Some((1, 1)));
+        assert_eq!(hero_group_key("GX020001"), Some((1, 2)));
+        assert_eq!(hero_group_key("NOPE"), None);
     }
 }
