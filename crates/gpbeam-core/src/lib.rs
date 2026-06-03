@@ -9,6 +9,7 @@ pub mod ledger;
 pub mod scanner;
 pub mod detect;
 pub mod orchestrator;
+pub mod credentials;
 
 pub use error::{CoreError, Result};
 pub use orchestrator::{run_offload, RunEvent, RunSummary};
