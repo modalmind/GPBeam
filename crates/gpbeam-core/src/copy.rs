@@ -102,4 +102,52 @@ mod tests {
         let out = copy_verified(&src, &dst_dir.path().join("a.MP4"), false, &mut |_| {}).unwrap();
         assert!(out.hash.is_none());
     }
+
+    #[test]
+    fn zero_byte_file_copies_and_verifies() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("empty.MP4");
+        fs::write(&src, b"").unwrap();
+        let dest = dst_dir.path().join("empty.MP4");
+        let out = copy_verified(&src, &dest, true, &mut |_| {}).unwrap();
+        assert_eq!(out.bytes, 0);
+        assert!(out.hash.is_some(), "zero-byte file should still produce a hash");
+        assert!(dest.exists());
+        assert_eq!(fs::read(&dest).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn recopy_overwrites_existing_dest() {
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("a.MP4");
+        fs::write(&src, b"NEW CONTENT").unwrap();
+        let dest = dst_dir.path().join("a.MP4");
+        fs::write(&dest, b"OLD STALE GARBAGE THAT IS LONGER").unwrap();
+        let out = copy_verified(&src, &dest, true, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"NEW CONTENT");
+        assert_eq!(out.bytes, 11);
+        assert_eq!(fs::read_dir(dst_dir.path()).unwrap().count(), 1); // no temp leftover
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_error_leaves_no_partial_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let src_dir = TempDir::new().unwrap();
+        let dst_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("a.MP4");
+        fs::write(&src, vec![0u8; 4096]).unwrap();
+        let final_path = dst_dir.path().join("a.MP4");
+        let mut perms = fs::metadata(dst_dir.path()).unwrap().permissions();
+        perms.set_mode(0o500); // read+execute, no write
+        fs::set_permissions(dst_dir.path(), perms).unwrap();
+        let res = copy_verified(&src, &final_path, true, &mut |_| {});
+        let mut perms = fs::metadata(dst_dir.path()).unwrap().permissions();
+        perms.set_mode(0o700); // restore so TempDir can clean up
+        fs::set_permissions(dst_dir.path(), perms).unwrap();
+        assert!(res.is_err(), "must fail when dest dir is not writable");
+        assert!(!final_path.exists(), "no partial file under the real name");
+    }
 }
