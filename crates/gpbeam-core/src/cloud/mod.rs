@@ -1,7 +1,13 @@
-//! Cloud mirroring subsystem (async). Phase 1 only needs `ResumeState`, which
-//! the ledger serializes to JSON in the `cloud_jobs` queue.
+//! Cloud mirroring subsystem (async). The cloud worker drains the persisted
+//! `cloud_jobs` queue and uploads verified media to a remote destination
+//! (Nextcloud via WebDAV) through the [`CloudUploader`] trait.
 
+use crate::error::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+pub mod nextcloud;
 
 /// Per-job resume cursor for chunked uploads. Persisted as JSON TEXT in
 /// `cloud_jobs.resume_state`.
@@ -11,4 +17,144 @@ pub struct ResumeState {
     pub upload_id: Option<String>,
     /// Bytes confirmed uploaded so far (sum of fully-stored chunks).
     pub uploaded_bytes: u64,
+}
+
+/// Result of a successful upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadOutcome {
+    /// The remote path (relative to the configured remote root) the file now lives at.
+    pub remote_ref: String,
+    /// Total bytes uploaded.
+    pub bytes: u64,
+    /// Server ETag (OC-ETag) if returned.
+    pub etag: Option<String>,
+}
+
+/// Progress / lifecycle events emitted by the cloud worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudEvent {
+    Uploading { file: String, uploaded: u64, total: u64 },
+    Mirrored { file: String },
+    CloudFailed { file: String, error: String },
+    Deleted { file: String },
+}
+
+/// A pluggable cloud upload backend. Implemented by `NextcloudUploader`.
+#[async_trait]
+pub trait CloudUploader: Send + Sync {
+    /// True if a remote object at `remote` already exists with byte size `size`.
+    async fn already_present(&self, remote: &str, size: u64) -> Result<bool>;
+
+    /// Upload `local` to `remote`. `total` is the file size in bytes. `resume`,
+    /// if present, lets a chunked upload continue. `progress` is called with the
+    /// cumulative bytes uploaded so far.
+    async fn upload(
+        &self,
+        local: &Path,
+        remote: &str,
+        total: u64,
+        resume: Option<ResumeState>,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<UploadOutcome>;
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::error::CoreError;
+    use std::sync::Mutex;
+
+    /// Records calls and returns a canned outcome or an injected error.
+    /// Used by worker tests in Phase 4.
+    pub struct MockUploader {
+        pub outcome: UploadOutcome,
+        /// If `Some`, `upload` returns this error instead of `outcome`.
+        pub fail_with: Option<CoreError>,
+        /// `already_present` return value.
+        pub present: bool,
+        pub calls: Mutex<Vec<String>>,
+    }
+
+    impl MockUploader {
+        pub fn new(outcome: UploadOutcome) -> Self {
+            MockUploader {
+                outcome,
+                fail_with: None,
+                present: false,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CloudUploader for MockUploader {
+        async fn already_present(&self, remote: &str, _size: u64) -> Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("present:{remote}"));
+            Ok(self.present)
+        }
+
+        async fn upload(
+            &self,
+            _local: &Path,
+            remote: &str,
+            total: u64,
+            _resume: Option<ResumeState>,
+            progress: &mut (dyn FnMut(u64) + Send),
+        ) -> Result<UploadOutcome> {
+            self.calls.lock().unwrap().push(format!("upload:{remote}"));
+            if let Some(err) = &self.fail_with {
+                return Err(clone_err(err));
+            }
+            progress(total);
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// Cheap clone for the injected-error case (CoreError is not Clone).
+    fn clone_err(err: &CoreError) -> CoreError {
+        match err {
+            CoreError::CloudAuth(m) => CoreError::CloudAuth(m.clone()),
+            CoreError::Http { status, msg } => CoreError::Http {
+                status: *status,
+                msg: msg.clone(),
+            },
+            CoreError::Config(m) => CoreError::Config(m.clone()),
+            other => CoreError::Config(format!("{other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::MockUploader;
+    use super::*;
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn mock_uploader_implements_trait() {
+        let outcome = UploadOutcome {
+            remote_ref: "GoPro/clip.mp4".into(),
+            bytes: 1024,
+            etag: Some("\"abc\"".into()),
+        };
+        let up = MockUploader::new(outcome.clone());
+
+        let mut seen = 0u64;
+        let mut cb = |n: u64| seen = n;
+        let got = up
+            .upload(Path::new("/tmp/clip.mp4"), "GoPro/clip.mp4", 1024, None, &mut cb)
+            .await
+            .unwrap();
+
+        assert_eq!(got, outcome);
+        assert_eq!(seen, 1024);
+        assert!(!up.already_present("GoPro/clip.mp4", 1024).await.unwrap());
+        assert_eq!(
+            up.calls.lock().unwrap().as_slice(),
+            &["upload:GoPro/clip.mp4".to_string(), "present:GoPro/clip.mp4".to_string()]
+        );
+    }
 }
