@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, MirrorMode};
 use crate::copy::copy_verified;
 use crate::diskguard;
 use crate::error::{CoreError, Result};
@@ -36,6 +36,14 @@ pub(crate) fn remote_path_for(remote_root: &str, dest_name: &str) -> String {
     } else {
         format!("{root}/{name}")
     }
+}
+
+/// Whether the orchestrator should delete the card source file *inline* right
+/// after a local verify. True only when the file verified locally AND the
+/// mirror mode is not `Auto` — under `Auto`, deletion is deferred to the cloud
+/// worker once the upload reaches `Done`.
+pub fn should_delete_card(local_verified: bool, mirror: MirrorMode) -> bool {
+    local_verified && mirror != MirrorMode::Auto
 }
 
 /// Run one offload pass for a mounted volume `card_root` into `cfg.dest_root`.
@@ -131,7 +139,6 @@ pub fn run_offload(
                 // source path is retained so the worker can delete it after a
                 // verified upload (Auto + delete-after-verify).
                 if let Some(cloud) = &cfg.cloud {
-                    use crate::config::MirrorMode;
                     if matches!(cloud.mirror_mode, MirrorMode::Auto | MirrorMode::Manual) {
                         let remote = remote_path_for(&cloud.remote_root, &item.dest_name);
                         ledger.enqueue_cloud_job(
@@ -330,6 +337,20 @@ mod tests {
         assert_eq!(summary.queued, 0);
         assert!(!events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
         assert_eq!(ledger.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn should_delete_card_truth_table() {
+        use crate::config::MirrorMode::{Auto, Manual, Off};
+        // Verified locally + not Auto -> delete inline.
+        assert!(should_delete_card(true, Off));
+        assert!(should_delete_card(true, Manual));
+        // Verified locally + Auto -> defer to the worker (no inline delete).
+        assert!(!should_delete_card(true, Auto));
+        // Not verified -> never delete, regardless of mirror.
+        assert!(!should_delete_card(false, Off));
+        assert!(!should_delete_card(false, Manual));
+        assert!(!should_delete_card(false, Auto));
     }
 
     #[test]
