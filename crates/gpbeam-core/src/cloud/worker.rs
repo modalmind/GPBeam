@@ -1,7 +1,5 @@
-#[allow(unused_imports)]
 use crate::backoff::backoff_delay;
 use crate::cloud::{CloudEvent, CloudUploader, ResumeState, UploadOutcome};
-#[allow(unused_imports)]
 use crate::error::{is_retryable, Result};
 use crate::ledger::{CloudJob, Ledger};
 use std::path::PathBuf;
@@ -20,7 +18,6 @@ pub struct CloudWorker {
     #[allow(dead_code)]
     destination_id: String,
     max_concurrency: usize,
-    #[allow(dead_code)]
     max_attempts: u32,
     #[allow(dead_code)]
     delete_after_verify: bool,
@@ -118,9 +115,33 @@ impl CloudWorker {
                     let _ = outcome; // remote_ref/etag retained for future use
                     terminal += 1;
                 }
-                Err(_e) => {
-                    // Retry vs terminal-failure handling lands in Task 3.3.
-                    terminal += 1;
+                Err(e) => {
+                    // `mark_job_failed` increments attempts (attempts+1); the
+                    // ledger does NOT bump attempts at claim time. So the attempt
+                    // number that just failed is `job.attempts + 1`, and after the
+                    // mark the row's attempts will equal that. Use it for both the
+                    // exhaustion check and the backoff schedule.
+                    let attempt_num = job.attempts.saturating_add(1);
+                    let err_text = e.to_string();
+                    let mut ledger = Ledger::open(&self.ledger_path)?;
+                    if is_retryable(&e) && attempt_num < self.max_attempts {
+                        // Reschedule: park in Failed with a future next_retry_at.
+                        let delay = backoff_delay(attempt_num, crate::backoff::jitter_ms());
+                        let next = now_unix.saturating_add(delay.as_secs() as i64);
+                        ledger.mark_job_failed(job.id, &err_text, Some(next))?;
+                        // NOT terminal: do not increment `terminal`.
+                    } else {
+                        // Terminal failure (non-retryable, or retries exhausted):
+                        // park in Failed with no retry, mark the imported row, and
+                        // notify.
+                        ledger.mark_job_failed(job.id, &err_text, None)?;
+                        ledger.set_cloud_status(job.imported_id, "failed")?;
+                        emit(CloudEvent::CloudFailed {
+                            file: job.remote_path.clone(),
+                            error: err_text,
+                        });
+                        terminal += 1;
+                    }
                 }
             }
         }
@@ -303,5 +324,122 @@ mod tests {
         )));
         // An Uploading event was emitted at least once (start-of-upload).
         assert!(events.iter().any(|e| matches!(e, CloudEvent::Uploading { .. })));
+    }
+
+    #[tokio::test]
+    async fn retryable_error_reschedules_then_succeeds_on_next_run() {
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+
+        // First attempt: retryable HTTP 503. Second attempt: success.
+        let uploader = Arc::new(MockUploader::scripted(vec![
+            Behavior {
+                progress_to: None,
+                outcome: AttemptOutcome::Err(CoreError::Http {
+                    status: Some(503),
+                    msg: "service unavailable".into(),
+                }),
+            },
+            Behavior {
+                progress_to: None,
+                outcome: AttemptOutcome::Ok { bytes: 4096, etag: Some("e".into()) },
+            },
+        ]));
+        let worker =
+            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+
+        // Pass 1 at t=1000: fails retryably, reschedules to next_retry_at = 1000 + ~2s.
+        let mut ev1: Vec<CloudEvent> = Vec::new();
+        let t1 = worker.run_once(1000, &mut |e| ev1.push(e)).await.unwrap();
+        assert_eq!(t1, 0, "a rescheduled job is NOT terminal");
+        assert!(
+            !ev1.iter().any(|e| matches!(e, CloudEvent::CloudFailed { .. })),
+            "retryable failure must not emit CloudFailed"
+        );
+
+        {
+            let l = Ledger::open(&ledger_path).unwrap();
+            let failed = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
+            assert_eq!(failed.len(), 1, "job is parked in Failed awaiting retry");
+            assert_eq!(failed[0].attempts, 1);
+            assert!(failed[0].next_retry_at.unwrap() >= 1000 + 2);
+            assert!(failed[0].last_error.as_deref().unwrap().contains("503"));
+            assert_eq!(l.pending_cloud_count().unwrap(), 1, "still pending");
+        }
+
+        // Pass 2 well after the retry window: claim_due picks up the due Failed job.
+        let mut ev2: Vec<CloudEvent> = Vec::new();
+        let t2 = worker.run_once(100_000, &mut |e| ev2.push(e)).await.unwrap();
+        assert_eq!(t2, 1, "now terminal (Done)");
+        assert_eq!(uploader.call_count(), 2);
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].id, job_id);
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_auth_error_is_terminal_and_emits_cloud_failed() {
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+
+        let uploader = Arc::new(MockUploader::scripted(vec![Behavior {
+            progress_to: None,
+            outcome: AttemptOutcome::Err(CoreError::CloudAuth("bad app password".into())),
+        }]));
+        let worker =
+            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        let terminal = worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!(terminal, 1, "a non-retryable failure IS terminal");
+        assert_eq!(uploader.call_count(), 1);
+
+        // CloudFailed emitted with the error text.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CloudEvent::CloudFailed { file, error }
+                if file == "GX010001.MP4" && error.contains("bad app password")
+        )));
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        let failed = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, job_id);
+        // Terminal failure: no future retry scheduled.
+        assert!(failed[0].next_retry_at.is_none());
+        // pending_cloud_count counts only Queued + retry-due Failed; a terminal
+        // Failed with no next_retry_at is NOT pending.
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn exhausting_max_attempts_makes_a_retryable_error_terminal() {
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, _job_id) = ledger_with_one_job(&dir);
+
+        // Always a retryable 503; max_attempts = 1 so the first failure is terminal.
+        let uploader = Arc::new(MockUploader::scripted(vec![Behavior {
+            progress_to: None,
+            outcome: AttemptOutcome::Err(CoreError::Http {
+                status: Some(503),
+                msg: "still down".into(),
+            }),
+        }]));
+        let worker =
+            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 1, false);
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        let terminal = worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!(terminal, 1, "retries exhausted -> terminal");
+        assert!(events.iter().any(|e| matches!(e, CloudEvent::CloudFailed { .. })));
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        let failed = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].next_retry_at.is_none(), "no retry after exhaustion");
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
     }
 }
