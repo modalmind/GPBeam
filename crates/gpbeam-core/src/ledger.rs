@@ -1,9 +1,61 @@
+use crate::cloud::ResumeState;
 use crate::error::Result;
 use rusqlite::Connection;
 use std::path::Path;
 
 pub struct Ledger {
     conn: Connection,
+}
+
+/// Lifecycle of a cloud upload job. Stored as lowercase words in `cloud_jobs.state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Queued,
+    Uploading,
+    Done,
+    Failed,
+}
+
+impl JobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Uploading => "uploading",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+        }
+    }
+
+    // Name is part of the LOCKED Shared Contract (`as_str`/`from_str`); keep it
+    // even though it shadows `std::str::FromStr::from_str`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<JobState> {
+        match s {
+            "queued" => Some(JobState::Queued),
+            "uploading" => Some(JobState::Uploading),
+            "done" => Some(JobState::Done),
+            "failed" => Some(JobState::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the `cloud_jobs` queue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudJob {
+    pub id: i64,
+    pub imported_id: i64,
+    pub destination_id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub card_src: Option<String>,
+    pub state: JobState,
+    pub attempts: u32,
+    pub next_retry_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub resume_state: Option<ResumeState>,
 }
 
 impl Ledger {
@@ -143,6 +195,136 @@ impl Ledger {
         )?;
         Ok(())
     }
+
+    /// Insert a new Queued cloud job for an already-imported file. Returns the job id.
+    /// `card_src` is the on-card source path, retained so the worker can delete the
+    /// original after a verified cloud upload (Auto + delete-after-verify).
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_cloud_job(
+        &mut self,
+        imported_id: i64,
+        destination_id: &str,
+        local_path: &str,
+        remote_path: &str,
+        total_bytes: u64,
+        card_src: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO cloud_jobs
+             (imported_id, destination_id, local_path, remote_path, card_src, state,
+              attempts, total_bytes, uploaded_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0)",
+            rusqlite::params![
+                imported_id,
+                destination_id,
+                local_path,
+                remote_path,
+                card_src,
+                JobState::Queued.as_str(),
+                total_bytes as i64,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Count jobs not yet finished: Queued, Uploading, or Failed-pending-retry
+    /// (Failed with a non-NULL `next_retry_at`). A terminal Failed job
+    /// (`next_retry_at` NULL) is NOT counted (Shared Contract C2), so
+    /// `run_until_drained` does not spin forever.
+    pub fn pending_cloud_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM cloud_jobs
+             WHERE state=?1 OR state=?2
+                OR (state=?3 AND next_retry_at IS NOT NULL)",
+            rusqlite::params![
+                JobState::Queued.as_str(),
+                JobState::Uploading.as_str(),
+                JobState::Failed.as_str(),
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// List cloud jobs, optionally filtered to one state, ordered by id.
+    pub fn list_cloud_jobs(&self, state: Option<JobState>) -> Result<Vec<CloudJob>> {
+        let mut stmt;
+        let mut rows = match state {
+            Some(s) => {
+                stmt = self.conn.prepare(
+                    "SELECT id, imported_id, destination_id, local_path, remote_path,
+                            card_src, state, attempts, next_retry_at, last_error,
+                            total_bytes, uploaded_bytes, resume_state
+                     FROM cloud_jobs WHERE state=?1 ORDER BY id",
+                )?;
+                stmt.query(rusqlite::params![s.as_str()])?
+            }
+            None => {
+                stmt = self.conn.prepare(
+                    "SELECT id, imported_id, destination_id, local_path, remote_path,
+                            card_src, state, attempts, next_retry_at, last_error,
+                            total_bytes, uploaded_bytes, resume_state
+                     FROM cloud_jobs ORDER BY id",
+                )?;
+                stmt.query([])?
+            }
+        };
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next()? {
+            jobs.push(row_to_cloud_job(row)?);
+        }
+        Ok(jobs)
+    }
+}
+
+/// Map a `cloud_jobs` row to a [`CloudJob`]. The SELECT column order is fixed
+/// (see `list_cloud_jobs` / `claim_due_cloud_jobs`): id, imported_id,
+/// destination_id, local_path, remote_path, card_src, state, attempts,
+/// next_retry_at, last_error, total_bytes, uploaded_bytes, resume_state.
+/// Decodes the `resume_state` JSON and the lowercase `state` word; a malformed
+/// `state` is mapped to a `rusqlite::Error` so `?` propagates as `CoreError::Db`.
+fn row_to_cloud_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudJob> {
+    let state_str: String = row.get(6)?;
+    let state = JobState::from_str(&state_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown job state {state_str:?}"),
+            )),
+        )
+    })?;
+    let resume_json: Option<String> = row.get(12)?;
+    let resume_state = match resume_json {
+        Some(s) => Some(serde_json::from_str::<ResumeState>(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?),
+        None => None,
+    };
+    let total_bytes: i64 = row.get(10)?;
+    let uploaded_bytes: i64 = row.get(11)?;
+    let attempts: i64 = row.get(7)?;
+    Ok(CloudJob {
+        id: row.get(0)?,
+        imported_id: row.get(1)?,
+        destination_id: row.get(2)?,
+        local_path: row.get(3)?,
+        remote_path: row.get(4)?,
+        card_src: row.get(5)?,
+        state,
+        attempts: attempts as u32,
+        next_retry_at: row.get(8)?,
+        last_error: row.get(9)?,
+        total_bytes: total_bytes as u64,
+        uploaded_bytes: uploaded_bytes as u64,
+        resume_state,
+    })
 }
 
 #[cfg(test)]
@@ -300,5 +482,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status.as_deref(), Some("queued"));
+    }
+
+    fn enqueue_sample(l: &mut Ledger) -> (i64, i64) {
+        let imported_id = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        let job_id = l
+            .enqueue_cloud_job(
+                imported_id,
+                "nc1",
+                "/dest/GX010001.MP4",
+                "videos/GX010001.MP4",
+                4096,
+                None,
+            )
+            .unwrap();
+        (imported_id, job_id)
+    }
+
+    #[test]
+    fn enqueue_then_list_returns_a_queued_job() {
+        let mut l = mem();
+        let (imported_id, job_id) = enqueue_sample(&mut l);
+        assert!(job_id > 0);
+
+        let jobs = l.list_cloud_jobs(Some(JobState::Queued)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let j = &jobs[0];
+        assert_eq!(j.id, job_id);
+        assert_eq!(j.imported_id, imported_id);
+        assert_eq!(j.destination_id, "nc1");
+        assert_eq!(j.local_path, "/dest/GX010001.MP4");
+        assert_eq!(j.remote_path, "videos/GX010001.MP4");
+        assert_eq!(j.card_src, None);
+        assert_eq!(j.state, JobState::Queued);
+        assert_eq!(j.attempts, 0);
+        assert_eq!(j.next_retry_at, None);
+        assert_eq!(j.last_error, None);
+        assert_eq!(j.total_bytes, 4096);
+        assert_eq!(j.uploaded_bytes, 0);
+        assert_eq!(j.resume_state, None);
+    }
+
+    #[test]
+    fn enqueue_persists_card_src_when_provided() {
+        let mut l = mem();
+        let imported_id = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        l.enqueue_cloud_job(
+            imported_id,
+            "nc1",
+            "/dest/GX010001.MP4",
+            "videos/GX010001.MP4",
+            4096,
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4"),
+        )
+        .unwrap();
+        let jobs = l.list_cloud_jobs(None).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].card_src.as_deref(),
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4")
+        );
+    }
+
+    #[test]
+    fn pending_cloud_count_counts_queued_jobs() {
+        let mut l = mem();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+        enqueue_sample(&mut l);
+        assert_eq!(l.pending_cloud_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_cloud_count_excludes_terminal_failed() {
+        // A Failed job with next_retry_at NULL is terminal and must NOT be
+        // counted as pending (Shared Contract C2); otherwise run_until_drained
+        // would spin forever on it.
+        let mut l = mem();
+        let (_, job_id) = enqueue_sample(&mut l);
+        l.conn
+            .execute(
+                "UPDATE cloud_jobs SET state='failed', next_retry_at=NULL WHERE id=?1",
+                rusqlite::params![job_id],
+            )
+            .unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_cloud_count_includes_failed_pending_retry() {
+        let mut l = mem();
+        let (_, job_id) = enqueue_sample(&mut l);
+        l.conn
+            .execute(
+                "UPDATE cloud_jobs SET state='failed', next_retry_at=9999 WHERE id=?1",
+                rusqlite::params![job_id],
+            )
+            .unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_cloud_count_excludes_done() {
+        let mut l = mem();
+        let (_, job_id) = enqueue_sample(&mut l);
+        l.conn
+            .execute(
+                "UPDATE cloud_jobs SET state='done' WHERE id=?1",
+                rusqlite::params![job_id],
+            )
+            .unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn list_cloud_jobs_none_filter_returns_all() {
+        let mut l = mem();
+        enqueue_sample(&mut l);
+        assert_eq!(l.list_cloud_jobs(None).unwrap().len(), 1);
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Done)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn job_state_round_trips_as_lowercase_words() {
+        assert_eq!(JobState::Queued.as_str(), "queued");
+        assert_eq!(JobState::Uploading.as_str(), "uploading");
+        assert_eq!(JobState::Done.as_str(), "done");
+        assert_eq!(JobState::Failed.as_str(), "failed");
+        assert_eq!(JobState::from_str("queued"), Some(JobState::Queued));
+        assert_eq!(JobState::from_str("uploading"), Some(JobState::Uploading));
+        assert_eq!(JobState::from_str("done"), Some(JobState::Done));
+        assert_eq!(JobState::from_str("failed"), Some(JobState::Failed));
+        assert_eq!(JobState::from_str("bogus"), None);
     }
 }

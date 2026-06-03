@@ -6,6 +6,7 @@ pub mod naming;
 pub mod diskguard;
 pub mod copy;
 pub mod ledger;
+pub mod cloud;
 pub mod scanner;
 pub mod detect;
 pub mod orchestrator;
