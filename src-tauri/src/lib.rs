@@ -12,7 +12,7 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 
-use gpbeam_core::config::Config;
+use gpbeam_core::config::{config_path, load_config, Config};
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
 
@@ -51,6 +51,21 @@ fn ledger_path(dest: &Path) -> PathBuf {
     dest.join(".gpbeam-ledger.sqlite")
 }
 
+/// Load `gpbeam.toml` from `$GPBEAM_CONFIG` (or `<dest>/gpbeam.toml`). On any
+/// error — missing file, parse failure — fall back to the exact M1 defaults so
+/// a no-config install behaves identically to M1. The chosen destination root
+/// always wins over whatever a stale config might claim, matching M1 behavior.
+fn load_or_default_config(dest: &Path) -> Config {
+    let path = config_path(std::env::var("GPBEAM_CONFIG").ok(), dest);
+    match load_config(&path) {
+        Ok(mut cfg) => {
+            cfg.dest_root = dest.to_path_buf();
+            cfg
+        }
+        Err(_) => Config::new(dest.to_path_buf()),
+    }
+}
+
 /// Run one offload pass for a freshly mounted volume. Blocking I/O — call via
 /// `spawn_blocking` so the async runtime is never stalled.
 fn handle_mount(app: &AppHandle, mount: PathBuf) {
@@ -65,7 +80,7 @@ fn handle_mount(app: &AppHandle, mount: PathBuf) {
         set_tray_state(app, "error");
         return;
     }
-    let cfg = Config::new(dest.clone());
+    let cfg = load_or_default_config(&dest);
     let mut ledger = match Ledger::open(&ledger_path(&dest)) {
         Ok(l) => l,
         Err(e) => {
