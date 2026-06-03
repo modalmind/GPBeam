@@ -110,13 +110,15 @@ pub async fn run_offload_and_mirror(
     card: &Path,
     dest: &Path,
     config_path: Option<&Path>,
+    flags: &SafetyFlags,
     emit: &mut (dyn FnMut(String) + Send),
 ) -> Result<()> {
     std::fs::create_dir_all(dest).map_err(|source| CoreError::Io {
         path: dest.to_path_buf(),
         source,
     })?;
-    let (cfg, toml_text) = load_or_default_config(dest, config_path)?;
+    let (mut cfg, toml_text) = load_or_default_config(dest, config_path)?;
+    apply_safety_overrides(&mut cfg, flags);
     let lpath = ledger_path_for(dest);
 
     // --- Sync offload (blocking rusqlite + std::fs). Runs on a blocking thread
@@ -217,4 +219,38 @@ pub fn retry_cloud(dest: &Path) -> Result<usize> {
     let lpath = ledger_path_for(dest);
     let mut ledger = Ledger::open(&lpath)?;
     ledger.requeue_failed_cloud_jobs()
+}
+
+/// CLI overrides for the two M2 safety booleans. `false` means "flag not passed"
+/// — absence never clears a `true` coming from gpbeam.toml.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SafetyFlags {
+    pub delete_after_verify: bool,
+    pub auto_eject: bool,
+}
+
+/// Apply CLI flags onto a loaded `Config`: a present flag forces the field true;
+/// an absent flag leaves whatever the config file already set.
+pub fn apply_safety_overrides(cfg: &mut Config, flags: &SafetyFlags) {
+    if flags.delete_after_verify {
+        cfg.delete_after_verify = true;
+    }
+    if flags.auto_eject {
+        cfg.auto_eject = true;
+    }
+}
+
+/// Pull `--delete-after-verify` and `--auto-eject` out of an argv slice,
+/// returning the remaining positional args and the parsed flags.
+pub fn parse_safety_flags(args: &[String]) -> (Vec<String>, SafetyFlags) {
+    let mut positional = Vec::new();
+    let mut flags = SafetyFlags::default();
+    for a in args {
+        match a.as_str() {
+            "--delete-after-verify" => flags.delete_after_verify = true,
+            "--auto-eject" => flags.auto_eject = true,
+            other => positional.push(other.to_string()),
+        }
+    }
+    (positional, flags)
 }

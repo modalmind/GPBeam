@@ -60,7 +60,8 @@ app_password = "test-app-pw"
     std::fs::write(&cfg_path, toml).unwrap();
 
     let mut lines: Vec<String> = Vec::new();
-    gpbeam_cli::run_offload_and_mirror(&card, &dest, Some(&cfg_path), &mut |l| {
+    let flags = gpbeam_cli::SafetyFlags::default();
+    gpbeam_cli::run_offload_and_mirror(&card, &dest, Some(&cfg_path), &flags, &mut |l| {
         lines.push(l)
     })
     .await

@@ -23,8 +23,9 @@ fn split_config(args: &[String]) -> (Vec<String>, Option<PathBuf>) {
 #[tokio::main]
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let (args, config) = split_config(&raw);
-    let usage = "usage: gpbeam-cli [--config <path>] offload <card> <dest> | watch <dest> | mirror-status <dest> | retry-cloud <dest>";
+    let (after_config, config) = split_config(&raw);
+    let (args, flags) = gpbeam_cli::parse_safety_flags(&after_config);
+    let usage = "usage: gpbeam-cli [--config <path>] [--delete-after-verify] [--auto-eject] offload <card> <dest> | watch <dest> | mirror-status <dest> | retry-cloud <dest>";
 
     match args.first().map(|s| s.as_str()) {
         Some("offload") => {
@@ -34,7 +35,7 @@ async fn main() {
             };
             let card = PathBuf::from(card);
             let dest = PathBuf::from(dest);
-            if let Err(e) = run_offload_and_mirror(&card, &dest, config.as_deref(), &mut |l| {
+            if let Err(e) = run_offload_and_mirror(&card, &dest, config.as_deref(), &flags, &mut |l| {
                 println!("{l}")
             })
             .await
@@ -56,10 +57,11 @@ async fn main() {
                 println!("[watch] volume mounted: {}", mount.display());
                 let dest = dest.clone();
                 let config = config.clone();
-                if let Err(e) = run_offload_and_mirror(&mount, &dest, config.as_deref(), &mut |l| {
-                    println!("{l}")
-                })
-                .await
+                if let Err(e) =
+                    run_offload_and_mirror(&mount, &dest, config.as_deref(), &flags, &mut |l| {
+                        println!("{l}")
+                    })
+                    .await
                 {
                     eprintln!("error: {e}");
                 }
