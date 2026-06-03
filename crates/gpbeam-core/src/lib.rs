@@ -12,7 +12,9 @@ pub mod detect;
 pub mod orchestrator;
 pub mod backoff;
 pub mod credentials;
+pub mod eject;
 
 pub use error::{CoreError, Result};
+pub use eject::{default_ejector, Ejector, SystemEjector};
 pub use orchestrator::{run_offload, RunEvent, RunSummary};
 pub use scanner::{scan_card, scan_with_skips, PlannedCopy};
