@@ -12,7 +12,9 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 
-use gpbeam_core::config::{config_path, load_config, Config};
+use gpbeam_core::cloud::{build_uploader, worker::CloudWorker, CloudEvent};
+use gpbeam_core::config::{config_path, load_config, Config, MirrorMode};
+use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
 
@@ -64,6 +66,70 @@ fn load_or_default_config(dest: &Path) -> Config {
         }
         Err(_) => Config::new(dest.to_path_buf()),
     }
+}
+
+/// Spawn the async cloud-upload worker loop on the Tauri runtime. Called only
+/// when the loaded config has a `[cloud]` table whose `mirror_mode` is `Auto`.
+/// The worker opens its OWN rusqlite `Ledger` at `ledger_path` (WAL + busy
+/// timeout); it shares no `Connection` with the sync offload path, so it never
+/// blocks card ejection or the UI thread. Credentials come from the same
+/// `gpbeam.toml` the offload side loaded, honoring `GPBEAM_NC_*` env overrides.
+fn spawn_cloud_worker(
+    app: &AppHandle,
+    cloud: gpbeam_core::config::CloudConfig,
+    delete_after_verify: bool,
+    ledger_path: PathBuf,
+) {
+    let cfg_path = config_path(std::env::var("GPBEAM_CONFIG").ok(), &dest_root());
+    let store = match std::fs::read_to_string(&cfg_path).ok().and_then(|s| {
+        EnvConfigStore::from_toml_str(
+            &s,
+            std::env::var("GPBEAM_NC_USERNAME").ok(),
+            std::env::var("GPBEAM_NC_APP_PASSWORD").ok(),
+        )
+        .ok()
+    }) {
+        Some(s) => s,
+        None => EnvConfigStore::empty(None, None),
+    };
+
+    let uploader = match build_uploader(&cloud, &store) {
+        Ok(u) => u,
+        Err(e) => {
+            // Misconfigured cloud (e.g. missing app password) must NOT take down
+            // the M1 offload path: report once and skip the worker.
+            notify(app, "GPBeam cloud disabled", &e.to_string());
+            return;
+        }
+    };
+
+    let worker = CloudWorker::new(
+        ledger_path,
+        uploader,
+        cloud.destination_id.clone(),
+        cloud.max_concurrency,
+        cloud.max_attempts,
+        delete_after_verify,
+    );
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            let app2 = app.clone();
+            let mut emit = move |ev: CloudEvent| {
+                // Task 6.5 replaces this with forward_cloud_event(&app2, ev).
+                let _ = app2.emit("gpbeam://cloud", format!("{ev:?}"));
+            };
+            // `run_until_drained` carries its own retry-aware sleep between
+            // passes; the outer ticker re-checks for jobs enqueued by later
+            // offload runs without busy-spinning.
+            if let Err(e) = worker.run_until_drained(&mut emit).await {
+                let _ = app.emit("gpbeam://cloud", format!("worker error: {e}"));
+            }
+        }
+    });
 }
 
 /// Run one offload pass for a freshly mounted volume. Blocking I/O — call via
@@ -194,6 +260,22 @@ pub fn run() {
                     let _ = tauri::async_runtime::spawn_blocking(move || handle_mount(&h, mount)).await;
                 }
             });
+
+            // M2: if cloud mirroring is configured for Auto, run the upload worker
+            // alongside the offload worker. No [cloud] table (or a non-Auto mode)
+            // -> nothing spawned and the process behaves byte-for-byte like M1.
+            let dest = dest_root();
+            let cfg = load_or_default_config(&dest);
+            if let Some(cloud) = cfg.cloud {
+                if cloud.mirror_mode == MirrorMode::Auto {
+                    spawn_cloud_worker(
+                        &app.handle().clone(),
+                        cloud,
+                        cfg.delete_after_verify,
+                        ledger_path(&dest),
+                    );
+                }
+            }
 
             Ok(())
         })
