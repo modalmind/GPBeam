@@ -90,6 +90,18 @@ impl Config {
     }
 }
 
+/// Resolve which `gpbeam.toml` to load.
+///
+/// `env` is the raw value of the `GPBEAM_CONFIG` environment variable (pass
+/// `std::env::var("GPBEAM_CONFIG").ok()`). A non-empty value is used verbatim.
+/// Otherwise we look for `gpbeam.toml` directly inside the destination root.
+pub fn config_path(env: Option<String>, dest_root: &Path) -> PathBuf {
+    match env {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => dest_root.join("gpbeam.toml"),
+    }
+}
+
 /// Read and parse a `gpbeam.toml` configuration file.
 ///
 /// IO failures map to [`CoreError::Io`]; toml/serde parse failures map to
@@ -223,5 +235,24 @@ mod tests {
         let path = dir.path().join("does-not-exist.toml");
         let err = load_config(&path).unwrap_err();
         assert!(matches!(err, crate::error::CoreError::Io { .. }));
+    }
+
+    #[test]
+    fn config_path_prefers_env_override() {
+        let env = Some("/etc/gpbeam/custom.toml".to_string());
+        let got = config_path(env, Path::new("/Users/me/GPBeam"));
+        assert_eq!(got, PathBuf::from("/etc/gpbeam/custom.toml"));
+    }
+
+    #[test]
+    fn config_path_empty_env_falls_back_to_dest_default() {
+        let got = config_path(Some(String::new()), Path::new("/Users/me/GPBeam"));
+        assert_eq!(got, PathBuf::from("/Users/me/GPBeam").join("gpbeam.toml"));
+    }
+
+    #[test]
+    fn config_path_no_env_falls_back_to_dest_default() {
+        let got = config_path(None, Path::new("/Users/me/GPBeam"));
+        assert_eq!(got, PathBuf::from("/Users/me/GPBeam").join("gpbeam.toml"));
     }
 }
