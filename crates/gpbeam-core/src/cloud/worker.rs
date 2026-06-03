@@ -70,19 +70,26 @@ impl CloudWorker {
         let mut set: JoinSet<JobResult> = JoinSet::new();
         for job in claimed {
             let uploader = Arc::clone(&self.uploader);
+            let ledger_path_for_task = self.ledger_path.clone();
             set.spawn(async move {
                 let local = PathBuf::from(&job.local_path);
                 let resume = job.resume_state.clone();
                 let total = job.total_bytes;
-                // Progress is collected locally; persistence is wired in Task 3.4.
-                let mut last_uploaded = job.uploaded_bytes;
-                let mut on_progress = |n: u64| {
-                    last_uploaded = n;
+                let job_id = job.id;
+                let progress_ledger_path = ledger_path_for_task.clone();
+
+                // Persist progress as bytes arrive so an interrupted upload can resume.
+                let mut on_progress = |uploaded: u64| {
+                    if let Ok(mut l) = Ledger::open(&progress_ledger_path) {
+                        let state = ResumeState { upload_id: None, uploaded_bytes: uploaded };
+                        let _ = l.save_job_progress(job_id, uploaded, &state);
+                    }
                 };
+
                 let result = uploader
                     .upload(&local, &job.remote_path, total, resume, &mut on_progress)
                     .await;
-                JobResult { job, result, last_uploaded }
+                JobResult { job, result, last_uploaded: 0 }
             });
         }
 
@@ -441,5 +448,61 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert!(failed[0].next_retry_at.is_none(), "no retry after exhaustion");
         assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn progress_is_persisted_and_next_claim_resumes() {
+        let dir = TempDir::new().unwrap();
+        // A larger job so partial progress is meaningful.
+        let path = dir.path().join("ledger.sqlite");
+        let job_id = {
+            let mut l = Ledger::open(&path).unwrap();
+            let imported_id = l
+                .record("C346", "GX010002.MP4", 100_000, 1000, "/dest/GX010002.MP4", Some("h"))
+                .unwrap();
+            l.enqueue_cloud_job(imported_id, "nc1", "/dest/GX010002.MP4", "GX010002.MP4", 100_000, None)
+                .unwrap()
+        };
+
+        // Attempt 1: report 60_000 bytes via progress, THEN fail retryably.
+        // Attempt 2: succeed (and must SEE the persisted resume state).
+        let uploader = Arc::new(MockUploader::scripted(vec![
+            Behavior {
+                progress_to: Some(60_000),
+                outcome: AttemptOutcome::Err(CoreError::Http {
+                    status: Some(429),
+                    msg: "slow down".into(),
+                }),
+            },
+            Behavior {
+                progress_to: Some(100_000),
+                outcome: AttemptOutcome::Ok { bytes: 100_000, etag: Some("e".into()) },
+            },
+        ]));
+        let worker = CloudWorker::new(path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+
+        // Pass 1: partial then retryable fail.
+        worker.run_once(1000, &mut |_| {}).await.unwrap();
+
+        // The 60_000 bytes of progress are persisted on the (now Failed) row.
+        {
+            let l = Ledger::open(&path).unwrap();
+            let jobs = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].id, job_id);
+            assert_eq!(jobs[0].uploaded_bytes, 60_000, "progress persisted across the failure");
+            let resume = jobs[0].resume_state.as_ref().expect("resume_state persisted");
+            assert_eq!(resume.uploaded_bytes, 60_000);
+        }
+
+        // Pass 2 after the retry window: resumes and finishes.
+        worker.run_once(100_000, &mut |_| {}).await.unwrap();
+        {
+            let l = Ledger::open(&path).unwrap();
+            let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
+            assert_eq!(done.len(), 1);
+            assert_eq!(done[0].uploaded_bytes, 100_000);
+            assert_eq!(l.pending_cloud_count().unwrap(), 0);
+        }
     }
 }
