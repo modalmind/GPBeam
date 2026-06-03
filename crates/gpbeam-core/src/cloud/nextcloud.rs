@@ -684,14 +684,19 @@ impl CloudUploader for NextcloudUploader {
 
     async fn upload(
         &self,
-        _local: &Path,
-        _remote: &str,
-        _total: u64,
-        _resume: Option<ResumeState>,
-        _progress: &mut (dyn FnMut(u64) + Send),
+        local: &Path,
+        remote: &str,
+        total: u64,
+        resume: Option<ResumeState>,
+        progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<UploadOutcome> {
-        // Implemented in Task 2.9 (dispatcher) atop put_simple/put_chunked.
-        Err(CoreError::Config("upload not yet implemented".into()))
+        let remote_rel = self.remote_rel(remote);
+        if total < self.chunk_threshold {
+            self.put_simple(local, &remote_rel, total, progress).await
+        } else {
+            self.put_chunked(local, &remote_rel, total, resume, progress)
+                .await
+        }
     }
 }
 
@@ -701,6 +706,7 @@ mod tests {
     use crate::config::{CloudConfig, CloudKind, MirrorMode};
     use crate::credentials::Secret;
     use std::path::PathBuf;
+    use wiremock::matchers::path_regex as wm_path_regex;
     use wiremock::matchers::{header, method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1075,5 +1081,91 @@ mod tests {
             .unwrap();
         assert_eq!(out.bytes, total);
         assert_eq!(last, total);
+    }
+
+    #[tokio::test]
+    async fn upload_small_uses_simple_put() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server.uri());
+        cfg.chunk_threshold = 50 * 1024 * 1024; // small file is below threshold
+
+        Mock::given(wm_method("PUT"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/small.mp4"))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"s1\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No chunk dance should occur.
+        Mock::given(wm_method("MKCOL"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg, &test_secret()).unwrap();
+        let f = tmp_file(b"tiny");
+        let mut cb = |_n: u64| {};
+        let out = up
+            .upload(f.path(), "small.mp4", 4, None, &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.remote_ref, "GoPro/small.mp4");
+        assert_eq!(out.etag.as_deref(), Some("\"s1\""));
+    }
+
+    #[tokio::test]
+    async fn upload_large_uses_chunk_dance() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server.uri());
+        cfg.chunk_threshold = 1024; // force chunking for anything bigger than 1 KiB
+        let total: u64 = 6 * 1024 * 1024; // 2 chunks @ 5 MiB
+
+        Mock::given(wm_method("MKCOL"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("PUT"))
+            .and(wm_path_regex(r"^/remote\.php/dav/uploads/alice/.+/\d{5}$"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("MOVE"))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"big\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg, &test_secret()).unwrap();
+        let f = tmp_file(&vec![1u8; total as usize]);
+        let mut cb = |_n: u64| {};
+        let out = up
+            .upload(f.path(), "big.mp4", total, None, &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.bytes, total);
+        assert_eq!(out.etag.as_deref(), Some("\"big\""));
+    }
+
+    #[tokio::test]
+    async fn upload_401_maps_to_cloud_auth() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server.uri());
+        cfg.chunk_threshold = 50 * 1024 * 1024;
+
+        Mock::given(wm_method("PUT"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg, &test_secret()).unwrap();
+        let f = tmp_file(b"x");
+        let mut cb = |_n: u64| {};
+        let err = up
+            .upload(f.path(), "x.mp4", 1, None, &mut cb)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::CloudAuth(_)), "got {err:?}");
     }
 }
