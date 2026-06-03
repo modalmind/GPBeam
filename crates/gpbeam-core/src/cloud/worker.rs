@@ -20,12 +20,15 @@ pub struct CloudWorker {
     delete_after_verify: bool,
 }
 
-/// Carries an upload result back from a spawned `JoinSet` task.
+/// Carries an upload result back from a spawned `JoinSet` task. When
+/// `skipped` is set, `already_present` reported the remote object already
+/// exists (G2) and `upload` was NOT called; the drain loop marks the job Done
+/// without consulting `result`.
 struct JobResult {
     job: CloudJob,
-    result: Result<UploadOutcome>,
-    #[allow(dead_code)]
-    last_uploaded: u64,
+    /// `Ok(Some(_))` on a completed upload, `Ok(None)` when skipped as already
+    /// present, `Err(_)` on an upload (or pre-flight `already_present`) failure.
+    result: Result<Option<UploadOutcome>>,
 }
 
 impl CloudWorker {
@@ -70,31 +73,69 @@ impl CloudWorker {
             let ledger_path_for_task = self.ledger_path.clone();
             set.spawn(async move {
                 let local = PathBuf::from(&job.local_path);
-                let resume = job.resume_state.clone();
                 let total = job.total_bytes;
                 let job_id = job.id;
+                // G1: a deterministic upload id derived from the job id so a
+                // chunked upload resumes the SAME remote session across restarts.
+                let upload_id = format!("gpbeam-{job_id}");
                 let progress_ledger_path = ledger_path_for_task.clone();
 
-                // Persist progress as bytes arrive so an interrupted upload can resume.
+                // G2 idempotent skip: if the remote object already exists, do
+                // NOT upload — signal a skip and let the drain loop mark Done.
+                match uploader.already_present(&job.remote_path, total).await {
+                    Ok(true) => {
+                        return JobResult { job, result: Ok(None) };
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        return JobResult { job, result: Err(e) };
+                    }
+                }
+
+                // G1: carry the deterministic id + persisted byte count into
+                // every attempt so `put_chunked` continues the same session.
+                let resume = Some(ResumeState {
+                    upload_id: Some(upload_id.clone()),
+                    uploaded_bytes: job.uploaded_bytes,
+                });
+
+                // Persist progress as bytes arrive so an interrupted upload can
+                // resume — keep the deterministic upload_id so it survives restarts.
+                let progress_upload_id = upload_id.clone();
                 let mut on_progress = |uploaded: u64| {
                     if let Ok(mut l) = Ledger::open(&progress_ledger_path) {
-                        let state = ResumeState { upload_id: None, uploaded_bytes: uploaded };
+                        let state = ResumeState {
+                            upload_id: Some(progress_upload_id.clone()),
+                            uploaded_bytes: uploaded,
+                        };
                         let _ = l.save_job_progress(job_id, uploaded, &state);
                     }
                 };
 
                 let result = uploader
                     .upload(&local, &job.remote_path, total, resume, &mut on_progress)
-                    .await;
-                JobResult { job, result, last_uploaded: 0 }
+                    .await
+                    .map(Some);
+                JobResult { job, result }
             });
         }
 
         let mut terminal = 0usize;
         while let Some(joined) = set.join_next().await {
             // A spawned task panicking is a bug; surface it.
-            let JobResult { job, result, last_uploaded: _ } =
-                joined.expect("upload task panicked");
+            let JobResult { job, result } = joined.expect("upload task panicked");
+
+            // G2: a job whose remote object already existed was skipped (no
+            // upload). Mark it Done + Mirrored without emitting an Uploading
+            // event, then move on.
+            if matches!(result, Ok(None)) {
+                let mut ledger = Ledger::open(&self.ledger_path)?;
+                ledger.mark_job_done(job.id)?;
+                ledger.set_cloud_status(job.imported_id, "done")?;
+                emit(CloudEvent::Mirrored { file: job.remote_path.clone() });
+                terminal += 1;
+                continue;
+            }
 
             emit(CloudEvent::Uploading {
                 file: job.remote_path.clone(),
@@ -105,11 +146,11 @@ impl CloudWorker {
             match result {
                 Ok(outcome) => {
                     let mut ledger = Ledger::open(&self.ledger_path)?;
-                    // Record full byte count on success, then mark Done. (Mid-upload
-                    // progress persistence is wired in Task 3.4; here a verified
-                    // upload means the whole file landed.)
+                    // Record full byte count on success, then mark Done. A
+                    // verified upload means the whole file landed; persist the
+                    // deterministic upload_id so a later resume can reuse it.
                     let resume = ResumeState {
-                        upload_id: None,
+                        upload_id: Some(format!("gpbeam-{}", job.id)),
                         uploaded_bytes: job.total_bytes,
                     };
                     ledger.save_job_progress(job.id, job.total_bytes, &resume)?;
@@ -240,6 +281,7 @@ mod tests {
     use async_trait::async_trait;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     /// A scriptable uploader for worker tests. Never touches the network.
@@ -250,6 +292,9 @@ mod tests {
         behaviors: Vec<Behavior>,
         calls: AtomicUsize,
         present: bool,
+        /// The `ResumeState` handed to the LAST `upload()` call, captured for
+        /// G1 assertions (`None` until `upload` is invoked once).
+        last_resume: Mutex<Option<ResumeState>>,
     }
 
     struct Behavior {
@@ -289,16 +334,40 @@ mod tests {
                 }],
                 calls: AtomicUsize::new(0),
                 present: false,
+                last_resume: Mutex::new(None),
             }
         }
 
         #[allow(dead_code)]
         fn scripted(behaviors: Vec<Behavior>) -> Self {
-            MockUploader { behaviors, calls: AtomicUsize::new(0), present: false }
+            MockUploader {
+                behaviors,
+                calls: AtomicUsize::new(0),
+                present: false,
+                last_resume: Mutex::new(None),
+            }
+        }
+
+        /// An uploader whose `already_present` always returns `true` (G2 skip).
+        fn already_present() -> Self {
+            MockUploader {
+                behaviors: vec![Behavior {
+                    progress_to: None,
+                    outcome: AttemptOutcome::Ok { bytes: 0, etag: None },
+                }],
+                calls: AtomicUsize::new(0),
+                present: true,
+                last_resume: Mutex::new(None),
+            }
         }
 
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        /// The `ResumeState` captured from the last `upload()` call, if any.
+        fn last_resume(&self) -> Option<ResumeState> {
+            self.last_resume.lock().unwrap().clone()
         }
     }
 
@@ -313,9 +382,10 @@ mod tests {
             _local: &Path,
             _remote: &str,
             total: u64,
-            _resume: Option<ResumeState>,
+            resume: Option<ResumeState>,
             progress: &mut (dyn FnMut(u64) + Send),
         ) -> Result<UploadOutcome> {
+            *self.last_resume.lock().unwrap() = resume;
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             let b = self
                 .behaviors
@@ -570,6 +640,94 @@ mod tests {
             assert_eq!(done[0].uploaded_bytes, 100_000);
             assert_eq!(l.pending_cloud_count().unwrap(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn already_present_remote_skips_upload_and_marks_done() {
+        // G2 idempotent skip: a queued job whose remote object already exists
+        // must reach Done and emit Mirrored WITHOUT the uploader being called.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+
+        let uploader = Arc::new(MockUploader::already_present());
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        let terminal = worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(terminal, 1, "the skipped job reached a terminal state");
+        assert_eq!(
+            uploader.call_count(),
+            0,
+            "upload() must NEVER be called when already_present is true"
+        );
+
+        // Job is Done in the ledger; imported row marked done; queue drained.
+        let l = Ledger::open(&ledger_path).unwrap();
+        let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].id, job_id);
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+
+        // A Mirrored event was emitted for the file.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CloudEvent::Mirrored { file } if file == "GX010001.MP4"
+        )));
+    }
+
+    #[tokio::test]
+    async fn worker_passes_deterministic_resume_id_and_carries_uploaded_bytes() {
+        // G1 deterministic chunked resume: the worker must derive
+        // upload_id = "gpbeam-{job.id}" and pass it (plus the persisted
+        // uploaded_bytes) into upload() on every attempt. Seed a NON-ZERO
+        // uploaded_bytes so the carry-through across a retry is proven.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+
+        // Persist partial progress (2048 of 4096) so the job carries a non-zero
+        // uploaded_bytes into the next claim.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let resume = ResumeState { upload_id: None, uploaded_bytes: 2048 };
+            l.save_job_progress(job_id, 2048, &resume).unwrap();
+        }
+
+        let uploader = Arc::new(MockUploader::ok(4096));
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        worker.run_once(1000, &mut |_| {}).await.unwrap();
+
+        assert_eq!(uploader.call_count(), 1, "upload was attempted once");
+        let resume = uploader
+            .last_resume()
+            .expect("worker passed a ResumeState into upload()");
+        assert_eq!(
+            resume.upload_id,
+            Some(format!("gpbeam-{job_id}")),
+            "deterministic upload_id derived from the job id"
+        );
+        assert_eq!(
+            resume.uploaded_bytes, 2048,
+            "the persisted uploaded_bytes is carried into the upload"
+        );
     }
 
     #[tokio::test]
