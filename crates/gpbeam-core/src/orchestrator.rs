@@ -18,11 +18,25 @@ pub enum RunEvent {
     Verified { file: String },
     Skipped { file: String },
     Failed { file: String, error: String },
+    CloudQueued { file: String },
     RunComplete { copied: usize, skipped: usize, failed: usize, bytes: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RunSummary { pub copied: usize, pub skipped: usize, pub failed: usize, pub bytes: u64 }
+pub struct RunSummary { pub copied: usize, pub skipped: usize, pub failed: usize, pub bytes: u64, pub queued: usize }
+
+/// Join the configured `remote_root` with a destination filename to form a
+/// remote-relative path. Always uses '/' (WebDAV remote paths use '/' regardless
+/// of host OS) and trims redundant slashes between the two parts.
+pub(crate) fn remote_path_for(remote_root: &str, dest_name: &str) -> String {
+    let root = remote_root.trim_end_matches('/');
+    let name = dest_name.trim_start_matches('/');
+    if root.is_empty() {
+        name.to_string()
+    } else {
+        format!("{root}/{name}")
+    }
+}
 
 /// Run one offload pass for a mounted volume `card_root` into `cfg.dest_root`.
 /// Emits `RunEvent`s for UI/CLI/notification consumers. Non-destructive: never
@@ -35,7 +49,7 @@ pub fn run_offload(
 ) -> Result<RunSummary> {
     if !is_gopro_card(card_root) {
         emit(RunEvent::NotGoPro(card_root.to_path_buf()));
-        return Ok(RunSummary { copied: 0, skipped: 0, failed: 0, bytes: 0 });
+        return Ok(RunSummary { copied: 0, skipped: 0, failed: 0, bytes: 0, queued: 0 });
     }
 
     let version = read_version(card_root);
@@ -64,6 +78,7 @@ pub fn run_offload(
     let mut failed = 0usize;
     let mut bytes = 0u64;
     let mut skipped_recovered = 0usize;
+    let mut queued = 0usize;
 
     for (i, item) in plan.iter().enumerate() {
         // Record-or-recover: a verified dest file may already exist from a prior
@@ -98,7 +113,7 @@ pub fn run_offload(
         match copy_verified(&item.src, &item.dest_path, cfg.verify, &mut |_| {}) {
             Ok(out) => {
                 let n = out.bytes;
-                ledger.record(
+                let imported_id = ledger.record(
                     serial_key,
                     &item.name,
                     item.size,
@@ -110,6 +125,27 @@ pub fn run_offload(
                 copied += 1;
                 emit(RunEvent::Progress { file: item.name.clone(), copied: n, total: n });
                 emit(RunEvent::Verified { file: item.name.clone() });
+
+                // Cloud mirror: enqueue a job for Auto OR Manual (Contract G3).
+                // Off (and no [cloud] config at all) enqueues nothing. The card
+                // source path is retained so the worker can delete it after a
+                // verified upload (Auto + delete-after-verify).
+                if let Some(cloud) = &cfg.cloud {
+                    use crate::config::MirrorMode;
+                    if matches!(cloud.mirror_mode, MirrorMode::Auto | MirrorMode::Manual) {
+                        let remote = remote_path_for(&cloud.remote_root, &item.dest_name);
+                        ledger.enqueue_cloud_job(
+                            imported_id,
+                            &cloud.destination_id,
+                            &item.dest_path.to_string_lossy(),
+                            &remote,
+                            item.size,
+                            Some(&item.src.to_string_lossy()),
+                        )?;
+                        queued += 1;
+                        emit(RunEvent::CloudQueued { file: item.name.clone() });
+                    }
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -119,7 +155,7 @@ pub fn run_offload(
     }
 
     let skipped = skipped + skipped_recovered;
-    let summary = RunSummary { copied, skipped, failed, bytes };
+    let summary = RunSummary { copied, skipped, failed, bytes, queued };
     emit(RunEvent::RunComplete { copied, skipped, failed, bytes });
     Ok(summary)
 }
@@ -197,6 +233,103 @@ mod tests {
         let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.skipped, 4);
         assert_eq!(s2.copied, 0);
+    }
+
+    fn cloud_cfg(dest: std::path::PathBuf, mode: crate::config::MirrorMode) -> Config {
+        use crate::config::{CloudConfig, CloudKind};
+        let mut cfg = Config::new(dest);
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://nc.example".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: mode,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        });
+        cfg
+    }
+
+    #[test]
+    fn auto_mirror_enqueues_one_job_per_copied_file() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Auto);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        assert_eq!(summary.queued, 4, "one cloud job queued per copied file");
+
+        let queued_events = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::CloudQueued { .. }))
+            .count();
+        assert_eq!(queued_events, 4);
+
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 4);
+
+        // remote_path == remote_root + "/" + dest_name (forward-slash join).
+        let jobs = ledger.list_cloud_jobs(None).unwrap();
+        assert!(jobs.iter().all(|j| j.remote_path.starts_with("GoPro/")));
+        assert!(jobs.iter().all(|j| j.destination_id == "nc1"));
+        // card_src is the on-card source path (so the worker can delete after upload).
+        assert!(jobs
+            .iter()
+            .all(|j| j.card_src.as_deref().is_some_and(|s| s.contains("DCIM"))));
+    }
+
+    #[test]
+    fn manual_mirror_also_enqueues_jobs() {
+        // Contract G3: run_offload enqueues for BOTH Auto and Manual.
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Manual);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        assert_eq!(summary.queued, 4, "Manual mirror queues jobs too");
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn off_mirror_enqueues_nothing() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Off);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        assert_eq!(summary.queued, 0);
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn no_cloud_config_queues_nothing_m1_unchanged() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf()); // cloud = None
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 4);
+        assert_eq!(summary.queued, 0);
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 0);
     }
 
     #[test]

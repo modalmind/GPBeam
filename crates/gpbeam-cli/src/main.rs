@@ -23,6 +23,7 @@ fn print_event(e: RunEvent) {
         RunEvent::Verified { file } => println!("  [ok] {file}"),
         RunEvent::Skipped { file } => println!("  [skip] {file}"),
         RunEvent::Failed { file, error } => eprintln!("  [FAIL] {file}: {error}"),
+        RunEvent::CloudQueued { file } => println!("  [queued] {file}"),
         RunEvent::RunComplete { copied, skipped, failed, bytes } =>
             println!("[done] copied {copied}, skipped {skipped}, failed {failed}, {bytes} bytes"),
     }
