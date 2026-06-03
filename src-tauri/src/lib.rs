@@ -34,6 +34,35 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
+/// Map one `CloudEvent` to UI side effects. The full event is always forwarded
+/// to the popover on `gpbeam://cloud`; terminal events also drive the tray icon
+/// and a native notification, reusing the M1 `set_tray_state` / `notify` paths.
+/// `CloudEvent` has exactly four variants (no `Ejected` — auto-eject is the sync
+/// offload path's job and surfaces as `RunEvent::Ejected`), so this match stays
+/// exhaustive over the locked contract.
+fn forward_cloud_event(app: &AppHandle, ev: CloudEvent) {
+    // Always surface the raw event to the popover UI.
+    let _ = app.emit("gpbeam://cloud", format!("{ev:?}"));
+
+    match ev {
+        CloudEvent::Uploading { .. } => {
+            // In-flight upload: reflect activity in the tray, no notification.
+            set_tray_state(app, "working");
+        }
+        CloudEvent::Mirrored { file } => {
+            set_tray_state(app, "idle");
+            notify(app, "GPBeam", &format!("Mirrored {file} to cloud"));
+        }
+        CloudEvent::CloudFailed { file, error } => {
+            set_tray_state(app, "error");
+            notify(app, "GPBeam cloud error", &format!("{file}: {error}"));
+        }
+        CloudEvent::Deleted { file } => {
+            notify(app, "GPBeam", &format!("Freed card space: {file}"));
+        }
+    }
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -118,10 +147,7 @@ fn spawn_cloud_worker(
         loop {
             ticker.tick().await;
             let app2 = app.clone();
-            let mut emit = move |ev: CloudEvent| {
-                // Task 6.5 replaces this with forward_cloud_event(&app2, ev).
-                let _ = app2.emit("gpbeam://cloud", format!("{ev:?}"));
-            };
+            let mut emit = move |ev: CloudEvent| forward_cloud_event(&app2, ev);
             // `run_until_drained` carries its own retry-aware sleep between
             // passes; the outer ticker re-checks for jobs enqueued by later
             // offload runs without busy-spinning.
