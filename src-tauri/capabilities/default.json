@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "GPBeam core capability (M1 tray shell)",
+  "windows": ["popover", "settings"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:app:default",
+    "positioner:default",
+    "notification:default",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled"
+  ]
+}

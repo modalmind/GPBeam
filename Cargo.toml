@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gpbeam-core", "crates/gpbeam-cli"]
-# src-tauri is added in Phase 9 (it has its own build flow)
+members = ["crates/gpbeam-core", "crates/gpbeam-cli", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
