@@ -35,7 +35,8 @@ pub fn scan_card(
     let mut media_dirs: Vec<PathBuf> = folders
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str())
+            .map(crate::gopro::is_gopro_media_folder).unwrap_or(false))
         .collect();
     media_dirs.sort();
 
@@ -146,6 +147,47 @@ mod tests {
         // default template {date}_{original}; date derived from mtime (varies), so just check shape
         assert!(mp4.dest_name.ends_with("_GX010001.MP4"));
         assert_eq!(mp4.dest_path.parent().unwrap(), dest.path());
+    }
+
+    #[test]
+    fn includes_thumbnails_when_enabled() {
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.include_thumbnails = true;
+        let ledger = Ledger::open_in_memory().unwrap();
+        let plan = scan_card(card.root(), &cfg, &ledger, Some("C346")).unwrap();
+        assert!(plan.iter().any(|p| p.name.ends_with(".THM")));
+    }
+
+    #[test]
+    fn unknown_kind_file_is_still_planned() {
+        use std::fs;
+        let card = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(card.path().join("DCIM/100GOPRO")).unwrap();
+        fs::write(card.path().join("DCIM/100GOPRO/GX010001.XYZ"), vec![0u8; 8]).unwrap();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let ledger = Ledger::open_in_memory().unwrap();
+        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346")).unwrap();
+        assert!(plan.iter().any(|p| p.name == "GX010001.XYZ"), "unknown media must still be copied");
+    }
+
+    #[test]
+    fn ignores_non_gopro_dcim_subfolders() {
+        use std::fs;
+        let card = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(card.path().join("DCIM/100GOPRO")).unwrap();
+        fs::write(card.path().join("DCIM/100GOPRO/GX010001.MP4"), vec![0u8; 16]).unwrap();
+        fs::create_dir_all(card.path().join("DCIM/Camera")).unwrap(); // non-GoPro
+        fs::write(card.path().join("DCIM/Camera/IMG_0001.JPG"), vec![0u8; 16]).unwrap();
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let ledger = Ledger::open_in_memory().unwrap();
+        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346")).unwrap();
+        let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"GX010001.MP4"));
+        assert!(!names.contains(&"IMG_0001.JPG"), "non-GoPro DCIM folders must be ignored");
     }
 
     #[test]

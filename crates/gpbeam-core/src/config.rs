@@ -36,6 +36,8 @@ mod tests {
         let c = Config::new(PathBuf::from("/tmp/dest"));
         assert_eq!(c.filename_template, "{date}_{original}");
         assert!(!c.include_proxies);
+        assert!(!c.include_thumbnails);
+        assert_eq!(c.layout, Layout::Flat);
         assert!(c.verify);
         assert_eq!(c.space_headroom, 1024 * 1024 * 1024);
     }

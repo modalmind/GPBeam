@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// True for folder names like 100GOPRO, 101GOPRO ... 999GOPRO.
-fn is_gopro_media_folder(name: &str) -> bool {
+pub(crate) fn is_gopro_media_folder(name: &str) -> bool {
     let b = name.as_bytes();
     b.len() == 8
         && b[0].is_ascii_digit() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
