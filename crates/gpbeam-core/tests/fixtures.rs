@@ -2,7 +2,7 @@
 //! Included by other test files via `#[path = "fixtures.rs"] mod fixtures;`.
 #![allow(dead_code)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::TempDir;
 
 pub struct Card { pub dir: TempDir }

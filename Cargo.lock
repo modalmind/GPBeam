@@ -252,6 +252,7 @@ name = "gpbeam-cli"
 version = "0.1.0"
 dependencies = [
  "gpbeam-core",
+ "tokio",
 ]
 
 [[package]]
