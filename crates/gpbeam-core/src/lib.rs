@@ -11,3 +11,5 @@ pub mod detect;
 pub mod orchestrator;
 
 pub use error::{CoreError, Result};
+pub use orchestrator::{run_offload, RunEvent, RunSummary};
+pub use scanner::{scan_card, scan_with_skips, PlannedCopy};
