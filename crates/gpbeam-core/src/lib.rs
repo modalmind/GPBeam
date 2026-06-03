@@ -14,6 +14,7 @@ pub mod backoff;
 pub mod credentials;
 pub mod eject;
 
+pub use cloud::{build_uploader, CloudEvent, CloudUploader};
 pub use error::{CoreError, Result};
 pub use eject::{default_ejector, Ejector, SystemEjector};
 pub use orchestrator::{run_offload, RunEvent, RunSummary};

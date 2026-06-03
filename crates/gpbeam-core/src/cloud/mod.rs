@@ -2,10 +2,14 @@
 //! `cloud_jobs` queue and uploads verified media to a remote destination
 //! (Nextcloud via WebDAV) through the [`CloudUploader`] trait.
 
-use crate::error::Result;
+use crate::cloud::nextcloud::NextcloudUploader;
+use crate::config::{CloudConfig, CloudKind};
+use crate::credentials::CredentialStore;
+use crate::error::{CoreError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
 
 pub mod nextcloud;
 pub mod worker;
@@ -57,6 +61,27 @@ pub trait CloudUploader: Send + Sync {
         resume: Option<ResumeState>,
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<UploadOutcome>;
+}
+
+/// Build the concrete cloud uploader for a `CloudConfig`, looking its secret up
+/// in `store` by `destination_id`. Returns `CoreError::Config` (non-retryable)
+/// when no credential is configured for that destination.
+pub fn build_uploader(
+    cfg: &CloudConfig,
+    store: &dyn CredentialStore,
+) -> Result<Arc<dyn CloudUploader>> {
+    let secret = store.get(&cfg.destination_id)?.ok_or_else(|| {
+        CoreError::Config(format!(
+            "no credentials configured for cloud destination '{}'",
+            cfg.destination_id
+        ))
+    })?;
+    match cfg.kind {
+        CloudKind::Nextcloud => {
+            let up = NextcloudUploader::new(cfg, &secret)?;
+            Ok(Arc::new(up))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +150,55 @@ pub(crate) mod test_support {
             CoreError::Config(m) => CoreError::Config(m.clone()),
             other => CoreError::Config(format!("{other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod build_uploader_tests {
+    use super::*;
+    use crate::config::{CloudConfig, CloudKind, MirrorMode};
+    use crate::credentials::EnvConfigStore;
+
+    fn cfg() -> CloudConfig {
+        CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "home-nc".into(),
+            base_url: "https://nc.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: MirrorMode::Auto,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        }
+    }
+
+    #[test]
+    fn missing_secret_is_a_config_error() {
+        let store = EnvConfigStore::empty(None, None);
+        // `Arc<dyn CloudUploader>` is not `Debug`, so match the result directly
+        // rather than `unwrap_err()`.
+        match build_uploader(&cfg(), &store) {
+            Err(crate::error::CoreError::Config(msg)) => {
+                assert!(msg.contains("home-nc"), "message should name the destination: {msg}");
+            }
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("expected a Config error, got an uploader"),
+        }
+    }
+
+    #[test]
+    fn present_secret_builds_an_uploader() {
+        let toml = r#"
+[credentials.home-nc]
+username = "alice"
+app_password = "abcd-efgh-ijkl"
+"#;
+        let store = EnvConfigStore::from_toml_str(toml, None, None).unwrap();
+        let up = build_uploader(&cfg(), &store).expect("uploader builds with a present secret");
+        // It is an Arc<dyn CloudUploader>; just confirm we got one.
+        assert_eq!(std::sync::Arc::strong_count(&up), 1);
     }
 }
 
