@@ -3,7 +3,68 @@
 use crate::config::CloudConfig;
 use crate::credentials::Secret;
 use crate::error::{CoreError, Result};
-use reqwest::Client;
+use async_trait::async_trait;
+use reqwest::{Client, Method};
+use std::path::Path;
+
+use crate::cloud::{CloudUploader, ResumeState, UploadOutcome};
+
+const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop>
+    <d:getcontentlength/>
+    <d:getetag/>
+    <d:resourcetype/>
+  </d:prop>
+</d:propfind>"#;
+
+/// Extract the first `<d:getcontentlength>` value from a PROPFIND 207 body.
+/// Namespace-agnostic: matches any element whose local name is `getcontentlength`.
+pub(crate) fn parse_first_contentlength(xml: &str) -> Option<u64> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_len = false;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                if local_name_eq(e.name().as_ref(), b"getcontentlength") {
+                    in_len = true;
+                }
+            }
+            Ok(Event::Text(t)) if in_len => {
+                if let Ok(s) = t.unescape() {
+                    if let Ok(n) = s.trim().parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+                in_len = false;
+            }
+            Ok(Event::End(e)) => {
+                if local_name_eq(e.name().as_ref(), b"getcontentlength") {
+                    in_len = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+/// Compare an XML qualified name's local part (after any `:`) to `local`.
+fn local_name_eq(qname: &[u8], local: &[u8]) -> bool {
+    let tail = match qname.iter().rposition(|&b| b == b':') {
+        Some(i) => &qname[i + 1..],
+        None => qname,
+    };
+    tail == local
+}
 
 /// Percent-encode each path segment, preserving the `/` separators. Encodes
 /// spaces, `#`, `?`, `+`, and other reserved/unsafe bytes per segment.
@@ -108,7 +169,6 @@ impl NextcloudUploader {
 
     /// Join the configured `remote_root` with a per-file relative path.
     /// Consumed by the request builders in Phase 2 Tasks 2.4–2.9.
-    #[allow(dead_code)]
     pub(crate) fn remote_rel(&self, remote: &str) -> String {
         let root = self.remote_root.trim_matches('/');
         let file = remote.trim_start_matches('/');
@@ -120,12 +180,73 @@ impl NextcloudUploader {
     }
 }
 
+impl NextcloudUploader {
+    /// PROPFIND Depth:0 the file URL. 207 with a content-length present => exists;
+    /// 404 => missing; 401 => CloudAuth; other => Http.
+    pub(crate) async fn propfind_present(&self, remote: &str, _size: u64) -> Result<bool> {
+        let rel = self.remote_rel(remote);
+        let url = files_url(&self.base_url, &self.username, &rel);
+        let method = Method::from_bytes(b"PROPFIND").expect("valid method");
+        let resp = self
+            .client
+            .request(method, &url)
+            .basic_auth(&self.username, Some(&self.app_password))
+            .header("Depth", "0")
+            .header(reqwest::header::CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(PROPFIND_BODY)
+            .send()
+            .await
+            .map_err(transport_err)?;
+
+        match resp.status().as_u16() {
+            207 => {
+                let body = resp.text().await.map_err(transport_err)?;
+                Ok(parse_first_contentlength(&body).is_some())
+            }
+            404 => Ok(false),
+            401 => Err(CoreError::CloudAuth(
+                "PROPFIND rejected (401); generate a Nextcloud app password".into(),
+            )),
+            s => Err(CoreError::Http {
+                status: Some(s),
+                msg: format!("PROPFIND {url} -> {s}"),
+            }),
+        }
+    }
+}
+
+/// Map a reqwest transport error to a retryable `Http { status: None, .. }`.
+pub(crate) fn transport_err(e: reqwest::Error) -> CoreError {
+    CoreError::Http { status: None, msg: e.to_string() }
+}
+
+#[async_trait]
+impl CloudUploader for NextcloudUploader {
+    async fn already_present(&self, remote: &str, size: u64) -> Result<bool> {
+        self.propfind_present(remote, size).await
+    }
+
+    async fn upload(
+        &self,
+        _local: &Path,
+        _remote: &str,
+        _total: u64,
+        _resume: Option<ResumeState>,
+        _progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<UploadOutcome> {
+        // Implemented in Task 2.9 (dispatcher) atop put_simple/put_chunked.
+        Err(CoreError::Config("upload not yet implemented".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{CloudConfig, CloudKind, MirrorMode};
     use crate::credentials::Secret;
     use std::path::PathBuf;
+    use wiremock::matchers::{header, method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_cfg(tls_ca_pem: Option<PathBuf>) -> CloudConfig {
         CloudConfig {
@@ -212,5 +333,60 @@ mod tests {
             uploads_url("https://c.example.com", "bob", "gpbeam-123", Some("00001")),
             "https://c.example.com/remote.php/dav/uploads/bob/gpbeam-123/00001"
         );
+    }
+
+    fn cfg_for(base_url: &str) -> CloudConfig {
+        let mut c = test_cfg(None);
+        c.base_url = base_url.to_string();
+        c.remote_root = "GoPro".into();
+        c
+    }
+
+    #[tokio::test]
+    async fn already_present_false_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/clip.mp4"))
+            .and(header("Depth", "0"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        assert!(!up.already_present("clip.mp4", 1024).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_present_true_on_207_with_size() {
+        let server = MockServer::start().await;
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/GoPro/clip.mp4</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength>2048</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/clip.mp4"))
+            .respond_with(ResponseTemplate::new(207).set_body_raw(xml, "application/xml"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        assert!(up.already_present("clip.mp4", 2048).await.unwrap());
+    }
+
+    #[test]
+    fn parse_contentlength_extracts_size() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response>
+            <d:prop><d:getcontentlength>4096</d:getcontentlength></d:prop>
+        </d:response></d:multistatus>"#;
+        assert_eq!(parse_first_contentlength(xml), Some(4096));
+        assert_eq!(parse_first_contentlength("<empty/>"), None);
     }
 }
