@@ -54,6 +54,11 @@ fn ledger_path(dest: &Path) -> PathBuf {
 /// Run one offload pass for a freshly mounted volume. Blocking I/O — call via
 /// `spawn_blocking` so the async runtime is never stalled.
 fn handle_mount(app: &AppHandle, mount: PathBuf) {
+    // Ignore non-GoPro volumes (thumb drives, phones, etc.) before any side
+    // effects: no tray flash, no destination dir, no ledger for a random disk.
+    if !gpbeam_core::gopro::is_gopro_card(&mount) {
+        return;
+    }
     let dest = dest_root();
     if let Err(e) = std::fs::create_dir_all(&dest) {
         notify(app, "GPBeam error", &format!("cannot create destination: {e}"));
