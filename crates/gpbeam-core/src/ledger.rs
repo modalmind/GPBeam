@@ -276,6 +276,103 @@ impl Ledger {
         }
         Ok(jobs)
     }
+
+    /// Atomically claim up to `limit` due jobs: Queued, or Failed whose
+    /// `next_retry_at <= now_unix` (a NULL retry time is never reclaimed).
+    /// Claimed rows are flipped to Uploading and returned.
+    pub fn claim_due_cloud_jobs(&mut self, now_unix: i64, limit: usize) -> Result<Vec<CloudJob>> {
+        let tx = self.conn.transaction()?;
+
+        // 1. Pick eligible ids deterministically (oldest first).
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM cloud_jobs
+                 WHERE state = ?1
+                    OR (state = ?2 AND next_retry_at IS NOT NULL AND next_retry_at <= ?3)
+                 ORDER BY id
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![
+                    JobState::Queued.as_str(),
+                    JobState::Failed.as_str(),
+                    now_unix,
+                    limit as i64,
+                ],
+                |r| r.get::<_, i64>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<i64>>>()?
+        };
+
+        // 2. Flip each to Uploading.
+        for id in &ids {
+            tx.execute(
+                "UPDATE cloud_jobs SET state=?2 WHERE id=?1",
+                rusqlite::params![id, JobState::Uploading.as_str()],
+            )?;
+        }
+
+        // 3. Re-read the claimed rows (now Uploading, preserving attempts/last_error).
+        // The SELECT column order matches `row_to_cloud_job` (card_src is column 5).
+        let mut jobs = Vec::with_capacity(ids.len());
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, imported_id, destination_id, local_path, remote_path,
+                        card_src, state, attempts, next_retry_at, last_error,
+                        total_bytes, uploaded_bytes, resume_state
+                 FROM cloud_jobs WHERE id = ?1",
+            )?;
+            for id in &ids {
+                let job = stmt.query_row(rusqlite::params![id], row_to_cloud_job)?;
+                jobs.push(job);
+            }
+        }
+
+        tx.commit()?;
+        Ok(jobs)
+    }
+
+    /// Mark a job finished successfully.
+    pub fn mark_job_done(&mut self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cloud_jobs SET state=?2, next_retry_at=NULL WHERE id=?1",
+            rusqlite::params![id, JobState::Done.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a job failed: bump attempts, store the error, and set the next retry
+    /// time (NULL = give up, never reclaimed).
+    pub fn mark_job_failed(
+        &mut self,
+        id: i64,
+        err: &str,
+        next_retry_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cloud_jobs
+             SET state=?2, attempts=attempts+1, last_error=?3, next_retry_at=?4
+             WHERE id=?1",
+            rusqlite::params![id, JobState::Failed.as_str(), err, next_retry_at],
+        )?;
+        Ok(())
+    }
+
+    /// Persist mid-upload progress: uploaded byte count + the resume cursor (JSON).
+    pub fn save_job_progress(
+        &mut self,
+        id: i64,
+        uploaded: u64,
+        resume: &ResumeState,
+    ) -> Result<()> {
+        let json = serde_json::to_string(resume)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.conn.execute(
+            "UPDATE cloud_jobs SET uploaded_bytes=?2, resume_state=?3 WHERE id=?1",
+            rusqlite::params![id, uploaded as i64, json],
+        )?;
+        Ok(())
+    }
 }
 
 /// Map a `cloud_jobs` row to a [`CloudJob`]. The SELECT column order is fixed
@@ -604,6 +701,118 @@ mod tests {
         enqueue_sample(&mut l);
         assert_eq!(l.list_cloud_jobs(None).unwrap().len(), 1);
         assert_eq!(l.list_cloud_jobs(Some(JobState::Done)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn claim_moves_queued_to_uploading() {
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+
+        let claimed = l.claim_due_cloud_jobs(0, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, job_id);
+        assert_eq!(claimed[0].state, JobState::Uploading);
+
+        // A second claim finds nothing — the job is already Uploading.
+        assert_eq!(l.claim_due_cloud_jobs(0, 10).unwrap().len(), 0);
+        assert_eq!(
+            l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn past_due_failed_reclaimed_future_not() {
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+
+        // Move it through Uploading -> Failed with a retry time of 500.
+        l.claim_due_cloud_jobs(0, 10).unwrap();
+        l.mark_job_failed(job_id, "boom", Some(500)).unwrap();
+
+        // now=499 < 500 -> not yet due.
+        assert_eq!(l.claim_due_cloud_jobs(499, 10).unwrap().len(), 0);
+        // now=500 -> due, reclaimed to Uploading.
+        let again = l.claim_due_cloud_jobs(500, 10).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, job_id);
+        assert_eq!(again[0].state, JobState::Uploading);
+        assert_eq!(again[0].attempts, 1);
+        assert_eq!(again[0].last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn failed_with_no_retry_time_is_not_reclaimed() {
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+        l.claim_due_cloud_jobs(0, 10).unwrap();
+        l.mark_job_failed(job_id, "fatal", None).unwrap(); // give up: no retry
+        // Even far in the future, a NULL next_retry_at is never reclaimed.
+        assert_eq!(l.claim_due_cloud_jobs(i64::MAX, 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn mark_job_done_moves_to_done() {
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+        l.claim_due_cloud_jobs(0, 10).unwrap();
+        l.mark_job_done(job_id).unwrap();
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Done)).unwrap().len(), 1);
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn save_job_progress_round_trips_resume_state() {
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+        let rs = ResumeState {
+            upload_id: Some("gpbeam-abc".to_string()),
+            uploaded_bytes: 2048,
+        };
+        l.save_job_progress(job_id, 2048, &rs).unwrap();
+
+        let j = &l.list_cloud_jobs(None).unwrap()[0];
+        assert_eq!(j.uploaded_bytes, 2048);
+        assert_eq!(j.resume_state.as_ref(), Some(&rs));
+    }
+
+    #[test]
+    fn job_progress_survives_reopen_on_file_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let rs = ResumeState {
+            upload_id: Some("gpbeam-xyz".to_string()),
+            uploaded_bytes: 1500,
+        };
+        let job_id = {
+            let mut l = Ledger::open(&path).unwrap();
+            let (_imp, job_id) = enqueue_sample(&mut l);
+            l.save_job_progress(job_id, 1500, &rs).unwrap();
+            job_id
+        };
+
+        // Reopen with a fresh connection — state must persist.
+        let l = Ledger::open(&path).unwrap();
+        let jobs = l.list_cloud_jobs(None).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(jobs[0].uploaded_bytes, 1500);
+        assert_eq!(jobs[0].resume_state.as_ref(), Some(&rs));
+    }
+
+    #[test]
+    fn claim_respects_limit() {
+        let mut l = mem();
+        for i in 0..3 {
+            let imp = l
+                .record("C346", &format!("GX01000{i}.MP4"), 4096, 1000 + i, "/d", None)
+                .unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/d", &format!("r{i}"), 4096, None)
+                .unwrap();
+        }
+        assert_eq!(l.claim_due_cloud_jobs(0, 2).unwrap().len(), 2);
+        // One Queued left.
+        assert_eq!(l.claim_due_cloud_jobs(0, 2).unwrap().len(), 1);
     }
 
     #[test]
