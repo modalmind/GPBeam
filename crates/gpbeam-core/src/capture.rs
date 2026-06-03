@@ -23,6 +23,8 @@ impl Captured {
         if dparts.iter().chain(&tparts).any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
             return None;
         }
+        if dparts[0].len() != 4 || dparts[1].len() != 2 || dparts[2].len() != 2 { return None; }
+        if tparts[0].len() != 2 || tparts[1].len() != 2 || tparts[2].len() != 2 { return None; }
         Some(Captured {
             date: format!("{}-{}-{}", dparts[0], dparts[1], dparts[2]),
             time: format!("{}{}{}", tparts[0], tparts[1], tparts[2]),
@@ -72,5 +74,12 @@ mod tests {
     #[test]
     fn rejects_malformed_exif() {
         assert!(Captured::from_exif("not a date").is_none());
+    }
+
+    #[test]
+    fn rejects_wrong_width_exif_fields() {
+        assert!(Captured::from_exif("9:1:1 1:1:1").is_none());      // single-digit fields
+        assert!(Captured::from_exif("2026:6:1 14:30:55").is_none()); // 1-digit month/day
+        assert!(Captured::from_exif("20260:06:01 14:30:55").is_none()); // 5-digit year
     }
 }
