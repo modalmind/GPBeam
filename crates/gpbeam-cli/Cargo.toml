@@ -1,0 +1,7 @@
+[package]
+name = "gpbeam-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpbeam-core = { path = "../gpbeam-core" }
