@@ -9,7 +9,7 @@ use gpbeam_core::cloud::CloudEvent;
 use gpbeam_core::config::{Config, MirrorMode};
 use gpbeam_core::credentials::{CredentialStore, EnvConfigStore};
 use gpbeam_core::error::{CoreError, Result};
-use gpbeam_core::ledger::Ledger;
+use gpbeam_core::ledger::{CloudJob, JobState, Ledger};
 use gpbeam_core::orchestrator::{run_offload, RunEvent};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -176,4 +176,35 @@ pub async fn run_offload_and_mirror(
         .run_until_drained(&mut |ev: CloudEvent| emit(format_cloud_event(&ev)))
         .await?;
     Ok(())
+}
+
+/// Build the lines for `mirror-status`: every cloud job grouped by state plus a
+/// trailing pending-count summary. Opens its own Ledger at the destination
+/// (pure read; no uploads).
+pub fn mirror_status_lines(dest: &Path) -> Result<Vec<String>> {
+    let lpath = ledger_path_for(dest);
+    let ledger = Ledger::open(&lpath)?;
+    let mut lines = Vec::new();
+    for state in [JobState::Uploading, JobState::Queued, JobState::Failed, JobState::Done] {
+        let jobs: Vec<CloudJob> = ledger.list_cloud_jobs(Some(state))?;
+        if jobs.is_empty() {
+            continue;
+        }
+        lines.push(format!("== {} ({}) ==", state.as_str(), jobs.len()));
+        for j in jobs {
+            let err = j.last_error.as_deref().unwrap_or("");
+            lines.push(format!(
+                "  [{}] #{} attempts={} {} -> {} {}",
+                j.state.as_str(),
+                j.id,
+                j.attempts,
+                j.local_path,
+                j.remote_path,
+                if err.is_empty() { String::new() } else { format!("({err})") }
+            ));
+        }
+    }
+    let pending = ledger.pending_cloud_count()?;
+    lines.push(format!("pending: {pending}"));
+    Ok(lines)
 }
