@@ -60,6 +60,37 @@ impl KeyringBackend for MemoryKeyring {
     }
 }
 
+/// Real `KeyringBackend` over the OS-native secure store via the `keyring`
+/// crate (`macOS` Keychain, Windows Credential Manager, Secret Service on
+/// Linux). Each `(service, account)` pair maps to one `keyring::Entry`.
+pub struct SystemKeyring;
+
+impl KeyringBackend for SystemKeyring {
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, String> {
+        let entry = keyring::Entry::new(service, account).map_err(|e| e.to_string())?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(service, account).map_err(|e| e.to_string())?;
+        entry.set_password(secret).map_err(|e| e.to_string())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(service, account).map_err(|e| e.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            // Deleting a missing credential is a no-op, mirroring MemoryKeyring.
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +122,14 @@ mod tests {
         let kr: Arc<dyn KeyringBackend> = Arc::new(MemoryKeyring::new());
         kr.set("s", "a", "p").unwrap();
         assert_eq!(kr.get("s", "a").unwrap(), Some("p".to_string()));
+    }
+
+    #[test]
+    fn system_keyring_constructs_and_is_object_safe() {
+        // Never calls get/set/delete: that would hit the real OS keychain. We only
+        // prove the type exists, constructs, and is usable behind the trait object.
+        let kr: Arc<dyn KeyringBackend> = Arc::new(SystemKeyring);
+        // Use the Arc so it is not optimized away; do not invoke keychain methods.
+        assert_eq!(Arc::strong_count(&kr), 1);
     }
 }
