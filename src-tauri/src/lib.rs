@@ -331,6 +331,64 @@ fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
     }
 }
 
+/// Run one wired (USB GoPro) offload pass for a freshly-detected camera at `ip`.
+/// Async — driven on the tokio runtime (NOT `spawn_blocking`): `run_wired_offload`
+/// is itself async I/O over HTTP. Each `RunEvent` folds into the shared `AppState`
+/// and broadcasts on `"gpbeam://state"` using the SAME M3 helpers as the SD path;
+/// the terminal tray icon + notification reuse the shared Task 6.2 helpers, so the
+/// two paths are behaviorally identical at the boundary. Cloud jobs enqueued by
+/// the offload are drained by the existing M2 cloud loop, unchanged.
+async fn run_wired_offload_for_camera(
+    app: &AppHandle,
+    state: &Arc<Mutex<AppState>>,
+    ip: std::net::IpAddr,
+) {
+    let dest = dest_root();
+    if let Err(e) = std::fs::create_dir_all(&dest) {
+        notify(app, "GPBeam error", &format!("cannot create destination: {e}"));
+        set_tray_state(app, "error");
+        return;
+    }
+    let cfg = load_or_default_config(&dest);
+    let mut ledger = match Ledger::open(&ledger_path(&dest)) {
+        Ok(l) => l,
+        Err(e) => {
+            notify(app, "GPBeam error", &e.to_string());
+            set_tray_state(app, "error");
+            return;
+        }
+    };
+
+    set_tray_state(app, "working");
+    let client = gpbeam_core::wired::client::GoProClient::new(ip);
+    let app2 = app.clone();
+    let state2 = state.clone();
+    let summary = gpbeam_core::wired::offload::run_wired_offload(
+        &client,
+        &cfg,
+        &mut ledger,
+        &mut |e: Ev| {
+            // Fold every event into the shared AppState and broadcast the snapshot
+            // (identical to handle_mount's emitter).
+            let snap = fold_run_event(&state2, &e, cloud_runtime::now_unix());
+            emit_state(&app2, &snap);
+        },
+    )
+    .await;
+
+    set_tray_state(app, tray_state_for_summary(&summary));
+    match summary {
+        Ok(s) => {
+            if let Some((title, body)) = summary_notification(&s) {
+                notify(app, title, &body);
+            }
+        }
+        Err(e) => {
+            notify(app, "GPBeam error", &e.to_string());
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Resolve paths + load config ONCE, before the builder, so we can seed the
@@ -740,5 +798,24 @@ mod tests {
         assert_eq!(tray_state_for_summary(&with_failures), "error");
         let hard_err: Result<RunSummary, CoreError> = Err(CoreError::Config("boom".into()));
         assert_eq!(tray_state_for_summary(&hard_err), "error");
+    }
+
+    #[test]
+    fn run_wired_offload_for_camera_signature_is_pinned() {
+        // Compile-time pin: existence + exact signature of the async wired driver.
+        // The poller loop in setup() calls it as
+        //   run_wired_offload_for_camera(&handle, &state, ip).await
+        // The returned future borrows `app`/`state`, so the boxed future's lifetime
+        // is tied to the inputs (`'a`); it MUST be `Send` so the setup() spawn (which
+        // requires `Future + Send`) compiles.
+        fn pin_check<'a>(
+            h: &'a tauri::AppHandle,
+            s: &'a std::sync::Arc<std::sync::Mutex<crate::app_state::AppState>>,
+            ip: std::net::IpAddr,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(run_wired_offload_for_camera(h, s, ip))
+        }
+        let _f = pin_check; // silence unused; this is a type-level assertion only.
+        let _ = _f;
     }
 }

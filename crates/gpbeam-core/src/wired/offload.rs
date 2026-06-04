@@ -77,7 +77,7 @@ pub async fn run_wired_offload(
     client: &GoProClient,
     cfg: &Config,
     ledger: &mut Ledger,
-    emit: &mut dyn FnMut(RunEvent),
+    emit: &mut (dyn FnMut(RunEvent) + Send),
 ) -> Result<RunSummary> {
     let info = client.info().await?;
     let serial = if info.serial.is_empty() { "unknown".to_string() } else { info.serial.clone() };
