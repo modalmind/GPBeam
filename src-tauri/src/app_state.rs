@@ -10,7 +10,6 @@
 
 #[allow(unused_imports)]
 use gpbeam_core::cloud::CloudEvent;
-#[allow(unused_imports)]
 use gpbeam_core::orchestrator::RunEvent;
 
 /// Coarse app status the tray icon + UI follow.
@@ -78,6 +77,116 @@ pub struct AppState {
     pub message: Option<String>,
 }
 
+impl RunProgress {
+    /// A fresh run stamped at `now_unix` with zeroed counters.
+    fn started(now_unix: i64) -> Self {
+        RunProgress {
+            model: None,
+            serial: None,
+            files_done: 0,
+            files_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            current_file: None,
+            started_at_unix: now_unix,
+        }
+    }
+
+    /// Seconds remaining, derived from observed throughput.
+    ///
+    /// Returns `None` when an estimate is meaningless:
+    /// - no bytes copied yet (`bytes_done == 0`) — no rate to extrapolate from,
+    /// - non-positive elapsed time (`now_unix <= started_at_unix`),
+    /// - the run is byte-complete (`bytes_done >= bytes_total`).
+    /// Otherwise `ceil((bytes_total - bytes_done) / (bytes_done / elapsed))`.
+    pub fn eta_secs(&self, now_unix: i64) -> Option<u64> {
+        let elapsed = now_unix - self.started_at_unix;
+        if self.bytes_done == 0 || elapsed <= 0 || self.bytes_done >= self.bytes_total {
+            return None;
+        }
+        let rate = self.bytes_done as f64 / elapsed as f64;
+        let remaining = (self.bytes_total - self.bytes_done) as f64;
+        Some((remaining / rate).ceil() as u64)
+    }
+}
+
+impl AppState {
+    /// Fold one core [`RunEvent`] into the snapshot. `now_unix` stamps run start
+    /// (used later by [`RunProgress::eta_secs`]). Pure; no I/O.
+    pub fn apply_run_event(&mut self, ev: &RunEvent, now_unix: i64) {
+        match ev {
+            RunEvent::Scanned { new_files, total_bytes } => {
+                let mut run = self.run.take().unwrap_or_else(|| RunProgress::started(now_unix));
+                run.files_total = *new_files;
+                run.bytes_total = *total_bytes;
+                run.files_done = 0;
+                run.bytes_done = 0;
+                run.current_file = None;
+                run.started_at_unix = now_unix;
+                self.run = Some(run);
+                self.status = Status::Working;
+                self.message = None;
+            }
+            RunEvent::CardDetected { model, serial } => {
+                let run = self
+                    .run
+                    .get_or_insert_with(|| RunProgress::started(now_unix));
+                run.model = model.clone();
+                run.serial = serial.clone();
+            }
+            RunEvent::Copying { file, index, .. } => {
+                let run = self
+                    .run
+                    .get_or_insert_with(|| RunProgress::started(now_unix));
+                run.current_file = Some(file.clone());
+                // `index` is 1-based; files fully done before this one is index-1.
+                run.files_done = index.saturating_sub(1);
+                self.status = Status::Working;
+            }
+            RunEvent::Progress { copied, .. } => {
+                if let Some(run) = self.run.as_mut() {
+                    run.bytes_done = run.bytes_done.saturating_add(*copied);
+                }
+            }
+            RunEvent::Verified { .. } => {
+                if let Some(run) = self.run.as_mut() {
+                    run.files_done = (run.files_done + 1).min(run.files_total);
+                }
+            }
+            RunEvent::Failed { file, error } => {
+                self.status = Status::Error;
+                self.message = Some(format!("{file}: {error}"));
+            }
+            RunEvent::InsufficientSpace { need, have } => {
+                self.status = Status::Error;
+                self.message = Some(format!(
+                    "insufficient space: need {need} bytes, have {have}"
+                ));
+            }
+            RunEvent::RunComplete { copied, skipped, failed, bytes } => {
+                self.last_run = Some(RunSummaryView {
+                    copied: *copied,
+                    skipped: *skipped,
+                    failed: *failed,
+                    bytes: *bytes,
+                });
+                self.run = None;
+                self.status = if *failed > 0 { Status::Error } else { Status::Idle };
+            }
+            RunEvent::CloudQueued { .. } => {
+                self.cloud.pending += 1;
+                self.cloud.configured = true;
+            }
+            // Informational / no snapshot change: surfaced via tray/notifications
+            // (lib.rs), not part of the UI state machine.
+            RunEvent::NotGoPro(_)
+            | RunEvent::Skipped { .. }
+            | RunEvent::CardFileDeleted { .. }
+            | RunEvent::Ejected { .. } => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +239,108 @@ mod tests {
         assert_eq!(state.run.unwrap(), run);
         assert_eq!(state.last_run.unwrap(), summary);
         assert_eq!(state.cloud.uploading.unwrap(), up);
+    }
+
+    #[test]
+    fn full_happy_path_scan_to_complete() {
+        let now = 1_000i64;
+        let mut s = AppState::default();
+
+        // Scanned: 2 files, 1000 bytes total. status -> Working, run created.
+        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, now);
+        assert_eq!(s.status, Status::Working);
+        let run = s.run.as_ref().expect("run created on Scanned");
+        assert_eq!(run.files_total, 2);
+        assert_eq!(run.bytes_total, 1000);
+        assert_eq!(run.files_done, 0);
+        assert_eq!(run.bytes_done, 0);
+        assert_eq!(run.started_at_unix, now);
+        assert_eq!(run.current_file, None);
+
+        // CardDetected: model/serial set on the existing run.
+        s.apply_run_event(
+            &RunEvent::CardDetected {
+                model: Some("HERO11".into()),
+                serial: Some("C346".into()),
+            },
+            now,
+        );
+        let run = s.run.as_ref().unwrap();
+        assert_eq!(run.model.as_deref(), Some("HERO11"));
+        assert_eq!(run.serial.as_deref(), Some("C346"));
+
+        // File 1: Copying{index:1} -> current_file set, files_done = 0.
+        s.apply_run_event(
+            &RunEvent::Copying { file: "A.MP4".into(), index: 1, total: 2 },
+            now,
+        );
+        let run = s.run.as_ref().unwrap();
+        assert_eq!(run.current_file.as_deref(), Some("A.MP4"));
+        assert_eq!(run.files_done, 0);
+
+        // Progress: bytes_done += copied.
+        s.apply_run_event(
+            &RunEvent::Progress { file: "A.MP4".into(), copied: 400, total: 400 },
+            now,
+        );
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 400);
+
+        // Verified: files_done -> 1.
+        s.apply_run_event(&RunEvent::Verified { file: "A.MP4".into() }, now);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 1);
+
+        // File 2.
+        s.apply_run_event(
+            &RunEvent::Copying { file: "B.MP4".into(), index: 2, total: 2 },
+            now,
+        );
+        let run = s.run.as_ref().unwrap();
+        assert_eq!(run.current_file.as_deref(), Some("B.MP4"));
+        assert_eq!(run.files_done, 1); // index - 1
+
+        s.apply_run_event(
+            &RunEvent::Progress { file: "B.MP4".into(), copied: 600, total: 600 },
+            now,
+        );
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
+
+        s.apply_run_event(&RunEvent::Verified { file: "B.MP4".into() }, now);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 2);
+
+        // RunComplete: run -> last_run, status Idle (no failures).
+        s.apply_run_event(
+            &RunEvent::RunComplete { copied: 2, skipped: 0, failed: 0, bytes: 1000 },
+            now,
+        );
+        assert!(s.run.is_none(), "run cleared on completion");
+        assert_eq!(s.status, Status::Idle);
+        let last = s.last_run.as_ref().expect("last_run set");
+        assert_eq!(*last, RunSummaryView { copied: 2, skipped: 0, failed: 0, bytes: 1000 });
+    }
+
+    #[test]
+    fn card_detected_before_scan_creates_run() {
+        // CardDetected may arrive first (orchestrator emits it before Scanned).
+        let mut s = AppState::default();
+        s.apply_run_event(
+            &RunEvent::CardDetected { model: Some("HERO12".into()), serial: None },
+            42,
+        );
+        let run = s.run.as_ref().expect("run created by CardDetected when absent");
+        assert_eq!(run.model.as_deref(), Some("HERO12"));
+        assert_eq!(run.serial, None);
+        assert_eq!(run.files_total, 0);
+        assert_eq!(run.started_at_unix, 42);
+    }
+
+    #[test]
+    fn verified_caps_files_done_at_total() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 10 }, 0);
+        s.apply_run_event(&RunEvent::Verified { file: "x".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 1);
+        // A spurious extra Verified must not exceed files_total.
+        s.apply_run_event(&RunEvent::Verified { file: "x".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 1);
     }
 }
