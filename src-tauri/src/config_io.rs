@@ -4,6 +4,7 @@
 //! `save_config` / `complete_wizard` commands. No Tauri types here — every
 //! function is pure and unit-tested.
 
+use std::io::Write;
 use std::path::Path;
 
 use gpbeam_core::config::{CloudConfig, CloudKind, Config, Layout, MirrorMode};
@@ -180,6 +181,65 @@ pub fn view_to_config(view: &ConfigView) -> Result<Config, String> {
         delete_after_verify: view.delete_after_verify,
         auto_eject: view.auto_eject,
     })
+}
+
+/// Read the existing config file at `path` (if any) and return its top-level
+/// `[credentials]` table serialized back to TOML text (e.g.
+/// `"[credentials.nc1]\nusername = \"alice\"\n..."`), or `None` when the file
+/// is absent, unparsable, or has no credentials table. Used to carry a
+/// hand-managed `[credentials.*]` table across a GUI save, since `Config`
+/// itself does not model credentials.
+fn extract_credentials_table(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let doc: toml::Value = toml::from_str(&raw).ok()?;
+    let creds = doc.get("credentials")?;
+    // Wrap the captured value back into a single-key document so it serializes
+    // as `[credentials.<id>]` tables, then hand back the text.
+    let mut wrapper = toml::value::Table::new();
+    wrapper.insert("credentials".to_string(), creds.clone());
+    toml::to_string(&toml::Value::Table(wrapper)).ok()
+}
+
+/// Atomically persist `cfg` to `path` as TOML, preserving any pre-existing
+/// top-level `[credentials]` table on disk. Writes `<path>.part`, fsyncs it,
+/// then renames over `path` so a reader never sees a half-written file.
+pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
+    // Serialize the Config itself. `Config` has no `credentials` field, so this
+    // never emits one — we re-attach any preserved table below.
+    let mut body =
+        toml::to_string(cfg).map_err(|e| format!("serialize config: {e}"))?;
+
+    if let Some(creds) = extract_credentials_table(path) {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+        body.push_str(&creds);
+    }
+
+    let part = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    };
+
+    // Write + fsync the temp file.
+    {
+        let mut f = std::fs::File::create(&part)
+            .map_err(|e| format!("create {}: {e}", part.display()))?;
+        f.write_all(body.as_bytes())
+            .map_err(|e| format!("write {}: {e}", part.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", part.display()))?;
+    }
+
+    // Atomic replace. On failure, best-effort remove the temp file so we never
+    // leave a stray `.part` behind.
+    if let Err(e) = std::fs::rename(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("rename {} -> {}: {e}", part.display(), path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,5 +464,112 @@ mod tests {
         let mut v = base_view();
         v.dest_root = String::new();
         assert!(view_to_config(&v).is_err());
+    }
+
+    #[test]
+    fn write_config_atomic_round_trips_via_load_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let mut cfg = Config::new(dir.path().join("dest"));
+        cfg.delete_after_verify = true;
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://cloud.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: MirrorMode::Auto,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        });
+
+        write_config_atomic(&path, &cfg).expect("write ok");
+
+        let loaded = gpbeam_core::config::load_config(&path).expect("load ok");
+        assert_eq!(loaded.dest_root, cfg.dest_root);
+        assert!(loaded.delete_after_verify);
+        let lc = loaded.cloud.expect("cloud round-trips");
+        assert_eq!(lc.destination_id, "nc1");
+        assert_eq!(lc.base_url, "https://cloud.example.com");
+        assert_eq!(lc.mirror_mode, MirrorMode::Auto);
+    }
+
+    #[test]
+    fn write_config_atomic_leaves_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let cfg = Config::new(dir.path().join("dest"));
+        write_config_atomic(&path, &cfg).expect("write ok");
+        let part = dir.path().join("gpbeam.toml.part");
+        assert!(!part.exists(), "temp .part file must be cleaned up");
+        assert!(path.exists(), "final config must exist");
+    }
+
+    #[test]
+    fn write_config_atomic_preserves_existing_credentials_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        // Seed a file that already carries a hand-managed [credentials.nc1] table.
+        let seed = r#"
+            dest_root = "/old/dest"
+            filename_template = "{date}_{original}"
+            include_proxies = false
+            include_thumbnails = false
+            layout = "Flat"
+            verify = true
+            space_headroom = 1073741824
+
+            [credentials.nc1]
+            username = "alice"
+            app_password = "s3cret-app-pw"
+        "#;
+        std::fs::write(&path, seed).unwrap();
+
+        // GUI save with new settings (different dest, cloud added).
+        let mut cfg = Config::new(std::path::PathBuf::from("/new/dest"));
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://cloud.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: MirrorMode::Auto,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        });
+        write_config_atomic(&path, &cfg).expect("write ok");
+
+        // The new config is loadable...
+        let loaded = gpbeam_core::config::load_config(&path).expect("load ok");
+        assert_eq!(loaded.dest_root, std::path::PathBuf::from("/new/dest"));
+        assert!(loaded.cloud.is_some());
+
+        // ...and the credentials table survived verbatim (parse the raw TOML).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+        let creds = doc
+            .get("credentials")
+            .and_then(|c| c.get("nc1"))
+            .expect("[credentials.nc1] preserved");
+        assert_eq!(creds.get("username").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            creds.get("app_password").and_then(|v| v.as_str()),
+            Some("s3cret-app-pw")
+        );
+    }
+
+    #[test]
+    fn write_config_atomic_no_credentials_when_none_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let cfg = Config::new(dir.path().join("dest"));
+        write_config_atomic(&path, &cfg).expect("write ok");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+        assert!(doc.get("credentials").is_none(), "no credentials table fabricated");
     }
 }
