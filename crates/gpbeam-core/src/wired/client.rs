@@ -206,6 +206,25 @@ impl GoProClient {
         let mut reader = Cursor::new(body);
         crate::transfer::stream_hash_to_part(&mut reader, part_path, already, progress)
     }
+
+    /// `GET /gopro/media/delete?path={dir}/{name}` — delete a file from the
+    /// camera. 200 -> Ok(()); any other status -> `Http`. The Phase 4 caller
+    /// treats an Err as non-fatal.
+    pub async fn delete(&self, m: &RemoteMedia) -> Result<()> {
+        let base = format!("{}/gopro/media/delete", self.base);
+        let path_param = format!("{}/{}", m.dir, m.name);
+        let url = with_query(&base, &[("path", path_param.as_str())])?;
+        let resp = self.http.get(url.clone()).send().await.map_err(transport_err)?;
+        let status = resp.status().as_u16();
+        if status == 200 {
+            Ok(())
+        } else {
+            Err(CoreError::Http {
+                status: Some(status),
+                msg: format!("GET {url} -> {status}"),
+            })
+        }
+    }
 }
 
 /// Parse a `/gopro/media/list` JSON body into a flat `Vec<RemoteMedia>`.
@@ -611,6 +630,47 @@ mod tests {
         let mut cb = |_n: u64| {};
         let err = c.download_resumable(&m, &part, &mut cb).await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(404), .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_sends_path_query_and_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/delete"))
+            .and(query_param("path", "100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: 10,
+            captured_unix: 0,
+        };
+        c.delete(&m).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_500_is_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: 10,
+            captured_unix: 0,
+        };
+        let err = c.delete(&m).await.unwrap_err();
+        assert!(matches!(err, CoreError::Http { status: Some(500), .. }), "got {err:?}");
     }
 
     #[test]
