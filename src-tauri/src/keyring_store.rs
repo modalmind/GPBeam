@@ -8,7 +8,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use gpbeam_core::credentials::{CredentialStore, EnvConfigStore, Secret};
+use gpbeam_core::error::Result as CoreResult;
 
 /// Pluggable secret backend. The real implementation (`SystemKeyring`) talks to
 /// the OS keychain via `keyring::Entry`; `MemoryKeyring` is an in-memory fake so
@@ -91,10 +94,101 @@ impl KeyringBackend for SystemKeyring {
     }
 }
 
+/// `CredentialStore` over the OS keychain with an env override and a TOML
+/// fallback. Only the **app-password** is stored in the keychain (keyed by
+/// `destination_id`); the username is supplied by callers from
+/// `CloudConfig.username`. `get` fills `Secret.username` from `env_username`,
+/// else the fallback file entry, else `""`.
+///
+/// Precedence for the app-password: `env_app_password` > keychain >
+/// `fallback.get(id).app_password`.
+pub struct KeyringCredentialStore {
+    service: String,
+    backend: Arc<dyn KeyringBackend>,
+    env_username: Option<String>,
+    env_app_password: Option<String>,
+    fallback: Option<EnvConfigStore>,
+}
+
+impl KeyringCredentialStore {
+    pub fn new(
+        service: impl Into<String>,
+        backend: Arc<dyn KeyringBackend>,
+        env_username: Option<String>,
+        env_app_password: Option<String>,
+        fallback: Option<EnvConfigStore>,
+    ) -> Self {
+        KeyringCredentialStore {
+            service: service.into(),
+            backend,
+            env_username,
+            env_app_password,
+            fallback,
+        }
+    }
+
+    /// The app-password stored in the keychain for `destination_id`, if any.
+    fn keychain_password(&self, destination_id: &str) -> Result<Option<String>, String> {
+        self.backend.get(&self.service, destination_id)
+    }
+
+    /// The fallback `Secret` for `destination_id`, if the fallback store has one.
+    fn fallback_secret(&self, destination_id: &str) -> CoreResult<Option<Secret>> {
+        match &self.fallback {
+            Some(store) => store.get(destination_id),
+            None => Ok(None),
+        }
+    }
+}
+
+impl CredentialStore for KeyringCredentialStore {
+    fn get(&self, destination_id: &str) -> CoreResult<Option<Secret>> {
+        let fallback = self.fallback_secret(destination_id)?;
+
+        // Password precedence: env > keychain > fallback.
+        let keychain_pw = self
+            .keychain_password(destination_id)
+            .map_err(gpbeam_core::error::CoreError::Config)?;
+        let app_password = self
+            .env_app_password
+            .clone()
+            .or(keychain_pw)
+            .or_else(|| fallback.as_ref().map(|s| s.app_password.clone()));
+
+        let app_password = match app_password {
+            Some(pw) => pw,
+            // No source had a password -> no resolvable secret.
+            None => return Ok(None),
+        };
+
+        // Username: env > fallback file entry > "".
+        let username = self
+            .env_username
+            .clone()
+            .or_else(|| fallback.as_ref().map(|s| s.username.clone()))
+            .unwrap_or_default();
+
+        Ok(Some(Secret {
+            username,
+            app_password,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    // helper: a fallback EnvConfigStore with one file entry for "nc1".
+    fn fallback_with_nc1() -> EnvConfigStore {
+        let toml = r#"
+[credentials.nc1]
+username = "file-user"
+app_password = "file-pw"
+"#;
+        EnvConfigStore::from_toml_str(toml, None, None).unwrap()
+    }
 
     #[test]
     fn memory_keyring_set_get_delete_roundtrip() {
@@ -131,5 +225,96 @@ mod tests {
         let kr: Arc<dyn KeyringBackend> = Arc::new(SystemKeyring);
         // Use the Arc so it is not optimized away; do not invoke keychain methods.
         assert_eq!(Arc::strong_count(&kr), 1);
+    }
+
+    #[test]
+    fn get_returns_none_when_no_source_has_a_password() {
+        let backend = Arc::new(MemoryKeyring::new());
+        let store = KeyringCredentialStore::new("com.gpbeam.test", backend, None, None, None);
+        assert_eq!(store.get("nc1").unwrap(), None);
+    }
+
+    #[test]
+    fn keychain_password_is_returned_with_empty_username() {
+        let backend = Arc::new(MemoryKeyring::new());
+        // Simulate the UI having stored the app-password under the destination id.
+        backend.set("com.gpbeam.test", "nc1", "keychain-pw").unwrap();
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend,
+            None, // no env username
+            None, // no env password
+            None, // no fallback
+        );
+        let secret = store.get("nc1").unwrap().expect("keychain password present");
+        // Only the app-password lives in the keychain; username defaults to "".
+        assert_eq!(secret.username, "");
+        assert_eq!(secret.app_password, "keychain-pw");
+    }
+
+    #[test]
+    fn env_password_wins_over_keychain_and_fallback() {
+        let backend = Arc::new(MemoryKeyring::new());
+        backend.set("com.gpbeam.test", "nc1", "keychain-pw").unwrap();
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend,
+            Some("env-user".to_string()),
+            Some("env-pw".to_string()),
+            Some(fallback_with_nc1()),
+        );
+        let secret = store.get("nc1").unwrap().expect("env produces a secret");
+        assert_eq!(secret.username, "env-user");
+        assert_eq!(secret.app_password, "env-pw");
+    }
+
+    #[test]
+    fn env_username_fills_username_when_keychain_supplies_password() {
+        let backend = Arc::new(MemoryKeyring::new());
+        backend.set("com.gpbeam.test", "nc1", "keychain-pw").unwrap();
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend,
+            Some("env-user".to_string()),
+            None, // no env password -> keychain wins for the password
+            None,
+        );
+        let secret = store.get("nc1").unwrap().expect("present");
+        assert_eq!(secret.username, "env-user");
+        assert_eq!(secret.app_password, "keychain-pw");
+    }
+
+    #[test]
+    fn fallback_used_when_keychain_empty_filling_username_and_password() {
+        let backend = Arc::new(MemoryKeyring::new());
+        // keychain has nothing for nc1.
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend,
+            None,
+            None,
+            Some(fallback_with_nc1()),
+        );
+        let secret = store.get("nc1").unwrap().expect("fallback present");
+        // Username and password both come from the fallback file entry.
+        assert_eq!(secret.username, "file-user");
+        assert_eq!(secret.app_password, "file-pw");
+    }
+
+    #[test]
+    fn keychain_password_beats_fallback_password() {
+        let backend = Arc::new(MemoryKeyring::new());
+        backend.set("com.gpbeam.test", "nc1", "keychain-pw").unwrap();
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend,
+            None,
+            None,
+            Some(fallback_with_nc1()),
+        );
+        let secret = store.get("nc1").unwrap().expect("present");
+        // Password from keychain; username falls back to the file entry's username.
+        assert_eq!(secret.app_password, "keychain-pw");
+        assert_eq!(secret.username, "file-user");
     }
 }
