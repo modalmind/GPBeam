@@ -97,7 +97,13 @@ impl RunProgress {
     /// - no bytes copied yet (`bytes_done == 0`) — no rate to extrapolate from,
     /// - non-positive elapsed time (`now_unix <= started_at_unix`),
     /// - the run is byte-complete (`bytes_done >= bytes_total`).
+    ///
     /// Otherwise `ceil((bytes_total - bytes_done) / (bytes_done / elapsed))`.
+    ///
+    /// Tested reference for the formula the popover mirrors client-side (the UI needs
+    /// a live countdown that ticks between state emits); also available to any non-UI
+    /// consumer (CLI status, notifications). Not yet called from production Rust.
+    #[allow(dead_code)]
     pub fn eta_secs(&self, now_unix: i64) -> Option<u64> {
         let elapsed = now_unix - self.started_at_unix;
         if self.bytes_done == 0 || elapsed <= 0 || self.bytes_done >= self.bytes_total {

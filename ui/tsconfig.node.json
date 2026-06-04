@@ -4,8 +4,9 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
+    "allowJs": true,
     "strict": true,
-    "noEmit": true,
+    "composite": true,
     "skipLibCheck": true,
     "types": ["node"]
   },

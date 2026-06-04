@@ -336,7 +336,9 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String>
 
 /// The exact set of `#[tauri::command]` names Phase 6 must register in
 /// `tauri::generate_handler!` (and that the TS `bindings.ts` mirrors). Kept here
-/// as the single source of truth so the count test below guards drift.
+/// as the single source of truth so the count test below guards drift. Test-only:
+/// `lib.rs` registers the commands via `generate_handler!` (idents, not strings).
+#[cfg(test)]
 pub const COMMAND_NAMES: &[&str] = &[
     "get_state",
     "get_config",
@@ -516,7 +518,7 @@ mod tests {
         let ledger_path = dir.path().join("ledger.sqlite");
         let mut state = AppState::default();
         state.cloud.configured = true; // stale; should be cleared by a cloud-less save
-        let mut runtime = CloudRuntime::empty();
+        let mut runtime = CloudRuntime::default();
 
         let view = base_view(dir.path().join("out").to_str().unwrap());
         apply_saved_config(&view, &cfg_path, &ledger_path, &mut state, &mut runtime).unwrap();
@@ -533,7 +535,7 @@ mod tests {
         let cfg_path = dir.path().join("gpbeam.toml");
         let ledger_path = dir.path().join("ledger.sqlite");
         let mut state = AppState::default();
-        let mut runtime = CloudRuntime::empty();
+        let mut runtime = CloudRuntime::default();
 
         let mut view = base_view(dir.path().join("out").to_str().unwrap());
         view.cloud = Some(cloud_view());
@@ -560,7 +562,7 @@ mod tests {
             l.enqueue_cloud_job(imp, "nc1", "/d/GX010001.MP4", "r/x", 1, None).unwrap();
         }
         let mut state = AppState::default();
-        let mut runtime = CloudRuntime::empty();
+        let mut runtime = CloudRuntime::default();
         let mut view = base_view(dir.path().join("out").to_str().unwrap());
         view.cloud = Some(cloud_view());
 
@@ -574,7 +576,7 @@ mod tests {
         let cfg_path = dir.path().join("gpbeam.toml");
         let ledger_path = dir.path().join("ledger.sqlite");
         let mut state = AppState::default();
-        let mut runtime = CloudRuntime::empty();
+        let mut runtime = CloudRuntime::default();
 
         let mut view = base_view(""); // empty dest_root is invalid
         view.dest_root = String::new();

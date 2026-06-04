@@ -17,14 +17,6 @@ pub struct CloudRuntime {
 }
 
 impl CloudRuntime {
-    /// An empty runtime: no cloud configured, no card deletion.
-    pub fn empty() -> Self {
-        CloudRuntime {
-            config: None,
-            delete_after_verify: false,
-        }
-    }
-
     /// Build a runtime from a freshly-loaded `Config`. `None` cloud table yields
     /// an idle runtime (`config: None`).
     pub fn from_config(cfg: &gpbeam_core::config::Config) -> Self {
