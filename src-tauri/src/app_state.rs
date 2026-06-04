@@ -8,7 +8,6 @@
 //! UI-event mirror to keep in sync. Everything here is pure: no Tauri, no I/O,
 //! no clock reads (callers pass `now_unix`), so it is exhaustively unit-tested.
 
-#[allow(unused_imports)]
 use gpbeam_core::cloud::CloudEvent;
 use gpbeam_core::orchestrator::RunEvent;
 
@@ -183,6 +182,33 @@ impl AppState {
             | RunEvent::Skipped { .. }
             | RunEvent::CardFileDeleted { .. }
             | RunEvent::Ejected { .. } => {}
+        }
+    }
+
+    /// Fold one core [`CloudEvent`] into the snapshot. Pure; no I/O.
+    pub fn apply_cloud_event(&mut self, ev: &CloudEvent) {
+        match ev {
+            CloudEvent::Uploading { file, uploaded, total } => {
+                self.cloud.uploading = Some(UploadProgress {
+                    file: file.clone(),
+                    uploaded: *uploaded,
+                    total: *total,
+                });
+            }
+            CloudEvent::Mirrored { .. } => {
+                self.cloud.uploading = None;
+                self.cloud.pending = self.cloud.pending.saturating_sub(1);
+            }
+            CloudEvent::CloudFailed { file, error } => {
+                self.cloud.uploading = None;
+                self.cloud.failed += 1;
+                self.cloud.pending = self.cloud.pending.saturating_sub(1);
+                self.status = Status::Error;
+                self.message = Some(format!("{file}: {error}"));
+            }
+            CloudEvent::Deleted { file } => {
+                self.message = Some(format!("freed card space: {file}"));
+            }
         }
     }
 }
@@ -448,5 +474,85 @@ mod tests {
         );
         assert_eq!(s.run, before, "no-op events leave run untouched");
         assert_eq!(s.status, Status::Working);
+    }
+
+    #[test]
+    fn cloud_uploading_sets_current_upload() {
+        let mut s = AppState::default();
+        s.apply_cloud_event(&CloudEvent::Uploading {
+            file: "clip.mp4".into(),
+            uploaded: 30,
+            total: 100,
+        });
+        assert_eq!(
+            s.cloud.uploading,
+            Some(UploadProgress { file: "clip.mp4".into(), uploaded: 30, total: 100 })
+        );
+    }
+
+    #[test]
+    fn cloud_mirrored_clears_upload_and_decrements_pending() {
+        let mut s = AppState::default();
+        s.cloud.pending = 2;
+        s.apply_cloud_event(&CloudEvent::Uploading {
+            file: "clip.mp4".into(),
+            uploaded: 100,
+            total: 100,
+        });
+        assert!(s.cloud.uploading.is_some());
+        s.apply_cloud_event(&CloudEvent::Mirrored { file: "clip.mp4".into() });
+        assert!(s.cloud.uploading.is_none());
+        assert_eq!(s.cloud.pending, 1);
+    }
+
+    #[test]
+    fn cloud_mirrored_pending_saturates_at_zero() {
+        let mut s = AppState::default();
+        // pending already 0 -> Mirrored must not underflow.
+        s.apply_cloud_event(&CloudEvent::Mirrored { file: "clip.mp4".into() });
+        assert_eq!(s.cloud.pending, 0);
+    }
+
+    #[test]
+    fn cloud_failed_sets_error_increments_failed_and_decrements_pending() {
+        let mut s = AppState::default();
+        s.cloud.pending = 1;
+        s.apply_cloud_event(&CloudEvent::Uploading {
+            file: "clip.mp4".into(),
+            uploaded: 10,
+            total: 100,
+        });
+        s.apply_cloud_event(&CloudEvent::CloudFailed {
+            file: "clip.mp4".into(),
+            error: "401 Unauthorized".into(),
+        });
+        assert!(s.cloud.uploading.is_none());
+        assert_eq!(s.cloud.failed, 1);
+        assert_eq!(s.cloud.pending, 0);
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(s.message.as_deref(), Some("clip.mp4: 401 Unauthorized"));
+    }
+
+    #[test]
+    fn cloud_failed_pending_saturates_at_zero() {
+        let mut s = AppState::default();
+        s.apply_cloud_event(&CloudEvent::CloudFailed {
+            file: "clip.mp4".into(),
+            error: "boom".into(),
+        });
+        assert_eq!(s.cloud.pending, 0);
+        assert_eq!(s.cloud.failed, 1);
+    }
+
+    #[test]
+    fn cloud_deleted_sets_message_only() {
+        let mut s = AppState::default();
+        s.cloud.pending = 3;
+        s.apply_cloud_event(&CloudEvent::Deleted { file: "clip.mp4".into() });
+        // No counter movement; status unchanged; an informational message is fine.
+        assert_eq!(s.cloud.pending, 3);
+        assert_eq!(s.cloud.failed, 0);
+        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.message.as_deref(), Some("freed card space: clip.mp4"));
     }
 }
