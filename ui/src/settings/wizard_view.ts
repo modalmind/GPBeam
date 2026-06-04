@@ -18,6 +18,7 @@ export function defaultConfigView(destRoot: string): ConfigView {
     spaceHeadroom: DEFAULT_SPACE_HEADROOM,
     deleteAfterVerify: false,
     autoEject: false,
+    wiredIngest: true,
     cloud: null,
   };
 }

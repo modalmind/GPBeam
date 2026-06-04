@@ -16,6 +16,11 @@ describe("defaultConfigView", () => {
     expect(v.cloud).toBeNull();
   });
 
+  it("defaults wiredIngest to true (USB GoPro offload on)", () => {
+    const v = defaultConfigView("/Users/me/GPBeam");
+    expect(v.wiredIngest).toBe(true);
+  });
+
   it("returns a fresh object each call (no shared mutation)", () => {
     const a = defaultConfigView("/a");
     const b = defaultConfigView("/b");
