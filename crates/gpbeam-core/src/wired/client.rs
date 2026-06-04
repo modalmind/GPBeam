@@ -122,6 +122,37 @@ impl GoProClient {
             firmware: body.firmware_version,
         })
     }
+
+    /// `GET /gopro/camera/control/wired_usb?p=1` — enable wired control. Many
+    /// cameras work without this; the Phase 4 caller treats an Err as non-fatal.
+    /// 200 -> Ok(()); any other status -> `Http`.
+    pub async fn enable_wired_control(&self) -> Result<()> {
+        let base = format!("{}/gopro/camera/control/wired_usb", self.base);
+        let url = with_query(&base, &[("p", "1")])?;
+        let resp = self.http.get(url.clone()).send().await.map_err(transport_err)?;
+        let status = resp.status().as_u16();
+        if status == 200 {
+            Ok(())
+        } else {
+            Err(CoreError::Http {
+                status: Some(status),
+                msg: format!("GET {url} -> {status}"),
+            })
+        }
+    }
+}
+
+/// Build a URL string with percent-encoded query parameters. reqwest is built
+/// without its `query` feature here, so we use `url::Url::parse_with_params`
+/// (the `url` crate is already a dependency) to attach + encode params.
+fn with_query(base: &str, params: &[(&str, &str)]) -> Result<String> {
+    let url = url::Url::parse_with_params(base, params.iter().copied()).map_err(|e| {
+        CoreError::Http {
+            status: None,
+            msg: format!("bad url {base}: {e}"),
+        }
+    })?;
+    Ok(url.into())
 }
 
 /// Map a reqwest transport error (no HTTP response) to a retryable
@@ -137,7 +168,7 @@ fn transport_err(e: reqwest::Error) -> CoreError {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::matchers::{method as wm_method, path as wm_path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -228,6 +259,35 @@ mod tests {
         let c = GoProClient::with_base(server.uri());
         let err = c.info().await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(500), .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn enable_wired_control_sends_p1_and_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/control/wired_usb"))
+            .and(query_param("p", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        c.enable_wired_control().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enable_wired_control_403_is_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/control/wired_usb"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let err = c.enable_wired_control().await.unwrap_err();
+        assert!(matches!(err, CoreError::Http { status: Some(403), .. }), "got {err:?}");
     }
 
     #[test]
