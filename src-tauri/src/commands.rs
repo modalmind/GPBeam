@@ -96,6 +96,9 @@ use std::sync::atomic::Ordering;
 
 use gpbeam_core::config::load_config;
 use tauri::{Emitter, State};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 use crate::config_io::config_to_view;
 
@@ -282,6 +285,53 @@ pub fn retry_failed_cloud(ctx: State<'_, AppCtx>) -> Result<usize, String> {
 #[tauri::command]
 pub fn quit(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+/// Open the native directory picker and return the chosen folder (or `None` if
+/// the user cancels). Uses the blocking dialog API so the command returns the
+/// path synchronously to the awaiting UI invoke.
+#[tauri::command]
+pub fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Open a path with the OS default handler (e.g. the destination folder in the
+/// file manager). `None` for `with` lets the OS pick the default application.
+#[tauri::command]
+pub fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Reveal a file in its containing folder (Finder/Explorer "show in folder"),
+/// used by the History tab's per-row Reveal action.
+#[tauri::command]
+pub fn reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|e| e.to_string())
+}
+
+/// Whether launch-at-login is currently enabled (autostart plugin).
+#[tauri::command]
+pub fn get_autostart(app: tauri::AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Toggle launch-at-login on or off (autostart plugin).
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())
+    } else {
+        mgr.disable().map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -534,5 +584,14 @@ mod tests {
         let _ = resume_cloud as fn(tauri::AppHandle, State<'_, AppCtx>) -> Result<AppState, String>;
         let _ = retry_failed_cloud as fn(State<'_, AppCtx>) -> Result<usize, String>;
         let _ = quit as fn(tauri::AppHandle);
+    }
+
+    #[test]
+    fn plugin_commands_exist() {
+        let _ = pick_folder as fn(tauri::AppHandle) -> Option<String>;
+        let _ = open_path as fn(tauri::AppHandle, String) -> Result<(), String>;
+        let _ = reveal_path as fn(tauri::AppHandle, String) -> Result<(), String>;
+        let _ = get_autostart as fn(tauri::AppHandle) -> bool;
+        let _ = set_autostart as fn(tauri::AppHandle, bool) -> Result<(), String>;
     }
 }

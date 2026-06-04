@@ -19,6 +19,8 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 gpbeam-core = { path = "../crates/gpbeam-core" }
 keyring = "3"
 serde = { version = "1", features = ["derive"] }
