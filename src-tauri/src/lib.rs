@@ -14,11 +14,19 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
 use gpbeam_core::cloud::{build_uploader, worker::CloudWorker, CloudEvent};
 use gpbeam_core::config::{config_path, load_config, Config, MirrorMode};
 use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
+
+use crate::app_state::AppState;
+use crate::cloud_runtime::CloudRuntime;
+use crate::commands::AppCtx;
+use crate::keyring_store::{KeyringBackend, KeyringCredentialStore, SystemKeyring};
 
 mod cloud_runtime;
 mod commands;
@@ -102,6 +110,40 @@ fn load_or_default_config(dest: &Path) -> Config {
             cfg
         }
         Err(_) => Config::new(dest.to_path_buf()),
+    }
+}
+
+/// Assemble the managed `AppCtx` from a loaded `Config`, the resolved paths, and a
+/// keychain backend. Kept pure (no `AppHandle`) so it is unit-testable: `run()`
+/// passes the real `SystemKeyring`; tests pass a `MemoryKeyring`. Credential
+/// precedence (env > keychain > toml fallback) lives in `KeyringCredentialStore`;
+/// here we just thread the env overrides and the optional toml fallback through.
+#[allow(clippy::too_many_arguments)]
+fn build_app_ctx(
+    cfg: &Config,
+    dest_root: PathBuf,
+    config_path: PathBuf,
+    ledger_path: PathBuf,
+    backend: Arc<dyn KeyringBackend>,
+    env_username: Option<String>,
+    env_app_password: Option<String>,
+    fallback: Option<EnvConfigStore>,
+) -> AppCtx {
+    let creds = KeyringCredentialStore::new(
+        "com.gpbeam.app",
+        backend,
+        env_username,
+        env_app_password,
+        fallback,
+    );
+    AppCtx {
+        state: Arc::new(Mutex::new(AppState::default())),
+        paused: Arc::new(AtomicBool::new(false)),
+        creds: Arc::new(creds),
+        runtime: Arc::new(Mutex::new(CloudRuntime::from_config(cfg))),
+        dest_root,
+        config_path,
+        ledger_path,
     }
 }
 
@@ -328,4 +370,74 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyring_store::MemoryKeyring;
+    use gpbeam_core::config::{CloudConfig, CloudKind, Config, MirrorMode};
+    use std::sync::Arc;
+
+    fn cfg_with_cloud() -> Config {
+        let mut cfg = Config::new(std::path::PathBuf::from("/tmp/gpbeam-test-dest"));
+        cfg.delete_after_verify = true;
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://example.com".into(),
+            username: "alice".into(),
+            remote_root: "/GPBeam".into(),
+            mirror_mode: MirrorMode::Auto,
+            chunk_threshold: 10_000_000,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 3,
+        });
+        cfg
+    }
+
+    #[test]
+    fn build_app_ctx_seeds_runtime_from_cloud_config() {
+        let cfg = cfg_with_cloud();
+        let backend = Arc::new(MemoryKeyring::new());
+        let ctx = build_app_ctx(
+            &cfg,
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest"),
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest/gpbeam.toml"),
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest/.gpbeam-ledger.sqlite"),
+            backend,
+            None, // env_username
+            None, // env_app_password
+            None, // fallback EnvConfigStore
+        );
+        let rt = ctx.runtime.lock().unwrap();
+        assert!(rt.config.is_some());
+        assert!(rt.delete_after_verify);
+        drop(rt);
+        assert_eq!(ctx.dest_root, std::path::PathBuf::from("/tmp/gpbeam-test-dest"));
+        assert!(!ctx.paused.load(std::sync::atomic::Ordering::SeqCst));
+        // Fresh AppState defaults to Idle with no run.
+        let st = ctx.state.lock().unwrap();
+        assert_eq!(st.status, crate::app_state::Status::Idle);
+        assert!(st.run.is_none());
+    }
+
+    #[test]
+    fn build_app_ctx_without_cloud_leaves_runtime_idle() {
+        let cfg = Config::new(std::path::PathBuf::from("/tmp/gpbeam-test-dest"));
+        let backend = Arc::new(MemoryKeyring::new());
+        let ctx = build_app_ctx(
+            &cfg,
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest"),
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest/gpbeam.toml"),
+            std::path::PathBuf::from("/tmp/gpbeam-test-dest/.gpbeam-ledger.sqlite"),
+            backend,
+            None,
+            None,
+            None,
+        );
+        let rt = ctx.runtime.lock().unwrap();
+        assert!(rt.config.is_none());
+    }
 }
