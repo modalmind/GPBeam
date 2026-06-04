@@ -43,6 +43,7 @@ pub struct ConfigView {
     pub space_headroom: u64,
     pub delete_after_verify: bool,
     pub auto_eject: bool,
+    pub wired_ingest: bool,
     pub cloud: Option<CloudView>,
 }
 
@@ -68,6 +69,7 @@ pub fn config_to_view(cfg: &Config, has_password: bool) -> ConfigView {
         space_headroom: cfg.space_headroom,
         delete_after_verify: cfg.delete_after_verify,
         auto_eject: cfg.auto_eject,
+        wired_ingest: cfg.wired_ingest,
         cloud: cfg.cloud.as_ref().map(|c| cloud_to_view(c, has_password)),
     }
 }
@@ -186,6 +188,7 @@ pub fn view_to_config(view: &ConfigView) -> Result<Config, String> {
         cloud,
         delete_after_verify: view.delete_after_verify,
         auto_eject: view.auto_eject,
+        wired_ingest: view.wired_ingest,
     })
 }
 
@@ -328,6 +331,29 @@ mod tests {
         assert!(cloud.get("hasPassword").is_some());
     }
 
+    #[test]
+    fn config_to_view_carries_wired_ingest_default_true() {
+        let cfg = Config::new(PathBuf::from("/Users/alice/GPBeam"));
+        let view = config_to_view(&cfg, false);
+        assert!(view.wired_ingest, "Config::new default true -> view true");
+    }
+
+    #[test]
+    fn config_to_view_serializes_wired_ingest_camelcase() {
+        let cfg = Config::new(PathBuf::from("/d"));
+        let json = serde_json::to_value(config_to_view(&cfg, false)).unwrap();
+        assert!(json.get("wiredIngest").is_some(), "camelCase key wiredIngest present");
+        assert_eq!(json.get("wiredIngest").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn view_to_config_maps_wired_ingest_false() {
+        let mut v = base_view();
+        v.wired_ingest = false;
+        let cfg = view_to_config(&v).expect("valid view -> config");
+        assert!(!cfg.wired_ingest, "view false -> config false");
+    }
+
     fn base_view() -> ConfigView {
         ConfigView {
             dest_root: "/Users/alice/GPBeam".into(),
@@ -338,6 +364,7 @@ mod tests {
             space_headroom: 1024 * 1024 * 1024,
             delete_after_verify: false,
             auto_eject: false,
+            wired_ingest: true,
             cloud: None,
         }
     }
