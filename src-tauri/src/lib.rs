@@ -50,16 +50,11 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-/// Map one `CloudEvent` to UI side effects. The full event is always forwarded
-/// to the popover on `gpbeam://cloud`; terminal events also drive the tray icon
-/// and a native notification, reusing the M1 `set_tray_state` / `notify` paths.
-/// `CloudEvent` has exactly four variants (no `Ejected` — auto-eject is the sync
-/// offload path's job and surfaces as `RunEvent::Ejected`), so this match stays
-/// exhaustive over the locked contract.
+/// Map one `CloudEvent` to tray-icon + native-notification side effects. The full
+/// UI state now flows on `"gpbeam://state"` (see `spawn_cloud_loop`), so this no
+/// longer emits a per-event debug string. `CloudEvent` has exactly four variants,
+/// so this match stays exhaustive over the locked contract.
 fn forward_cloud_event(app: &AppHandle, ev: CloudEvent) {
-    // Always surface the raw event to the popover UI.
-    let _ = app.emit("gpbeam://cloud", format!("{ev:?}"));
-
     match ev {
         CloudEvent::Uploading { .. } => {
             // In-flight upload: reflect activity in the tray, no notification.
@@ -173,60 +168,60 @@ fn build_app_ctx(
     }
 }
 
-/// Spawn the async cloud-upload worker loop on the Tauri runtime. Called only
-/// when the loaded config has a `[cloud]` table whose `mirror_mode` is `Auto`.
-/// The worker opens its OWN rusqlite `Ledger` at `ledger_path` (WAL + busy
-/// timeout); it shares no `Connection` with the sync offload path, so it never
-/// blocks card ejection or the UI thread. Credentials come from the same
-/// `gpbeam.toml` the offload side loaded, honoring `GPBEAM_NC_*` env overrides.
-fn spawn_cloud_worker(
-    app: &AppHandle,
-    cloud: gpbeam_core::config::CloudConfig,
-    delete_after_verify: bool,
-    ledger_path: PathBuf,
-) {
-    let cfg_path = config_path(std::env::var("GPBEAM_CONFIG").ok(), &dest_root());
-    let store = match std::fs::read_to_string(&cfg_path).ok().and_then(|s| {
-        EnvConfigStore::from_toml_str(
-            &s,
-            std::env::var("GPBEAM_NC_USERNAME").ok(),
-            std::env::var("GPBEAM_NC_APP_PASSWORD").ok(),
-        )
-        .ok()
-    }) {
-        Some(s) => s,
-        None => EnvConfigStore::empty(None, None),
-    };
-
-    let uploader = match build_uploader(&cloud, &store) {
-        Ok(u) => u,
-        Err(e) => {
-            // Misconfigured cloud (e.g. missing app password) must NOT take down
-            // the M1 offload path: report once and skip the worker.
-            notify(app, "GPBeam cloud disabled", &e.to_string());
-            return;
-        }
-    };
-
-    let worker = CloudWorker::new(
-        ledger_path,
-        uploader,
-        cloud.destination_id.clone(),
-        cloud.max_concurrency,
-        cloud.max_attempts,
-        delete_after_verify,
-    );
-
+/// The single long-lived cloud-mirror loop. Ticks every 5s; on each tick it reads
+/// the swappable `CloudRuntime` and the `paused` flag from the managed `AppCtx`. If
+/// `should_drain` is false it idles; otherwise it builds an uploader through the
+/// keychain-backed credential store, drains the queue via `CloudWorker`, folds each
+/// `CloudEvent` into the shared `AppState` (broadcasting `gpbeam://state`), and runs
+/// the tray-icon/notification side effects. `save_config` swaps `runtime.config`
+/// in place, so the next tick uses the new settings — no task abort needed.
+fn spawn_cloud_loop(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
+
+            let ctx = app.state::<AppCtx>();
+            let paused = ctx.paused.load(std::sync::atomic::Ordering::SeqCst);
+            let runtime = ctx.runtime.lock().expect("CloudRuntime mutex poisoned").clone();
+
+            if !cloud_runtime::should_drain(paused, &runtime) {
+                continue;
+            }
+            let cloud = match runtime.config.clone() {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Build the uploader through the keychain-backed credential store.
+            let uploader = match build_uploader(&cloud, ctx.creds.as_ref()) {
+                Ok(u) => u,
+                Err(e) => {
+                    // Misconfigured cloud (e.g. missing app password) must NOT take
+                    // down the offload path: surface once and retry next tick.
+                    notify(&app, "GPBeam cloud disabled", &e.to_string());
+                    continue;
+                }
+            };
+
+            let worker = CloudWorker::new(
+                ctx.ledger_path.clone(),
+                uploader,
+                cloud.destination_id.clone(),
+                cloud.max_concurrency,
+                cloud.max_attempts,
+                runtime.delete_after_verify,
+            );
+
             let app2 = app.clone();
-            let mut emit = move |ev: CloudEvent| forward_cloud_event(&app2, ev);
-            // `run_until_drained` carries its own retry-aware sleep between
-            // passes; the outer ticker re-checks for jobs enqueued by later
-            // offload runs without busy-spinning.
+            let state = ctx.state.clone();
+            let mut emit = move |ev: CloudEvent| {
+                // Fold into shared state + broadcast, then run tray/notification FX.
+                let snap = fold_cloud_event(&state, &ev);
+                emit_state(&app2, &snap);
+                forward_cloud_event(&app2, ev);
+            };
             if let Err(e) = worker.run_until_drained(&mut emit).await {
                 let _ = app.emit("gpbeam://cloud", format!("worker error: {e}"));
             }
@@ -372,21 +367,11 @@ pub fn run() {
                 }
             });
 
-            // M2: if cloud mirroring is configured for Auto, run the upload worker
-            // alongside the offload worker. No [cloud] table (or a non-Auto mode)
-            // -> nothing spawned and the process behaves byte-for-byte like M1.
-            let dest = dest_root();
-            let cfg = load_or_default_config(&dest);
-            if let Some(cloud) = cfg.cloud {
-                if cloud.mirror_mode == MirrorMode::Auto {
-                    spawn_cloud_worker(
-                        &app.handle().clone(),
-                        cloud,
-                        cfg.delete_after_verify,
-                        ledger_path(&dest),
-                    );
-                }
-            }
+            // M3: one long-lived cloud-mirror loop. It self-guards each tick via
+            // `should_drain`, so with no [cloud] table (or mirror_mode = Off) it is
+            // an idle no-op and the process behaves like M1/M2 defaults. The runtime
+            // it reads is seeded in build_app_ctx and swapped live by save_config.
+            spawn_cloud_loop(&app.handle().clone());
 
             Ok(())
         })
@@ -517,6 +502,26 @@ mod tests {
         assert_eq!(up.total, 100);
         let shared = state.lock().unwrap();
         assert!(shared.cloud.uploading.is_some());
+    }
+
+    #[test]
+    fn cloud_failed_folds_to_error_state() {
+        use crate::app_state::Status;
+        use gpbeam_core::cloud::CloudEvent;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::app_state::AppState::default()));
+        // Prime a pending upload so the failure has something to decrement.
+        let _ = fold_cloud_event(
+            &state,
+            &CloudEvent::Uploading { file: "x.mp4".into(), uploaded: 0, total: 10 },
+        );
+        let snap = fold_cloud_event(
+            &state,
+            &CloudEvent::CloudFailed { file: "x.mp4".into(), error: "boom".into() },
+        );
+        assert_eq!(snap.status, Status::Error);
+        assert!(snap.cloud.uploading.is_none());
+        assert_eq!(snap.cloud.failed, 1);
+        assert!(snap.message.is_some());
     }
 
     #[test]
