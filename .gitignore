@@ -25,3 +25,6 @@ dist-ssr/
 
 # GPBeam scratch (workflow scripts, plan-assembly helpers)
 .gpbeam/
+
+# Internal design docs / plans / research — kept locally, not published
+/docs/

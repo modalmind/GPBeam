@@ -152,8 +152,7 @@ npm --prefix ui run check       # svelte-check (type/template)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Cloud tests run against a mocked WebDAV server (`wiremock`); a real-Nextcloud checklist lives
-in `docs/superpowers/validation/`.
+Cloud tests run against a mocked WebDAV server (`wiremock`), so the suite is fully headless.
 
 ## Platform support
 

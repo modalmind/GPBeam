@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    # macOS: the gpbeam (Tauri) crate embeds the frontend via generate_context!,
+    # so it builds without Linux WebKit deps and matches the primary dev platform.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix ui ci
+
+      - name: Build frontend
+        # tauri::generate_context! embeds ../ui/dist at compile time, so the gpbeam
+        # crate (and its tests/clippy) won't build until the frontend is built.
+        run: npm --prefix ui run build
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix ui ci
+
+      - name: Type-check (svelte-check)
+        run: npm --prefix ui run check
+
+      - name: Unit tests (Vitest)
+        run: npm --prefix ui run test
+
+      - name: Build
+        run: npm --prefix ui run build
