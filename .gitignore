@@ -10,6 +10,10 @@ dist/
 dist-ssr/
 *.local
 
+# M3 frontend build artifacts (explicit, per M3 contract)
+/ui/node_modules/
+/ui/dist/
+
 # Editors / OS
 .DS_Store
 .vscode/*
