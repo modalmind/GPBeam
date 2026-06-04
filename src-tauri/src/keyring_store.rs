@@ -202,6 +202,25 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use gpbeam_core::cloud::build_uploader;
+    use gpbeam_core::config::{CloudConfig, CloudKind, MirrorMode};
+
+    // Cloud-config fixture mirroring crates/gpbeam-core/src/cloud/mod.rs.
+    fn cloud_cfg() -> CloudConfig {
+        CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "home-nc".into(),
+            base_url: "https://nc.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: MirrorMode::Auto,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        }
+    }
+
     // helper: a fallback EnvConfigStore with one file entry for "nc1".
     fn fallback_with_nc1() -> EnvConfigStore {
         let toml = r#"
@@ -426,5 +445,44 @@ app_password = "file-pw"
         );
         assert!(fb_store.has_password("nc1"));
         assert!(!fb_store.has_password("unknown"));
+    }
+
+    #[test]
+    fn build_uploader_succeeds_with_keychain_backed_secret() {
+        let backend = Arc::new(MemoryKeyring::new());
+        // Store the app-password under the destination id, as the UI would.
+        backend
+            .set("com.gpbeam.app", "home-nc", "abcd-efgh-ijkl")
+            .unwrap();
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.app",
+            backend,
+            None,
+            None,
+            None,
+        );
+        // `build_uploader` takes `&dyn CredentialStore`; our store qualifies.
+        match build_uploader(&cloud_cfg(), &store) {
+            Ok(up) => assert_eq!(Arc::strong_count(&up), 1),
+            Err(e) => panic!("expected an uploader, got error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn build_uploader_fails_when_no_password_anywhere() {
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.app",
+            Arc::new(MemoryKeyring::new()),
+            None,
+            None,
+            None,
+        );
+        match build_uploader(&cloud_cfg(), &store) {
+            Err(gpbeam_core::error::CoreError::Config(msg)) => {
+                assert!(msg.contains("home-nc"), "message names the destination: {msg}");
+            }
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("expected a Config error, got an uploader"),
+        }
     }
 }
