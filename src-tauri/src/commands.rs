@@ -92,6 +92,11 @@ fn seed_pending_from_ledger(ledger_path: &Path, cloud: &mut CloudState) {
 
 use crate::config_io::{validate_view, view_to_config, write_config_atomic, ConfigView};
 
+use gpbeam_core::config::load_config;
+use tauri::State;
+
+use crate::config_io::config_to_view;
+
 /// The shared `save_config` / `complete_wizard` pipeline as a pure function so
 /// it can be unit-tested without a Tauri `AppHandle`.
 ///
@@ -133,6 +138,49 @@ fn apply_saved_config(
         state.cloud.uploading = None;
     }
     Ok(())
+}
+
+/// Snapshot of the current application state for a freshly-opened window. Clones
+/// the managed `AppState` and re-seeds `cloud.pending` from the persisted queue
+/// so the popover is accurate after an app restart (design §7).
+#[tauri::command]
+pub fn get_state(ctx: State<'_, AppCtx>) -> AppState {
+    let mut state = ctx.state.lock().expect("AppState mutex poisoned").clone();
+    seed_pending_from_ledger(&ctx.ledger_path, &mut state.cloud);
+    state
+}
+
+/// The current on-disk `Config` as a UI-facing `ConfigView` (secrets redacted;
+/// `has_password` is a keychain/env presence hint only). Falls back to M1
+/// defaults rooted at the destination when no config exists yet, so the settings
+/// window always renders.
+#[tauri::command]
+pub fn get_config(ctx: State<'_, AppCtx>) -> Result<ConfigView, String> {
+    let cfg = match load_config(&ctx.config_path) {
+        Ok(mut c) => {
+            c.dest_root = ctx.dest_root.clone();
+            c
+        }
+        Err(_) => gpbeam_core::config::Config::new(ctx.dest_root.clone()),
+    };
+    let has_password = match cfg.cloud.as_ref() {
+        Some(cloud) => ctx.creds.has_password(&cloud.destination_id),
+        None => false,
+    };
+    Ok(config_to_view(&cfg, has_password))
+}
+
+/// The most-recently-copied files (capped at `limit`) for the History tab.
+#[tauri::command]
+pub fn get_history(ctx: State<'_, AppCtx>, limit: usize) -> Result<Vec<HistoryRow>, String> {
+    history_rows_from_ledger(&ctx.ledger_path, limit)
+}
+
+/// True when no `gpbeam.toml` exists at the resolved config path — the settings
+/// window opens into the first-run wizard instead of the tabs (design §4.3).
+#[tauri::command]
+pub fn is_first_run(ctx: State<'_, AppCtx>) -> bool {
+    !ctx.config_path.exists()
 }
 
 #[cfg(test)]
@@ -361,5 +409,14 @@ mod tests {
             .unwrap_err();
         assert!(!err.is_empty(), "validation error message is non-empty");
         assert!(!cfg_path.exists(), "invalid input must NOT write gpbeam.toml");
+    }
+
+    #[test]
+    fn state_reading_commands_exist() {
+        // Reference each command as a fn item so a signature drift fails to compile.
+        let _ = get_state as fn(tauri::State<'_, AppCtx>) -> AppState;
+        let _ = get_config as fn(tauri::State<'_, AppCtx>) -> Result<crate::config_io::ConfigView, String>;
+        let _ = get_history as fn(tauri::State<'_, AppCtx>, usize) -> Result<Vec<HistoryRow>, String>;
+        let _ = is_first_run as fn(tauri::State<'_, AppCtx>) -> bool;
     }
 }
