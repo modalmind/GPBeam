@@ -334,6 +334,29 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String>
     }
 }
 
+/// The exact set of `#[tauri::command]` names Phase 6 must register in
+/// `tauri::generate_handler!` (and that the TS `bindings.ts` mirrors). Kept here
+/// as the single source of truth so the count test below guards drift.
+pub const COMMAND_NAMES: &[&str] = &[
+    "get_state",
+    "get_config",
+    "save_config",
+    "pick_folder",
+    "open_path",
+    "reveal_path",
+    "set_nextcloud_credentials",
+    "clear_nextcloud_credentials",
+    "pause_cloud",
+    "resume_cloud",
+    "retry_failed_cloud",
+    "get_history",
+    "get_autostart",
+    "set_autostart",
+    "is_first_run",
+    "complete_wizard",
+    "quit",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +616,20 @@ mod tests {
         let _ = reveal_path as fn(tauri::AppHandle, String) -> Result<(), String>;
         let _ = get_autostart as fn(tauri::AppHandle) -> bool;
         let _ = set_autostart as fn(tauri::AppHandle, bool) -> Result<(), String>;
+    }
+
+    /// Pins the count of commands wired into Phase 6's `generate_handler!`. If
+    /// this fails, update both `COMMAND_NAMES` and the macro list in lib.rs.
+    #[test]
+    fn command_surface_count_is_pinned() {
+        assert_eq!(COMMAND_NAMES.len(), 17, "command surface changed — sync lib.rs generate_handler!");
+    }
+
+    #[test]
+    fn command_names_are_unique_and_sorted_by_phase_table() {
+        let mut seen = std::collections::HashSet::new();
+        for name in COMMAND_NAMES {
+            assert!(seen.insert(*name), "duplicate command name: {name}");
+        }
     }
 }
