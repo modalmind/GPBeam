@@ -58,6 +58,17 @@ pub struct CloudJob {
     pub resume_state: Option<ResumeState>,
 }
 
+/// One row of recent-import history for the M3 History tab. Read-only view
+/// over the `imported` table (joined with its own `cloud_status` column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportRow {
+    pub name: String,
+    pub dest_path: String,
+    pub size: u64,
+    pub copied_at: String,
+    pub cloud_status: Option<String>,
+}
+
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -387,6 +398,32 @@ impl Ledger {
             rusqlite::params![JobState::Queued.as_str(), JobState::Failed.as_str()],
         )?;
         Ok(n)
+    }
+
+    /// Most-recently-copied imports first (`ORDER BY id DESC`), capped at
+    /// `limit`. Read-only view for the M3 History tab. `cloud_status` is the
+    /// per-file column on `imported` (NULL -> `None`).
+    pub fn recent_imports(&self, limit: usize) -> Result<Vec<ImportRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, dest_path, size, copied_at, cloud_status
+             FROM imported
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![limit as i64])?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let size: i64 = row.get(2)?;
+            out.push(ImportRow {
+                name: row.get(0)?,
+                dest_path: row.get(1)?,
+                size: size as u64,
+                copied_at: row.get(3)?,
+                cloud_status: row.get(4)?,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -841,5 +878,70 @@ mod tests {
         assert_eq!(JobState::from_str("done"), Some(JobState::Done));
         assert_eq!(JobState::from_str("failed"), Some(JobState::Failed));
         assert_eq!(JobState::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn recent_imports_empty_ledger_is_empty_vec() {
+        let l = mem();
+        assert_eq!(l.recent_imports(10).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn recent_imports_most_recent_first() {
+        let mut l = mem();
+        // Three distinct files; ORDER BY id DESC means the last-recorded is first.
+        l.record("C346", "GX010001.MP4", 100, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        l.record("C346", "GX010002.MP4", 200, 1001, "/dest/GX010002.MP4", None)
+            .unwrap();
+        l.record("C346", "GX010003.MP4", 300, 1002, "/dest/GX010003.MP4", None)
+            .unwrap();
+
+        let rows = l.recent_imports(10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "GX010003.MP4");
+        assert_eq!(rows[1].name, "GX010002.MP4");
+        assert_eq!(rows[2].name, "GX010001.MP4");
+
+        // Scalar fields are mapped correctly on the newest row.
+        assert_eq!(rows[0].dest_path, "/dest/GX010003.MP4");
+        assert_eq!(rows[0].size, 300);
+        assert!(!rows[0].copied_at.is_empty());
+        assert_eq!(rows[0].cloud_status, None);
+    }
+
+    #[test]
+    fn recent_imports_honors_limit() {
+        let mut l = mem();
+        for i in 0..5 {
+            l.record(
+                "C346",
+                &format!("GX01000{i}.MP4"),
+                100 + i as u64,
+                1000 + i,
+                &format!("/dest/GX01000{i}.MP4"),
+                None,
+            )
+            .unwrap();
+        }
+        let rows = l.recent_imports(2).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest two (i=4 then i=3), most-recent first.
+        assert_eq!(rows[0].name, "GX010004.MP4");
+        assert_eq!(rows[1].name, "GX010003.MP4");
+    }
+
+    #[test]
+    fn recent_imports_reflects_cloud_status() {
+        let mut l = mem();
+        let id = l
+            .record("C346", "GX010001.MP4", 100, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        // Before set_cloud_status the column is NULL -> None.
+        assert_eq!(l.recent_imports(10).unwrap()[0].cloud_status, None);
+
+        l.set_cloud_status(id, "done").unwrap();
+        let rows = l.recent_imports(10).unwrap();
+        assert_eq!(rows[0].cloud_status.as_deref(), Some("done"));
     }
 }
