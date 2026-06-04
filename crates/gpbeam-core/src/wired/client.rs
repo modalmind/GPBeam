@@ -9,7 +9,9 @@
 use crate::error::{CoreError, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use std::io::Cursor;
 use std::net::IpAddr;
+use std::path::Path;
 
 /// Identity of a connected camera, from `GET /gopro/camera/info`.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,7 +61,6 @@ impl GoProClient {
     }
 
     /// Full download URL for a media file: `{base}/videos/DCIM/{dir}/{name}`.
-    #[allow(dead_code)]
     pub(crate) fn media_url(&self, m: &RemoteMedia) -> String {
         format!("{}/videos/DCIM/{}/{}", self.base, m.dir, m.name)
     }
@@ -156,6 +157,55 @@ impl GoProClient {
         let text = resp.text().await.map_err(transport_err)?;
         parse_media_list(&text)
     }
+
+    /// Download `m` into `part_path`, resuming from its current byte length via a
+    /// `Range: bytes=<part_len>-` request. The response body is buffered, then fed
+    /// to `crate::transfer::stream_hash_to_part`, which appends to the `.part`
+    /// (open-append when `already > 0`) and BLAKE3-hashes the full on-disk file.
+    /// `progress` is called with the cumulative bytes on disk. Returns
+    /// `(total_bytes_on_disk, blake3_hex)`. Non-2xx -> `Http`.
+    pub async fn download_resumable(
+        &self,
+        m: &RemoteMedia,
+        part_path: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(u64, String)> {
+        // Bytes already on disk -> the Range start offset.
+        let already = match std::fs::metadata(part_path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(CoreError::Io {
+                    path: part_path.to_path_buf(),
+                    source: e,
+                })
+            }
+        };
+
+        let url = self.media_url(m);
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::RANGE, format!("bytes={already}-"))
+            .send()
+            .await
+            .map_err(transport_err)?;
+        let status = resp.status().as_u16();
+        // 200 (full) and 206 (partial) are both acceptable; the helper appends
+        // from `already`, so a server that ignores Range and resends from 0 would
+        // double-append — but the Open GoPro API honors Range (Accept-Ranges:
+        // bytes), and resume only triggers when `already > 0`.
+        if status != 200 && status != 206 {
+            return Err(CoreError::Http {
+                status: Some(status),
+                msg: format!("GET {url} (Range bytes={already}-) -> {status}"),
+            });
+        }
+
+        let body = resp.bytes().await.map_err(transport_err)?;
+        let mut reader = Cursor::new(body);
+        crate::transfer::stream_hash_to_part(&mut reader, part_path, already, progress)
+    }
 }
 
 /// Parse a `/gopro/media/list` JSON body into a flat `Vec<RemoteMedia>`.
@@ -232,8 +282,27 @@ fn transport_err(e: reqwest::Error) -> CoreError {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::io::Write as _;
     use wiremock::matchers::{method as wm_method, path as wm_path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// Match a GET whose `Range` header starts at exactly `from` (`bytes=<from>-`).
+    struct RangeFrom {
+        from: u64,
+    }
+    impl Match for RangeFrom {
+        fn matches(&self, req: &Request) -> bool {
+            req.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == format!("bytes={}-", self.from))
+                .unwrap_or(false)
+        }
+    }
+
+    fn blake3_hex(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
 
     #[tokio::test]
     async fn version_parses_version_field() {
@@ -436,6 +505,112 @@ mod tests {
         let c = GoProClient::with_base(server.uri());
         let err = c.media_list().await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(500), .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn download_resumable_fresh_streams_and_hashes() {
+        let server = MockServer::start().await;
+        let full = b"hello gopro wired download".to_vec();
+
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .and(RangeFrom { from: 0 })
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(full.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: full.len() as u64,
+            captured_unix: 1780515910,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+
+        let mut last = 0u64;
+        let mut cb = |n: u64| last = n;
+        let (total, hash) = c.download_resumable(&m, &part, &mut cb).await.unwrap();
+
+        assert_eq!(total, full.len() as u64);
+        assert_eq!(hash, blake3_hex(&full));
+        assert_eq!(last, full.len() as u64, "progress reached total");
+        assert_eq!(std::fs::read(&part).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn download_resumable_resumes_from_existing_part() {
+        let server = MockServer::start().await;
+        let full = b"0123456789ABCDEFGHIJ".to_vec(); // 20 bytes
+        let head_len = 8u64;                          // pre-existing .part has 8 bytes
+        let tail = full[head_len as usize..].to_vec();
+
+        // Only the tail is served, and only for a Range starting at head_len.
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .and(RangeFrom { from: head_len })
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(tail.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Guard: a fresh (bytes=0-) request must NOT happen.
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .and(RangeFrom { from: 0 })
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: full.len() as u64,
+            captured_unix: 1780515910,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        // Pre-create the .part with the first head_len bytes.
+        {
+            let mut f = std::fs::File::create(&part).unwrap();
+            f.write_all(&full[..head_len as usize]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut last = 0u64;
+        let mut cb = |n: u64| last = n;
+        let (total, hash) = c.download_resumable(&m, &part, &mut cb).await.unwrap();
+
+        assert_eq!(total, full.len() as u64);
+        assert_eq!(hash, blake3_hex(&full), "hash is over the FULL reassembled file");
+        assert_eq!(last, full.len() as u64);
+        assert_eq!(std::fs::read(&part).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn download_resumable_404_is_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: 10,
+            captured_unix: 0,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        let mut cb = |_n: u64| {};
+        let err = c.download_resumable(&m, &part, &mut cb).await.unwrap_err();
+        assert!(matches!(err, CoreError::Http { status: Some(404), .. }), "got {err:?}");
     }
 
     #[test]
