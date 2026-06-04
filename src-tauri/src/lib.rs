@@ -235,8 +235,10 @@ fn spawn_cloud_worker(
 }
 
 /// Run one offload pass for a freshly mounted volume. Blocking I/O — call via
-/// `spawn_blocking` so the async runtime is never stalled.
-fn handle_mount(app: &AppHandle, mount: PathBuf) {
+/// `spawn_blocking` so the async runtime is never stalled. Each `RunEvent` folds
+/// into the shared `AppState` and is broadcast to the UI on `"gpbeam://state"`;
+/// the tray icon + notifications still follow the terminal summary.
+fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
     // Ignore non-GoPro volumes (thumb drives, phones, etc.) before any side
     // effects: no tray flash, no destination dir, no ledger for a random disk.
     if !gpbeam_core::gopro::is_gopro_card(&mount) {
@@ -260,9 +262,11 @@ fn handle_mount(app: &AppHandle, mount: PathBuf) {
 
     set_tray_state(app, "working");
     let app2 = app.clone();
+    let state2 = state.clone();
     let summary = run_offload(&mount, &cfg, &mut ledger, &mut |e: Ev| {
-        // Forward every event to the popover UI; tray state follows terminal events.
-        let _ = app2.emit("gpbeam://event", format!("{e:?}"));
+        // Fold every event into the shared AppState and broadcast the snapshot.
+        let snap = fold_run_event(&state2, &e, cloud_runtime::now_unix());
+        emit_state(&app2, &snap);
     });
 
     match summary {
@@ -353,13 +357,18 @@ pub fn run() {
 
             // Background worker: poll for removable mounts and offload each.
             let handle = app.handle().clone();
+            let state = app.state::<AppCtx>().state.clone();
             tauri::async_runtime::spawn(async move {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 tauri::async_runtime::spawn(gpbeam_core::detect::poll_removable_mounts(tx));
                 while let Some(mount) = rx.recv().await {
                     let h = handle.clone();
+                    let st = state.clone();
                     // run_offload is blocking I/O -> keep it off the async runtime.
-                    let _ = tauri::async_runtime::spawn_blocking(move || handle_mount(&h, mount)).await;
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        handle_mount(&h, &st, mount)
+                    })
+                    .await;
                 }
             });
 
@@ -468,6 +477,30 @@ mod tests {
         // The shared state must have been mutated, not just the returned clone.
         let shared = state.lock().unwrap();
         assert_eq!(shared.status, Status::Working);
+    }
+
+    #[test]
+    fn run_event_sequence_folds_to_terminal_idle() {
+        use crate::app_state::Status;
+        use gpbeam_core::orchestrator::RunEvent;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::app_state::AppState::default()));
+        let seq = [
+            RunEvent::CardDetected { model: Some("HERO12".into()), serial: Some("C123".into()) },
+            RunEvent::Scanned { new_files: 1, total_bytes: 100 },
+            RunEvent::Copying { file: "a.mp4".into(), index: 1, total: 1 },
+            RunEvent::Progress { file: "a.mp4".into(), copied: 100, total: 100 },
+            RunEvent::Verified { file: "a.mp4".into() },
+            RunEvent::RunComplete { copied: 1, skipped: 0, failed: 0, bytes: 100 },
+        ];
+        let mut last = crate::app_state::AppState::default();
+        for ev in &seq {
+            last = fold_run_event(&state, ev, 1_700_000_000);
+        }
+        assert_eq!(last.status, Status::Idle);
+        assert!(last.run.is_none());
+        let lr = last.last_run.expect("last_run set on RunComplete");
+        assert_eq!(lr.copied, 1);
+        assert_eq!(lr.bytes, 100);
     }
 
     #[test]
