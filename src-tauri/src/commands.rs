@@ -4,11 +4,85 @@
 //! free helpers below (which ARE unit-tested), so the commands stay testable-
 //! by-inspection and the real Tauri glue is the only untested surface.
 
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+use crate::app_state::AppState;
+use crate::cloud_runtime::CloudRuntime;
+use crate::keyring_store::KeyringCredentialStore;
+
+/// Tauri-managed application context. Holds the shared, mutable state every
+/// command reads/writes, plus the immutable resolved paths. Registered via
+/// `.manage(AppCtx { .. })` in lib.rs (Phase 6).
+pub struct AppCtx {
+    /// The single source of truth the UI renders. Folded by the reducers in
+    /// `app_state` and re-emitted on `gpbeam://state` after every apply.
+    pub state: Arc<Mutex<AppState>>,
+    /// Pause flag the cloud tick loop checks before claiming jobs.
+    pub paused: Arc<AtomicBool>,
+    /// Keychain-backed credential store (env > keychain > toml precedence).
+    pub creds: Arc<KeyringCredentialStore>,
+    /// Mutable cloud settings the tick loop reads each pass; `save_config`
+    /// swaps `runtime.config` so the next tick uses the new settings.
+    pub runtime: Arc<Mutex<CloudRuntime>>,
+    /// Resolved offload destination root (`$GPBEAM_DEST`, else `~/GPBeam`).
+    pub dest_root: PathBuf,
+    /// Resolved `gpbeam.toml` path for atomic writes.
+    pub config_path: PathBuf,
+    /// Resolved SQLite ledger path for history / pending-count reads.
+    pub ledger_path: PathBuf,
+}
+
+/// One recent-transfer row for the History tab. Camel-cased to match the TS
+/// `HistoryRow` type in `ui/src/lib/bindings.ts`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRow {
+    pub name: String,
+    pub dest_path: String,
+    pub size: u64,
+    pub copied_at: String,
+    pub cloud_status: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn module_compiles() {
         // Smoke test: this module and its dependencies resolve.
         assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn history_row_serializes_camel_case() {
+        let row = HistoryRow {
+            name: "GX010001.MP4".into(),
+            dest_path: "/dest/GX010001.MP4".into(),
+            size: 4096,
+            copied_at: "2026-06-03 10:00:00".into(),
+            cloud_status: Some("done".into()),
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["name"], "GX010001.MP4");
+        assert_eq!(json["destPath"], "/dest/GX010001.MP4");
+        assert_eq!(json["size"], 4096);
+        assert_eq!(json["copiedAt"], "2026-06-03 10:00:00");
+        assert_eq!(json["cloudStatus"], "done");
+    }
+
+    #[test]
+    fn history_row_null_cloud_status_serializes_as_null() {
+        let row = HistoryRow {
+            name: "GX010002.MP4".into(),
+            dest_path: "/dest/GX010002.MP4".into(),
+            size: 10,
+            copied_at: "2026-06-03 10:01:00".into(),
+            cloud_status: None,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json["cloudStatus"].is_null());
     }
 }
