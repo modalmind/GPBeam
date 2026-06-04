@@ -92,8 +92,10 @@ fn seed_pending_from_ledger(ledger_path: &Path, cloud: &mut CloudState) {
 
 use crate::config_io::{validate_view, view_to_config, write_config_atomic, ConfigView};
 
+use std::sync::atomic::Ordering;
+
 use gpbeam_core::config::load_config;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::config_io::config_to_view;
 
@@ -181,6 +183,105 @@ pub fn get_history(ctx: State<'_, AppCtx>, limit: usize) -> Result<Vec<HistoryRo
 #[tauri::command]
 pub fn is_first_run(ctx: State<'_, AppCtx>) -> bool {
     !ctx.config_path.exists()
+}
+
+/// Emit the current `AppState` snapshot on `gpbeam://state` so every open window
+/// re-renders. The whole state is sent (no per-event channel) — see the contract.
+fn emit_state(app: &tauri::AppHandle, state: &AppState) {
+    let _ = app.emit("gpbeam://state", state);
+}
+
+/// Validate + atomically persist `gpbeam.toml`, rebuild the cloud runtime, refresh
+/// the cloud flags, then return (and broadcast) the updated state. On a validation
+/// or write error the existing config is untouched and `Err(message)` is returned.
+#[tauri::command]
+pub fn save_config(
+    app: tauri::AppHandle,
+    ctx: State<'_, AppCtx>,
+    view: ConfigView,
+) -> Result<AppState, String> {
+    let updated = {
+        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
+        let mut runtime = ctx.runtime.lock().expect("CloudRuntime mutex poisoned");
+        apply_saved_config(&view, &ctx.config_path, &ctx.ledger_path, &mut state, &mut runtime)?;
+        state.clone()
+    };
+    emit_state(&app, &updated);
+    Ok(updated)
+}
+
+/// Write the initial config from the first-run wizard. Identical pipeline to
+/// `save_config` (the wizard simply produces a `ConfigView` from its steps).
+#[tauri::command]
+pub fn complete_wizard(
+    app: tauri::AppHandle,
+    ctx: State<'_, AppCtx>,
+    view: ConfigView,
+) -> Result<AppState, String> {
+    save_config(app, ctx, view)
+}
+
+/// Store the Nextcloud app-password for `destination_id` in the OS keychain
+/// (the username lives in `gpbeam.toml`). Returns a friendly error if the
+/// keychain is unavailable/denied (design §7); cloud stays disabled, local
+/// offload is unaffected.
+#[tauri::command]
+pub fn set_nextcloud_credentials(
+    ctx: State<'_, AppCtx>,
+    destination_id: String,
+    app_password: String,
+) -> Result<(), String> {
+    ctx.creds.set_password(&destination_id, &app_password)
+}
+
+/// Delete the keychain entry for `destination_id`.
+#[tauri::command]
+pub fn clear_nextcloud_credentials(
+    ctx: State<'_, AppCtx>,
+    destination_id: String,
+) -> Result<(), String> {
+    ctx.creds.delete_password(&destination_id)
+}
+
+/// Pause the cloud drain loop (in-flight uploads finish; no new jobs claimed).
+/// Returns the refreshed state with `cloud.paused == true`.
+#[tauri::command]
+pub fn pause_cloud(app: tauri::AppHandle, ctx: State<'_, AppCtx>) -> Result<AppState, String> {
+    ctx.paused.store(true, Ordering::SeqCst);
+    let updated = {
+        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
+        state.cloud.paused = true;
+        state.clone()
+    };
+    emit_state(&app, &updated);
+    Ok(updated)
+}
+
+/// Resume the cloud drain loop. Returns the refreshed state with `cloud.paused == false`.
+#[tauri::command]
+pub fn resume_cloud(app: tauri::AppHandle, ctx: State<'_, AppCtx>) -> Result<AppState, String> {
+    ctx.paused.store(false, Ordering::SeqCst);
+    let updated = {
+        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
+        state.cloud.paused = false;
+        state.clone()
+    };
+    emit_state(&app, &updated);
+    Ok(updated)
+}
+
+/// Re-queue every terminally-failed cloud job so the next drain tick retries it.
+/// Returns how many jobs were requeued.
+#[tauri::command]
+pub fn retry_failed_cloud(ctx: State<'_, AppCtx>) -> Result<usize, String> {
+    let mut ledger = Ledger::open(&ctx.ledger_path).map_err(|e| e.to_string())?;
+    ledger.requeue_failed_cloud_jobs().map_err(|e| e.to_string())
+}
+
+/// Quit the app (the window-less tray app otherwise only exits via tray "Quit").
+#[tauri::command]
+pub fn quit(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 #[cfg(test)]
@@ -418,5 +519,20 @@ mod tests {
         let _ = get_config as fn(tauri::State<'_, AppCtx>) -> Result<crate::config_io::ConfigView, String>;
         let _ = get_history as fn(tauri::State<'_, AppCtx>, usize) -> Result<Vec<HistoryRow>, String>;
         let _ = is_first_run as fn(tauri::State<'_, AppCtx>) -> bool;
+    }
+
+    #[test]
+    fn mutating_commands_exist() {
+        let _ = save_config
+            as fn(tauri::AppHandle, State<'_, AppCtx>, ConfigView) -> Result<AppState, String>;
+        let _ = complete_wizard
+            as fn(tauri::AppHandle, State<'_, AppCtx>, ConfigView) -> Result<AppState, String>;
+        let _ = set_nextcloud_credentials
+            as fn(State<'_, AppCtx>, String, String) -> Result<(), String>;
+        let _ = clear_nextcloud_credentials as fn(State<'_, AppCtx>, String) -> Result<(), String>;
+        let _ = pause_cloud as fn(tauri::AppHandle, State<'_, AppCtx>) -> Result<AppState, String>;
+        let _ = resume_cloud as fn(tauri::AppHandle, State<'_, AppCtx>) -> Result<AppState, String>;
+        let _ = retry_failed_cloud as fn(State<'_, AppCtx>) -> Result<usize, String>;
+        let _ = quit as fn(tauri::AppHandle);
     }
 }
