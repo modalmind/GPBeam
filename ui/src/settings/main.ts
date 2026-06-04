@@ -1,9 +1,9 @@
-import { mount } from "svelte";
-import Settings from "./Settings.svelte";
+import { mount } from 'svelte';
+import Settings from './Settings.svelte';
 
-const target = document.getElementById("app");
-if (!target) throw new Error("settings mount target #app not found");
-
-const app = mount(Settings, { target });
+const app = mount(Settings, {
+  // Svelte 5 mount target; tests assert this exact getElementById call.
+  target: document.getElementById('app') as HTMLElement,
+});
 
 export default app;
