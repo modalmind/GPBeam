@@ -3,6 +3,8 @@
 //! reflect idle/working/error, and fires native notifications on completion.
 //! The rich popover/settings UI (and folder picker, cloud, history) is M3.
 
+mod config_io;
+
 use std::path::{Path, PathBuf};
 use tauri::{
     image::Image,
