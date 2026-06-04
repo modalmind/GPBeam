@@ -139,6 +139,28 @@ impl KeyringCredentialStore {
             None => Ok(None),
         }
     }
+
+    /// Store the app-password for `destination_id` in the keychain (overwrites).
+    pub fn set_password(&self, destination_id: &str, app_password: &str) -> Result<(), String> {
+        self.backend.set(&self.service, destination_id, app_password)
+    }
+
+    /// Remove the keychain entry for `destination_id`. Missing entries are a no-op.
+    pub fn delete_password(&self, destination_id: &str) -> Result<(), String> {
+        self.backend.delete(&self.service, destination_id)
+    }
+
+    /// True if any source (env, keychain, or fallback) supplies an app-password
+    /// for `destination_id`. UI hint only — does not resolve a full `Secret`.
+    pub fn has_password(&self, destination_id: &str) -> bool {
+        if self.env_app_password.is_some() {
+            return true;
+        }
+        if matches!(self.keychain_password(destination_id), Ok(Some(_))) {
+            return true;
+        }
+        matches!(self.fallback_secret(destination_id), Ok(Some(s)) if !s.app_password.is_empty())
+    }
 }
 
 impl CredentialStore for KeyringCredentialStore {
@@ -316,5 +338,93 @@ app_password = "file-pw"
         // Password from keychain; username falls back to the file entry's username.
         assert_eq!(secret.app_password, "keychain-pw");
         assert_eq!(secret.username, "file-user");
+    }
+
+    #[test]
+    fn set_password_then_get_returns_it() {
+        let backend = Arc::new(MemoryKeyring::new());
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend.clone(),
+            None,
+            None,
+            None,
+        );
+        assert!(store.get("nc1").unwrap().is_none());
+        store.set_password("nc1", "stored-pw").unwrap();
+        let secret = store.get("nc1").unwrap().expect("stored");
+        assert_eq!(secret.app_password, "stored-pw");
+        // It really landed in the backend under (service, destination_id).
+        assert_eq!(
+            backend.get("com.gpbeam.test", "nc1").unwrap(),
+            Some("stored-pw".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_password_clears_keychain_entry() {
+        let backend = Arc::new(MemoryKeyring::new());
+        let store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            backend.clone(),
+            None,
+            None,
+            None,
+        );
+        store.set_password("nc1", "stored-pw").unwrap();
+        assert!(store.has_password("nc1"));
+        store.delete_password("nc1").unwrap();
+        assert_eq!(backend.get("com.gpbeam.test", "nc1").unwrap(), None);
+        assert!(!store.has_password("nc1"));
+        // Deleting again is a no-op.
+        store.delete_password("nc1").unwrap();
+    }
+
+    #[test]
+    fn has_password_reflects_each_source() {
+        // No source -> false.
+        let empty = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            Arc::new(MemoryKeyring::new()),
+            None,
+            None,
+            None,
+        );
+        assert!(!empty.has_password("nc1"));
+
+        // env password -> true (even with empty keychain and no fallback).
+        let env_store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            Arc::new(MemoryKeyring::new()),
+            None,
+            Some("env-pw".to_string()),
+            None,
+        );
+        assert!(env_store.has_password("nc1"));
+
+        // keychain password -> true.
+        let kc_backend = Arc::new(MemoryKeyring::new());
+        kc_backend.set("com.gpbeam.test", "nc1", "kc-pw").unwrap();
+        let kc_store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            kc_backend,
+            None,
+            None,
+            None,
+        );
+        assert!(kc_store.has_password("nc1"));
+        // Different id with nothing stored -> false.
+        assert!(!kc_store.has_password("other"));
+
+        // fallback password -> true.
+        let fb_store = KeyringCredentialStore::new(
+            "com.gpbeam.test",
+            Arc::new(MemoryKeyring::new()),
+            None,
+            None,
+            Some(fallback_with_nc1()),
+        );
+        assert!(fb_store.has_password("nc1"));
+        assert!(!fb_store.has_password("unknown"));
     }
 }
