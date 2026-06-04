@@ -555,4 +555,119 @@ mod tests {
         assert_eq!(s.status, Status::Idle);
         assert_eq!(s.message.as_deref(), Some("freed card space: clip.mp4"));
     }
+
+    fn rp(bytes_done: u64, bytes_total: u64, started_at_unix: i64) -> RunProgress {
+        RunProgress {
+            model: None,
+            serial: None,
+            files_done: 0,
+            files_total: 0,
+            bytes_done,
+            bytes_total,
+            current_file: None,
+            started_at_unix,
+        }
+    }
+
+    #[test]
+    fn eta_none_when_no_bytes_copied() {
+        // bytes_done == 0 -> no rate to extrapolate.
+        assert_eq!(rp(0, 1000, 0).eta_secs(10), None);
+    }
+
+    #[test]
+    fn eta_none_when_elapsed_not_positive() {
+        // now <= started_at -> elapsed <= 0.
+        assert_eq!(rp(500, 1000, 100).eta_secs(100), None); // elapsed == 0
+        assert_eq!(rp(500, 1000, 100).eta_secs(50), None); // elapsed < 0
+    }
+
+    #[test]
+    fn eta_none_when_byte_complete() {
+        // bytes_done >= bytes_total -> nothing left.
+        assert_eq!(rp(1000, 1000, 0).eta_secs(10), None);
+        assert_eq!(rp(1200, 1000, 0).eta_secs(10), None);
+    }
+
+    #[test]
+    fn eta_concrete_normal_case() {
+        // 400 of 1000 bytes in 10s -> rate 40 B/s; remaining 600 -> 15s.
+        assert_eq!(rp(400, 1000, 0).eta_secs(10), Some(15));
+    }
+
+    #[test]
+    fn eta_ceils_fractional_seconds() {
+        // 300 of 1000 in 10s -> rate 30 B/s; remaining 700 / 30 = 23.33 -> ceil 24.
+        assert_eq!(rp(300, 1000, 0).eta_secs(10), Some(24));
+    }
+
+    #[test]
+    fn app_state_json_shape_is_camel_and_lowercase() {
+        let state = AppState {
+            status: Status::Working,
+            run: Some(RunProgress {
+                model: Some("HERO11".into()),
+                serial: Some("C346".into()),
+                files_done: 1,
+                files_total: 4,
+                bytes_done: 100,
+                bytes_total: 1000,
+                current_file: Some("GX010001.MP4".into()),
+                started_at_unix: 1_700_000_000,
+            }),
+            last_run: Some(RunSummaryView { copied: 3, skipped: 1, failed: 0, bytes: 4096 }),
+            cloud: CloudState {
+                configured: true,
+                pending: 2,
+                failed: 0,
+                paused: false,
+                uploading: Some(UploadProgress {
+                    file: "clip.mp4".into(),
+                    uploaded: 5,
+                    total: 10,
+                }),
+            },
+            message: Some("copying".into()),
+        };
+
+        let v = serde_json::to_value(&state).expect("AppState serializes");
+
+        // Status is a lowercase string token.
+        assert_eq!(v["status"], serde_json::json!("working"));
+
+        // Top-level + nested fields are camelCase.
+        let run = &v["run"];
+        assert_eq!(run["filesDone"], serde_json::json!(1));
+        assert_eq!(run["filesTotal"], serde_json::json!(4));
+        assert_eq!(run["bytesDone"], serde_json::json!(100));
+        assert_eq!(run["bytesTotal"], serde_json::json!(1000));
+        assert_eq!(run["currentFile"], serde_json::json!("GX010001.MP4"));
+        assert_eq!(run["startedAtUnix"], serde_json::json!(1_700_000_000i64));
+        assert!(run.get("files_done").is_none(), "no snake_case keys leak");
+
+        let last = &v["lastRun"];
+        assert_eq!(last["copied"], serde_json::json!(3));
+        assert_eq!(last["skipped"], serde_json::json!(1));
+
+        let cloud = &v["cloud"];
+        assert_eq!(cloud["configured"], serde_json::json!(true));
+        assert_eq!(cloud["pending"], serde_json::json!(2));
+        assert_eq!(cloud["uploading"]["total"], serde_json::json!(10));
+
+        assert_eq!(v["message"], serde_json::json!("copying"));
+        assert!(v.get("last_run").is_none(), "top-level key is camelCase lastRun");
+    }
+
+    #[test]
+    fn default_app_state_json_shape() {
+        // Defaults: status "idle", run/lastRun/message null, cloud all-false/zero.
+        let v = serde_json::to_value(AppState::default()).unwrap();
+        assert_eq!(v["status"], serde_json::json!("idle"));
+        assert_eq!(v["run"], serde_json::Value::Null);
+        assert_eq!(v["lastRun"], serde_json::Value::Null);
+        assert_eq!(v["message"], serde_json::Value::Null);
+        assert_eq!(v["cloud"]["pending"], serde_json::json!(0));
+        assert_eq!(v["cloud"]["configured"], serde_json::json!(false));
+        assert_eq!(v["cloud"]["uploading"], serde_json::Value::Null);
+    }
 }
