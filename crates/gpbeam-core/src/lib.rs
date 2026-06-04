@@ -14,6 +14,7 @@ pub mod transfer;
 pub mod backoff;
 pub mod credentials;
 pub mod eject;
+pub mod wired;
 
 pub use cloud::{build_uploader, CloudEvent, CloudUploader};
 pub use error::{CoreError, Result};
