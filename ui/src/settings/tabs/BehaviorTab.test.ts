@@ -19,6 +19,7 @@ function makeView() {
     spaceHeadroom: 2 * 1024 * 1024 * 1024, // 2 GiB
     deleteAfterVerify: false,
     autoEject: false,
+    wiredIngest: true,
     cloud: null,
   };
 }
@@ -93,5 +94,16 @@ describe('BehaviorTab', () => {
     expect((cb as HTMLInputElement).checked).toBe(true);
     await fireEvent.click(cb);
     expect(setAutostart).toHaveBeenCalledWith(false);
+  });
+
+  it('reflects wiredIngest and toggles it directly on the view', async () => {
+    const view = makeView();
+    render(BehaviorTab, { props: { view } });
+    const cb = screen.getByLabelText('Offload a USB-connected GoPro') as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+    await fireEvent.click(cb);
+    expect(view.wiredIngest).toBe(false);
+    await fireEvent.click(cb);
+    expect(view.wiredIngest).toBe(true);
   });
 });
