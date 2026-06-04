@@ -1590,7 +1590,9 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-positioner",
  "tauri-plugin-single-instance",
+ "tempfile",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]
