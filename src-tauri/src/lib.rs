@@ -22,6 +22,8 @@ use gpbeam_core::config::{config_path, load_config, Config};
 use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
+use gpbeam_core::error::CoreError;
+use gpbeam_core::orchestrator::RunSummary;
 
 use crate::app_state::AppState;
 use crate::cloud_runtime::CloudRuntime;
@@ -48,6 +50,33 @@ fn set_tray_state(app: &AppHandle, state: &str) {
 
 fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// The terminal toast for a finished run, or `None` when nothing was copied
+/// (a no-op run must stay silent). On failures it returns the failure toast.
+/// Pure and shared by the SD (`handle_mount`) and wired offload paths so their
+/// completion notifications cannot drift.
+fn summary_notification(s: &RunSummary) -> Option<(&'static str, String)> {
+    if s.failed > 0 {
+        return Some(("GPBeam", format!("{} file(s) failed to copy", s.failed)));
+    }
+    if s.copied > 0 {
+        return Some((
+            "GPBeam",
+            format!("Copied {} file(s), {} skipped", s.copied, s.skipped),
+        ));
+    }
+    None
+}
+
+/// The terminal tray-icon state for a finished run: `"idle"` on a clean run,
+/// `"error"` on any per-file failure or a hard run error. Pure; shared by both
+/// offload paths.
+fn tray_state_for_summary(summary: &Result<RunSummary, CoreError>) -> &'static str {
+    match summary {
+        Ok(s) if s.failed == 0 => "idle",
+        _ => "error",
+    }
 }
 
 /// Map one `CloudEvent` to tray-icon + native-notification side effects. The full
@@ -289,23 +318,14 @@ fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
         emit_state(&app2, &snap);
     });
 
+    set_tray_state(app, tray_state_for_summary(&summary));
     match summary {
-        Ok(s) if s.failed == 0 => {
-            set_tray_state(app, "idle");
-            if s.copied > 0 {
-                notify(
-                    app,
-                    "GPBeam",
-                    &format!("Copied {} file(s), {} skipped", s.copied, s.skipped),
-                );
+        Ok(s) => {
+            if let Some((title, body)) = summary_notification(&s) {
+                notify(app, title, &body);
             }
         }
-        Ok(s) => {
-            set_tray_state(app, "error");
-            notify(app, "GPBeam", &format!("{} file(s) failed to copy", s.failed));
-        }
         Err(e) => {
-            set_tray_state(app, "error");
             notify(app, "GPBeam error", &e.to_string());
         }
     }
@@ -682,5 +702,43 @@ mod tests {
             !wired_ingest_enabled(&cfg),
             "wired_ingest=false suppresses the camera poller"
         );
+    }
+
+    #[test]
+    fn summary_notification_clean_run_with_copies_announces_counts() {
+        use gpbeam_core::orchestrator::RunSummary;
+        let s = RunSummary { copied: 3, skipped: 1, failed: 0, bytes: 4096, queued: 2 };
+        let (title, body) = summary_notification(&s).expect("clean copy toast");
+        assert_eq!(title, "GPBeam");
+        assert_eq!(body, "Copied 3 file(s), 1 skipped");
+    }
+
+    #[test]
+    fn summary_notification_nothing_copied_is_silent() {
+        use gpbeam_core::orchestrator::RunSummary;
+        // A no-op run (nothing new) must not raise a toast.
+        let s = RunSummary { copied: 0, skipped: 5, failed: 0, bytes: 0, queued: 0 };
+        assert!(summary_notification(&s).is_none());
+    }
+
+    #[test]
+    fn summary_notification_failures_announce_failure_count() {
+        use gpbeam_core::orchestrator::RunSummary;
+        let s = RunSummary { copied: 2, skipped: 0, failed: 1, bytes: 20, queued: 0 };
+        let (title, body) = summary_notification(&s).expect("failure toast");
+        assert_eq!(title, "GPBeam");
+        assert_eq!(body, "1 file(s) failed to copy");
+    }
+
+    #[test]
+    fn tray_state_for_summary_maps_results_to_icon() {
+        use gpbeam_core::error::CoreError;
+        use gpbeam_core::orchestrator::RunSummary;
+        let clean = Ok(RunSummary { copied: 1, skipped: 0, failed: 0, bytes: 1, queued: 0 });
+        assert_eq!(tray_state_for_summary(&clean), "idle");
+        let with_failures = Ok(RunSummary { copied: 0, skipped: 0, failed: 2, bytes: 0, queued: 0 });
+        assert_eq!(tray_state_for_summary(&with_failures), "error");
+        let hard_err: Result<RunSummary, CoreError> = Err(CoreError::Config("boom".into()));
+        assert_eq!(tray_state_for_summary(&hard_err), "error");
     }
 }
