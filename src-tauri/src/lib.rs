@@ -20,6 +20,8 @@ use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
 
+mod keyring_store;
+
 mod app_state;
 
 /// Swap the tray icon for the current state ("idle" | "working" | "error").
