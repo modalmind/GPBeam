@@ -27,6 +27,7 @@
   let view: ConfigView | null = null;
   let status: 'idle' | 'saving' = 'idle';
   let notice: { kind: 'ok' | 'err'; text: string } | null = null;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
   // First-run gate: null = undecided (render nothing yet), true = wizard, false = tabs.
   let firstRun: boolean | null = null;
@@ -48,9 +49,12 @@
     if (!view) return;
     status = 'saving';
     notice = null;
+    if (noticeTimer) clearTimeout(noticeTimer);
     try {
       await saveConfig(view);
       notice = { kind: 'ok', text: 'Saved.' };
+      // Auto-dismiss the success toast after a moment; errors stay until next save.
+      noticeTimer = setTimeout(() => { notice = null; }, 2500);
     } catch (e) {
       notice = { kind: 'err', text: typeof e === 'string' ? e : (e as Error)?.message ?? 'Save failed.' };
     } finally {

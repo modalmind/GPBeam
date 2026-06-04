@@ -416,14 +416,11 @@ pub fn run() {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("popover") {
                             use tauri_plugin_positioner::{Position, WindowExt};
-                            // Toggle: a second click on the tray dismisses the popover.
-                            if w.is_visible().unwrap_or(false) {
-                                let _ = w.hide();
-                            } else {
-                                let _ = w.move_window(Position::TrayCenter);
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
+                            // Always show at the tray; dismissal is handled by the
+                            // popover's focus-lost handler (click outside to close).
+                            let _ = w.move_window(Position::TrayCenter);
+                            let _ = w.show();
+                            let _ = w.set_focus();
                         }
                     }
                 })
@@ -456,16 +453,24 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building GPBeam")
-        .run(|_app, event| {
-            // Window-less app: closing a window hides it; only the tray "Quit" exits.
-            if let RunEvent::WindowEvent {
-                event: WindowEvent::CloseRequested { api, .. },
-                label,
-                ..
-            } = event
-            {
-                if label == "popover" || label == "settings" {
-                    api.prevent_close();
+        .run(|app, event| {
+            if let RunEvent::WindowEvent { event, label, .. } = event {
+                match event {
+                    // Window-less app: closing a window only hides it; the tray
+                    // "Quit" is the real exit.
+                    WindowEvent::CloseRequested { api, .. } => {
+                        if label == "popover" || label == "settings" {
+                            api.prevent_close();
+                        }
+                    }
+                    // The tray popover auto-dismisses when it loses focus (i.e. the
+                    // user clicks anywhere outside it), like a native menu-bar popover.
+                    WindowEvent::Focused(false) if label == "popover" => {
+                        if let Some(w) = app.get_webview_window("popover") {
+                            let _ = w.hide();
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
