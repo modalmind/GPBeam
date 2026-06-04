@@ -3,6 +3,22 @@ name = "gpbeam-cli"
 edition.workspace = true
 version.workspace = true
 
+[lib]
+name = "gpbeam_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gpbeam-cli"
+path = "src/main.rs"
+
 [dependencies]
 gpbeam-core = { path = "../gpbeam-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }

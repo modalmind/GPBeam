@@ -6,10 +6,16 @@ pub mod naming;
 pub mod diskguard;
 pub mod copy;
 pub mod ledger;
+pub mod cloud;
 pub mod scanner;
 pub mod detect;
 pub mod orchestrator;
+pub mod backoff;
+pub mod credentials;
+pub mod eject;
 
+pub use cloud::{build_uploader, CloudEvent, CloudUploader};
 pub use error::{CoreError, Result};
+pub use eject::{default_ejector, Ejector, SystemEjector};
 pub use orchestrator::{run_offload, RunEvent, RunSummary};
 pub use scanner::{scan_card, scan_with_skips, PlannedCopy};
