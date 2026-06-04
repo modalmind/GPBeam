@@ -140,6 +140,70 @@ impl GoProClient {
             })
         }
     }
+
+    /// `GET /gopro/media/list` -> a flat list of every media file on the card.
+    /// Non-200 -> `Http`.
+    pub async fn media_list(&self) -> Result<Vec<RemoteMedia>> {
+        let url = format!("{}/gopro/media/list", self.base);
+        let resp = self.http.get(&url).send().await.map_err(transport_err)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(CoreError::Http {
+                status: Some(status),
+                msg: format!("GET {url} -> {status}"),
+            });
+        }
+        let text = resp.text().await.map_err(transport_err)?;
+        parse_media_list(&text)
+    }
+}
+
+/// Parse a `/gopro/media/list` JSON body into a flat `Vec<RemoteMedia>`.
+///
+/// The API encodes sizes/timestamps as strings (e.g. "s":"684588850"); we parse
+/// them to numbers, defaulting to 0 on missing/unparseable values. Directory
+/// groups (`media[].d` + `media[].fs[]`) are flattened in order. Unknown JSON
+/// fields are ignored.
+fn parse_media_list(json: &str) -> Result<Vec<RemoteMedia>> {
+    #[derive(Deserialize, Default)]
+    struct ListBody {
+        #[serde(default)]
+        media: Vec<DirGroup>,
+    }
+    #[derive(Deserialize, Default)]
+    struct DirGroup {
+        #[serde(default)]
+        d: String,
+        #[serde(default)]
+        fs: Vec<FileEntry>,
+    }
+    #[derive(Deserialize, Default)]
+    struct FileEntry {
+        #[serde(default)]
+        n: String,
+        #[serde(default)]
+        s: String,
+        #[serde(default)]
+        cre: String,
+    }
+
+    let body: ListBody = serde_json::from_str(json).map_err(|e| CoreError::Http {
+        status: None,
+        msg: format!("media list parse error: {e}"),
+    })?;
+
+    let mut out = Vec::new();
+    for group in body.media {
+        for f in group.fs {
+            out.push(RemoteMedia {
+                dir: group.d.clone(),
+                name: f.n,
+                size: f.s.parse::<u64>().unwrap_or(0),
+                captured_unix: f.cre.parse::<i64>().unwrap_or(0),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Build a URL string with percent-encoded query parameters. reqwest is built
@@ -288,6 +352,90 @@ mod tests {
         let c = GoProClient::with_base(server.uri());
         let err = c.enable_wired_control().await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(403), .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_media_list_flattens_dirs_and_parses_string_numbers() {
+        let json = r#"{
+          "id": "1",
+          "media": [
+            {
+              "d": "100GOPRO",
+              "fs": [
+                {"n":"GX010001.MP4","s":"684588850","cre":"1780515910","mod":"1780515912"},
+                {"n":"GX010002.MP4","s":"12","cre":"1780600000","mod":"1780600001"}
+              ]
+            },
+            {
+              "d": "101GOPRO",
+              "fs": [
+                {"n":"GS010003.360","s":"42","cre":"1780700000","mod":"1780700001"}
+              ]
+            }
+          ]
+        }"#;
+        let got = parse_media_list(json).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                RemoteMedia { dir: "100GOPRO".into(), name: "GX010001.MP4".into(), size: 684588850, captured_unix: 1780515910 },
+                RemoteMedia { dir: "100GOPRO".into(), name: "GX010002.MP4".into(), size: 12, captured_unix: 1780600000 },
+                RemoteMedia { dir: "101GOPRO".into(), name: "GS010003.360".into(), size: 42, captured_unix: 1780700000 },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_media_list_missing_or_bad_fields_default_to_zero() {
+        let json = r#"{"media":[{"d":"100GOPRO","fs":[
+            {"n":"GX010001.MP4"},
+            {"n":"GX010002.MP4","s":"not-a-number","cre":"also-bad"}
+        ]}]}"#;
+        let got = parse_media_list(json).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], RemoteMedia { dir: "100GOPRO".into(), name: "GX010001.MP4".into(), size: 0, captured_unix: 0 });
+        assert_eq!(got[1], RemoteMedia { dir: "100GOPRO".into(), name: "GX010002.MP4".into(), size: 0, captured_unix: 0 });
+    }
+
+    #[test]
+    fn parse_media_list_empty_media_is_empty_vec() {
+        assert_eq!(parse_media_list(r#"{"media":[]}"#).unwrap(), vec![]);
+        assert_eq!(parse_media_list(r#"{}"#).unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn media_list_fetches_and_parses() {
+        let server = MockServer::start().await;
+        let body = r#"{"media":[{"d":"100GOPRO","fs":[
+            {"n":"GX010001.MP4","s":"100","cre":"1780515910","mod":"1780515912"}
+        ]}]}"#;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let list = c.media_list().await.unwrap();
+        assert_eq!(
+            list,
+            vec![RemoteMedia { dir: "100GOPRO".into(), name: "GX010001.MP4".into(), size: 100, captured_unix: 1780515910 }]
+        );
+    }
+
+    #[tokio::test]
+    async fn media_list_500_is_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let err = c.media_list().await.unwrap_err();
+        assert!(matches!(err, CoreError::Http { status: Some(500), .. }), "got {err:?}");
     }
 
     #[test]
