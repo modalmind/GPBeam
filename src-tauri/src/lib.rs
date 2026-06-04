@@ -121,13 +121,21 @@ fn ledger_path(dest: &Path) -> PathBuf {
 
 /// Load `gpbeam.toml` from `$GPBEAM_CONFIG` (or `<dest>/gpbeam.toml`). On any
 /// error — missing file, parse failure — fall back to the exact M1 defaults so
-/// a no-config install behaves identically to M1. The chosen destination root
-/// always wins over whatever a stale config might claim, matching M1 behavior.
+/// a no-config install behaves identically to M1. The destination chosen in the
+/// GUI (wizard/Settings, stored as the config's `dest_root`) is honored; an
+/// explicit `$GPBEAM_DEST` still overrides it, and a config missing a dest_root
+/// falls back to the default.
 fn load_or_default_config(dest: &Path) -> Config {
     let path = config_path(std::env::var("GPBEAM_CONFIG").ok(), dest);
     match load_config(&path) {
         Ok(mut cfg) => {
-            cfg.dest_root = dest.to_path_buf();
+            // Honor the destination chosen in the GUI wizard/Settings. An explicit
+            // GPBEAM_DEST env still wins (M1/M2 power-user override); a config with
+            // no dest_root falls back to the default destination.
+            let env_dest = std::env::var("GPBEAM_DEST").ok().filter(|s| !s.is_empty());
+            if env_dest.is_some() || cfg.dest_root.as_os_str().is_empty() {
+                cfg.dest_root = dest.to_path_buf();
+            }
             cfg
         }
         Err(_) => Config::new(dest.to_path_buf()),
@@ -350,6 +358,7 @@ pub fn run() {
             commands::pick_folder,
             commands::open_path,
             commands::reveal_path,
+            commands::open_settings,
             commands::set_nextcloud_credentials,
             commands::clear_nextcloud_credentials,
             commands::pause_cloud,
@@ -407,9 +416,14 @@ pub fn run() {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("popover") {
                             use tauri_plugin_positioner::{Position, WindowExt};
-                            let _ = w.move_window(Position::TrayCenter);
-                            let _ = w.show();
-                            let _ = w.set_focus();
+                            // Toggle: a second click on the tray dismisses the popover.
+                            if w.is_visible().unwrap_or(false) {
+                                let _ = w.hide();
+                            } else {
+                                let _ = w.move_window(Position::TrayCenter);
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
                         }
                     }
                 })

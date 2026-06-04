@@ -107,6 +107,11 @@ export function revealPath(path: string): Promise<void> {
   return invoke<void>("reveal_path", { path });
 }
 
+/** Show the dedicated settings window (used by the popover's "Settings…"). */
+export function openSettings(): Promise<void> {
+  return invoke<void>("open_settings");
+}
+
 export function setNextcloudCredentials(
   destinationId: string,
   appPassword: string,

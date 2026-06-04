@@ -6,8 +6,11 @@
     resumeCloud,
     retryFailedCloud,
     openPath,
+    openSettings,
     quit,
   } from "../lib/bindings";
+  import type { RunProgress } from "../lib/bindings";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { humanBytes, etaHuman, percent } from "../lib/format";
 
   // Live application snapshot. Store is the single source of truth (design §4.1).
@@ -20,28 +23,24 @@
   // counts down between events. The store carries startedAtUnix + byte totals; the math
   // mirrors AppState::eta_secs on the Rust side but only for display.
   let nowUnix = Math.floor(Date.now() / 1000);
-  function etaSecs(): number | null {
-    if (!run) return null;
-    const elapsed = nowUnix - run.startedAtUnix;
-    if (run.bytesDone <= 0 || elapsed <= 0 || run.bytesDone >= run.bytesTotal) {
+  // Takes (run, now) as args so Svelte's reactive `$: eta` tracks BOTH — otherwise a
+  // no-arg call hides the `nowUnix` dependency and the ETA never counts down on the tick.
+  function etaSecs(r: RunProgress | null, now: number): number | null {
+    if (!r) return null;
+    const elapsed = now - r.startedAtUnix;
+    if (r.bytesDone <= 0 || elapsed <= 0 || r.bytesDone >= r.bytesTotal) {
       return null;
     }
-    const rate = run.bytesDone / elapsed;
+    const rate = r.bytesDone / elapsed;
     if (rate <= 0) return null;
-    return Math.ceil((run.bytesTotal - run.bytesDone) / rate);
+    return Math.ceil((r.bytesTotal - r.bytesDone) / rate);
   }
-  $: eta = run ? etaSecs() : null;
+  $: eta = etaSecs(run, nowUnix);
 
-  function statusWord(): string {
-    switch (state.status) {
-      case "working":
-        return "working";
-      case "error":
-        return "error";
-      default:
-        return "idle";
-    }
-  }
+  // Reactive (not a no-arg function) so it re-derives whenever `state.status` changes;
+  // a `{statusWord()}` call would be computed once and never update after hydrate.
+  $: statusWord =
+    state.status === "working" ? "working" : state.status === "error" ? "error" : "idle";
 
   async function onPause() {
     if (cloud.paused) {
@@ -61,10 +60,12 @@
     await openPath("");
   }
 
-  function openSettings() {
-    // Settings lives in a sibling window; navigating the popover's webview is the simplest
-    // cross-window hook and keeps the action testable without Tauri window APIs.
-    window.location.href = "settings.html";
+  async function onSettings() {
+    // Open the dedicated decorated settings window (NOT navigate this popover's own
+    // transparent, frameless webview — doing that rendered settings see-through).
+    await openSettings();
+    // Dismiss the transient popover once settings are up. Non-fatal if hide is denied.
+    getCurrentWindow().hide().catch(() => {});
   }
 
   async function onQuit() {
@@ -87,7 +88,7 @@
 <header class="head">
   <span class="dot" class:working={state.status === "working"} class:error={state.status === "error"} aria-hidden="true"></span>
   <span class="title">GPBeam</span>
-  <span class="state-word" data-testid="status-word">{statusWord()}</span>
+  <span class="state-word" data-testid="status-word">{statusWord}</span>
 </header>
 
 {#if run}
@@ -149,7 +150,7 @@
 
 <footer class="foot">
   <button type="button" class="link" data-testid="open-dest" on:click={openDestination}>Open destination</button>
-  <button type="button" class="link" data-testid="open-settings" on:click={openSettings}>Settings…</button>
+  <button type="button" class="link" data-testid="open-settings" on:click={onSettings}>Settings…</button>
   <button type="button" class="link" data-testid="quit" on:click={onQuit}>Quit</button>
 </footer>
 

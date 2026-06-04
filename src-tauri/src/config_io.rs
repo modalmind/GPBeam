@@ -223,6 +223,16 @@ pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
         body.push_str(&creds);
     }
 
+    // Ensure the destination directory exists — on a fresh install the config's
+    // parent (e.g. ~/GPBeam) may not have been created yet, and File::create on a
+    // missing directory fails with "No such file or directory".
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create config dir {}: {e}", parent.display()))?;
+        }
+    }
+
     let part = {
         let mut p = path.as_os_str().to_os_string();
         p.push(".part");

@@ -163,7 +163,13 @@ pub fn get_state(ctx: State<'_, AppCtx>) -> AppState {
 pub fn get_config(ctx: State<'_, AppCtx>) -> Result<ConfigView, String> {
     let cfg = match load_config(&ctx.config_path) {
         Ok(mut c) => {
-            c.dest_root = ctx.dest_root.clone();
+            // Honor the destination the wizard/Settings wrote into the config. An
+            // explicit GPBEAM_DEST env still wins (power-user override, captured in
+            // ctx.dest_root); a config with no dest_root falls back to the default.
+            let env_dest = std::env::var("GPBEAM_DEST").ok().filter(|s| !s.is_empty());
+            if env_dest.is_some() || c.dest_root.as_os_str().is_empty() {
+                c.dest_root = ctx.dest_root.clone();
+            }
             c
         }
         Err(_) => gpbeam_core::config::Config::new(ctx.dest_root.clone()),
@@ -291,10 +297,18 @@ pub fn quit(app: tauri::AppHandle) {
 /// the user cancels). Uses the blocking dialog API so the command returns the
 /// path synchronously to the awaiting UI invoke.
 #[tauri::command]
-pub fn pick_folder(app: tauri::AppHandle) -> Option<String> {
-    app.dialog()
-        .file()
-        .blocking_pick_folder()
+pub async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    // MUST be async (off the main thread): the native folder dialog is driven by the
+    // main-thread event loop, so `blocking_pick_folder()` on the main thread deadlocks
+    // (the dialog never appears, the command never returns). We use the non-blocking
+    // callback API and await its result via a oneshot channel instead.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |path| {
+        let _ = tx.send(path);
+    });
+    rx.await
+        .ok()
+        .flatten()
         .and_then(|p| p.into_path().ok())
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -302,9 +316,23 @@ pub fn pick_folder(app: tauri::AppHandle) -> Option<String> {
 /// Open a path with the OS default handler (e.g. the destination folder in the
 /// file manager). `None` for `with` lets the OS pick the default application.
 #[tauri::command]
-pub fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub fn open_path(
+    app: tauri::AppHandle,
+    ctx: tauri::State<'_, AppCtx>,
+    path: String,
+) -> Result<(), String> {
+    // Empty path = the popover's "Open destination" action: resolve the configured
+    // destination root (creating it if absent, so a brand-new install can still
+    // reveal the folder before the first offload has run).
+    let target = if path.is_empty() {
+        let dest = ctx.dest_root.clone();
+        let _ = std::fs::create_dir_all(&dest);
+        dest.to_string_lossy().into_owned()
+    } else {
+        path
+    };
     app.opener()
-        .open_path(path, None::<&str>)
+        .open_path(target, None::<&str>)
         .map_err(|e| e.to_string())
 }
 
@@ -315,6 +343,23 @@ pub fn reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(path)
         .map_err(|e| e.to_string())
+}
+
+/// Show (and focus) the dedicated decorated settings window. The popover's
+/// "Settings…" action calls this so settings open in their own window rather than
+/// replacing the transparent, frameless popover's content (which rendered with a
+/// see-through background).
+#[tauri::command]
+pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    match app.get_webview_window("settings") {
+        Some(w) => {
+            w.show().map_err(|e| e.to_string())?;
+            w.set_focus().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        None => Err("settings window not found".into()),
+    }
 }
 
 /// Whether launch-at-login is currently enabled (autostart plugin).
@@ -346,6 +391,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "pick_folder",
     "open_path",
     "reveal_path",
+    "open_settings",
     "set_nextcloud_credentials",
     "clear_nextcloud_credentials",
     "pause_cloud",
@@ -613,9 +659,10 @@ mod tests {
 
     #[test]
     fn plugin_commands_exist() {
-        let _ = pick_folder as fn(tauri::AppHandle) -> Option<String>;
-        let _ = open_path as fn(tauri::AppHandle, String) -> Result<(), String>;
+        let _ = pick_folder; // async command (fn item); existence/compile check
+        let _ = open_path as fn(tauri::AppHandle, State<'_, AppCtx>, String) -> Result<(), String>;
         let _ = reveal_path as fn(tauri::AppHandle, String) -> Result<(), String>;
+        let _ = open_settings as fn(tauri::AppHandle) -> Result<(), String>;
         let _ = get_autostart as fn(tauri::AppHandle) -> bool;
         let _ = set_autostart as fn(tauri::AppHandle, bool) -> Result<(), String>;
     }
@@ -624,7 +671,7 @@ mod tests {
     /// this fails, update both `COMMAND_NAMES` and the macro list in lib.rs.
     #[test]
     fn command_surface_count_is_pinned() {
-        assert_eq!(COMMAND_NAMES.len(), 17, "command surface changed — sync lib.rs generate_handler!");
+        assert_eq!(COMMAND_NAMES.len(), 18, "command surface changed — sync lib.rs generate_handler!");
     }
 
     #[test]
