@@ -230,6 +230,59 @@ mod tests {
         assert!(ledger.is_imported("C3575424520622", "GX010198.MP4", 4096, 1_780_515_910).unwrap());
     }
 
+    #[tokio::test]
+    async fn second_run_is_idempotent() {
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let s1 = run_wired_offload(&client, &cfg, &mut ledger, &mut |_| {}).await.unwrap();
+        assert_eq!(s1.copied, 1);
+        let s2 = run_wired_offload(&client, &cfg, &mut ledger, &mut |_| {}).await.unwrap();
+        assert_eq!(s2.copied, 0, "already imported -> nothing new");
+        assert_eq!(s2.skipped, 1);
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 1, "no duplicate file");
+    }
+
+    #[tokio::test]
+    async fn size_mismatch_fails_and_keeps_part() {
+        // media_list reports 4096 bytes but the download serves only 10 -> size mismatch.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model_name": "M", "serial_number": "C357", "firmware_version": "1" })))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path_regex(r"^/gopro/camera/control/wired_usb"))
+            .respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("GET")).and(path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": [ { "d": "100GOPRO", "fs": [ { "n": "GX010198.MP4", "s": "4096", "cre": "1", "mod": "1" } ] } ] })))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/videos/DCIM/100GOPRO/GX010198.MP4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 10]))
+            .mount(&server).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        let s = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!(s.copied, 0);
+        assert_eq!(s.failed, 1);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::Failed { .. })));
+        // final file NOT present; a `.part` remains for resume
+        assert!(!ledger.is_imported("C357", "GX010198.MP4", 4096, 1).unwrap());
+        let names: Vec<String> = std::fs::read_dir(dest.path()).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n.ends_with(".part")), "a .part should remain: {names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".MP4") && !n.ends_with(".part")));
+    }
+
     #[test]
     fn plan_skips_proxies_thumbnails_dedups_and_names() {
         let dir = tempfile::tempdir().unwrap();
