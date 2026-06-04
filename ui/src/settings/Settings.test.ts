@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock bindings used by Settings and its child tabs (children import the same module).
 vi.mock('../lib/bindings', () => ({
+  // Settings now gates on isFirstRun(); false routes straight to the tabs.
+  isFirstRun: vi.fn().mockResolvedValue(false),
   getConfig: vi.fn(),
   saveConfig: vi.fn(),
   pickFolder: vi.fn(),
@@ -15,7 +17,7 @@ vi.mock('../lib/bindings', () => ({
   clearNextcloudCredentials: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { getConfig, saveConfig } from '../lib/bindings';
+import { getConfig, saveConfig, isFirstRun } from '../lib/bindings';
 
 import Settings from './Settings.svelte';
 
@@ -34,7 +36,11 @@ function makeView() {
 }
 
 describe('Settings', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // clearAllMocks wipes return values; keep the first-run gate routing to tabs.
+    (isFirstRun as any).mockResolvedValue(false);
+  });
 
   it('loads the config on mount and shows the Destination tab first', async () => {
     (getConfig as any).mockResolvedValue(makeView());

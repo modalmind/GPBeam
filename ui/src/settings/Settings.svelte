@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { ConfigView } from '../lib/bindings';
-  import { getConfig, saveConfig } from '../lib/bindings';
+  import { getConfig, saveConfig, isFirstRun } from '../lib/bindings';
+  import Wizard from './Wizard.svelte';
   import DestinationTab from './tabs/DestinationTab.svelte';
   import BehaviorTab from './tabs/BehaviorTab.svelte';
   import CloudTab from './tabs/CloudTab.svelte';
@@ -27,9 +28,21 @@
   let status: 'idle' | 'saving' = 'idle';
   let notice: { kind: 'ok' | 'err'; text: string } | null = null;
 
+  // First-run gate: null = undecided (render nothing yet), true = wizard, false = tabs.
+  let firstRun: boolean | null = null;
+
+  // Default destination offered by the wizard's folder step.
+  const defaultDest = '~/GPBeam';
+
   onMount(async () => {
+    firstRun = await isFirstRun();
     view = await getConfig();
   });
+
+  function onWizardDone() {
+    // The window hides itself; flip the gate so a re-show lands on the tabs.
+    firstRun = false;
+  }
 
   async function onSave() {
     if (!view) return;
@@ -46,6 +59,9 @@
   }
 </script>
 
+{#if firstRun === true}
+  <Wizard {defaultDest} on:done={onWizardDone} />
+{:else if firstRun === false}
 <div class="settings">
   <nav class="sidebar">
     {#each TABS as t (t.id)}
@@ -82,6 +98,7 @@
     {/if}
   </main>
 </div>
+{/if}
 
 <style>
   :root { color-scheme: light dark; }
