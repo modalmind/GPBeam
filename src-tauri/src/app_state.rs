@@ -394,4 +394,59 @@ mod tests {
         assert_eq!(s.status, Status::Working);
         assert!(s.message.is_none(), "Scanned resets the message for the new run");
     }
+
+    #[test]
+    fn cloud_queued_increments_pending_and_marks_configured() {
+        let mut s = AppState::default();
+        assert!(!s.cloud.configured);
+        assert_eq!(s.cloud.pending, 0);
+
+        s.apply_run_event(&RunEvent::CloudQueued { file: "A.MP4".into() }, 0);
+        assert!(s.cloud.configured);
+        assert_eq!(s.cloud.pending, 1);
+
+        s.apply_run_event(&RunEvent::CloudQueued { file: "B.MP4".into() }, 0);
+        assert_eq!(s.cloud.pending, 2);
+        assert!(s.cloud.configured);
+    }
+
+    #[test]
+    fn multi_file_files_done_bookkeeping_from_copying_index() {
+        // files_done tracks the 1-based Copying index minus one, then Verified
+        // bumps it; the two paths must stay consistent across several files.
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 3, total_bytes: 300 }, 0);
+
+        s.apply_run_event(&RunEvent::Copying { file: "1".into(), index: 1, total: 3 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 0);
+        s.apply_run_event(&RunEvent::Verified { file: "1".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 1);
+
+        s.apply_run_event(&RunEvent::Copying { file: "2".into(), index: 2, total: 3 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 1); // index-1 keeps it at 1
+        s.apply_run_event(&RunEvent::Verified { file: "2".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 2);
+
+        s.apply_run_event(&RunEvent::Copying { file: "3".into(), index: 3, total: 3 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 2);
+        s.apply_run_event(&RunEvent::Verified { file: "3".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().files_done, 3);
+        assert_eq!(s.run.as_ref().unwrap().current_file.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn skipped_and_other_noop_events_do_not_change_run() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 20 }, 0);
+        let before = s.run.clone();
+        s.apply_run_event(&RunEvent::Skipped { file: "dup.MP4".into() }, 0);
+        s.apply_run_event(&RunEvent::CardFileDeleted { file: "dup.MP4".into() }, 0);
+        s.apply_run_event(&RunEvent::Ejected { mount: "/Volumes/GoPro".into() }, 0);
+        s.apply_run_event(
+            &RunEvent::NotGoPro(std::path::PathBuf::from("/Volumes/USB")),
+            0,
+        );
+        assert_eq!(s.run, before, "no-op events leave run untouched");
+        assert_eq!(s.status, Status::Working);
+    }
 }
