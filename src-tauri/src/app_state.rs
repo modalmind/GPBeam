@@ -343,4 +343,55 @@ mod tests {
         s.apply_run_event(&RunEvent::Verified { file: "x".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().files_done, 1);
     }
+
+    #[test]
+    fn failed_event_sets_error_and_message() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 10 }, 0);
+        assert_eq!(s.status, Status::Working);
+        s.apply_run_event(
+            &RunEvent::Failed { file: "A.MP4".into(), error: "disk read error".into() },
+            0,
+        );
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(s.message.as_deref(), Some("A.MP4: disk read error"));
+    }
+
+    #[test]
+    fn insufficient_space_sets_error_and_message() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::InsufficientSpace { need: 500, have: 100 }, 0);
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("insufficient space: need 500 bytes, have 100")
+        );
+    }
+
+    #[test]
+    fn run_complete_with_failures_is_error_status() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 3, total_bytes: 30 }, 0);
+        s.apply_run_event(
+            &RunEvent::RunComplete { copied: 2, skipped: 0, failed: 1, bytes: 20 },
+            0,
+        );
+        assert_eq!(s.status, Status::Error);
+        assert!(s.run.is_none());
+        assert_eq!(
+            s.last_run.as_ref().unwrap(),
+            &RunSummaryView { copied: 2, skipped: 0, failed: 1, bytes: 20 }
+        );
+    }
+
+    #[test]
+    fn scanned_clears_a_stale_error_message() {
+        // A new run starting should clear a leftover error from a prior run.
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Failed { file: "x".into(), error: "boom".into() }, 0);
+        assert_eq!(s.status, Status::Error);
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 5 }, 10);
+        assert_eq!(s.status, Status::Working);
+        assert!(s.message.is_none(), "Scanned resets the message for the new run");
+    }
 }
