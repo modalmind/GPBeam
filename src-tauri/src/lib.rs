@@ -18,6 +18,8 @@ use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
 
+mod app_state;
+
 /// Swap the tray icon for the current state ("idle" | "working" | "error").
 fn set_tray_state(app: &AppHandle, state: &str) {
     let bytes: &[u8] = match state {
