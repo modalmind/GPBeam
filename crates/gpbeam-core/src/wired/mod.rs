@@ -4,3 +4,4 @@
 //! (Phase 3); `offload` drives the verify→ledger→cloud pipeline (Phase 4).
 
 pub mod client;
+pub mod detect;
