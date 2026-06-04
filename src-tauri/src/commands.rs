@@ -46,6 +46,33 @@ pub struct HistoryRow {
     pub cloud_status: Option<String>,
 }
 
+use std::path::Path;
+
+use gpbeam_core::ledger::Ledger;
+
+/// Map the ledger's recent imports to `HistoryRow`s for the History tab.
+///
+/// Returns an EMPTY list (not an error) when the ledger file does not exist
+/// yet — a first-run install has no transfers and the UI must render cleanly.
+/// Any other ledger error (corrupt db, query failure) is surfaced as a string.
+fn history_rows_from_ledger(ledger_path: &Path, limit: usize) -> Result<Vec<HistoryRow>, String> {
+    if !ledger_path.exists() {
+        return Ok(Vec::new());
+    }
+    let ledger = Ledger::open(ledger_path).map_err(|e| e.to_string())?;
+    let rows = ledger.recent_imports(limit).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| HistoryRow {
+            name: r.name,
+            dest_path: r.dest_path,
+            size: r.size,
+            copied_at: r.copied_at,
+            cloud_status: r.cloud_status,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +111,51 @@ mod tests {
         };
         let json = serde_json::to_value(&row).unwrap();
         assert!(json["cloudStatus"].is_null());
+    }
+
+    use gpbeam_core::ledger::Ledger;
+
+    #[test]
+    fn history_rows_maps_recent_imports_most_recent_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let mut l = Ledger::open(&path).unwrap();
+        let id1 = l
+            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+            .unwrap();
+        l.set_cloud_status(id1, "done").unwrap();
+        l.record("C346", "GX010002.MP4", 10, 2000, "/dest/GX010002.MP4", None)
+            .unwrap();
+
+        let rows = history_rows_from_ledger(&path, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // recent_imports is ORDER BY id DESC -> the second-recorded file leads.
+        assert_eq!(rows[0].name, "GX010002.MP4");
+        assert_eq!(rows[0].dest_path, "/dest/GX010002.MP4");
+        assert_eq!(rows[0].size, 10);
+        assert!(rows[0].cloud_status.is_none());
+        assert_eq!(rows[1].name, "GX010001.MP4");
+        assert_eq!(rows[1].cloud_status.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn history_rows_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let mut l = Ledger::open(&path).unwrap();
+        for i in 0..5 {
+            l.record("C346", &format!("GX0100{i:02}.MP4"), 1, 1000 + i, "/d", None)
+                .unwrap();
+        }
+        let rows = history_rows_from_ledger(&path, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn history_rows_missing_ledger_file_is_empty_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.sqlite");
+        let rows = history_rows_from_ledger(&path, 10).unwrap();
+        assert!(rows.is_empty());
     }
 }
