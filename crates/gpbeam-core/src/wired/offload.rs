@@ -322,4 +322,73 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(plan.len(), 1);
     }
+
+    use crate::config::{CloudConfig, CloudKind};
+
+    fn cloud_cfg(dest: std::path::PathBuf, mode: MirrorMode) -> Config {
+        let mut cfg = Config::new(dest);
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud, destination_id: "nc1".into(),
+            base_url: "https://nc.example".into(), username: "alice".into(),
+            remote_root: "GoPro".into(), mirror_mode: mode, chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None, max_concurrency: 2, max_attempts: 8,
+        });
+        cfg
+    }
+
+    #[tokio::test]
+    async fn auto_mirror_enqueues_one_cloud_job_per_file() {
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), MirrorMode::Auto);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        let s = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!(s.copied, 1);
+        assert_eq!(s.queued, 1);
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 1);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
+    }
+
+    #[tokio::test]
+    async fn delete_after_verify_calls_camera_delete() {
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        // Expect exactly one delete call for the file.
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.delete_after_verify = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        // `server` drop verifies the `.expect(1)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn insufficient_space_aborts_before_download() {
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        let dest = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.space_headroom = u64::MAX - 1; // force the guard to fail
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        let err = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await;
+        assert!(matches!(err, Err(CoreError::InsufficientSpace { .. })));
+        assert!(events.iter().any(|e| matches!(e, RunEvent::InsufficientSpace { .. })));
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0, "nothing downloaded");
+    }
 }
