@@ -185,6 +185,14 @@ fn seed_cloud_state(state: &mut AppState, cfg: &Config, pending: usize) {
     state.cloud.pending = pending;
 }
 
+/// Whether the USB-wired GoPro detector should be spawned. Gated by the
+/// `wired_ingest` config flag (default true): with it off, the poller is never
+/// started and the process behaves byte-for-byte like M1–M3. Pure so `setup()`'s
+/// (untestable) spawn branch reduces to a single named, tested decision.
+fn wired_ingest_enabled(cfg: &Config) -> bool {
+    cfg.wired_ingest
+}
+
 /// The single long-lived cloud-mirror loop. Ticks every 5s; on each tick it reads
 /// the swappable `CloudRuntime` and the `paused` flag from the managed `AppCtx`. If
 /// `should_drain` is false it idles; otherwise it builds an uploader through the
@@ -658,5 +666,21 @@ mod tests {
         );
         let rt = ctx.runtime.lock().unwrap();
         assert!(rt.config.is_none());
+    }
+
+    #[test]
+    fn wired_ingest_enabled_follows_config_flag() {
+        // Default config: wired_ingest defaults to true (Phase 5), so the poller spawns.
+        let mut cfg = Config::new(std::path::PathBuf::from("/tmp/gpbeam-test-dest"));
+        assert!(
+            wired_ingest_enabled(&cfg),
+            "default config enables wired ingest"
+        );
+        // Explicitly disabled -> the poller is NOT spawned (byte-for-byte M1–M3).
+        cfg.wired_ingest = false;
+        assert!(
+            !wired_ingest_enabled(&cfg),
+            "wired_ingest=false suppresses the camera poller"
+        );
     }
 }
