@@ -90,6 +90,51 @@ fn seed_pending_from_ledger(ledger_path: &Path, cloud: &mut CloudState) {
     }
 }
 
+use crate::config_io::{validate_view, view_to_config, write_config_atomic, ConfigView};
+
+/// The shared `save_config` / `complete_wizard` pipeline as a pure function so
+/// it can be unit-tested without a Tauri `AppHandle`.
+///
+/// Steps (validation precedes any write, per design §7 — a bad view leaves the
+/// existing `gpbeam.toml` untouched):
+/// 1. `validate_view` — reject malformed input up front.
+/// 2. `view_to_config` — build the core `Config`.
+/// 3. `write_config_atomic` — `.part` + fsync + rename; existing `[credentials.*]`
+///    preserved by the writer.
+/// 4. Swap `runtime.config`/`delete_after_verify` so the next cloud tick uses the
+///    new settings (no task abort needed — lib.rs polls the runtime each pass).
+/// 5. Refresh `state.cloud.configured` from whether a `[cloud]` table is present,
+///    and re-seed `state.cloud.pending` from the persisted queue.
+///
+/// Mutates `state` and `runtime` in place; returns `Err(message)` on validation
+/// or write failure (with `state`/`runtime` left as they were before the call).
+fn apply_saved_config(
+    view: &ConfigView,
+    config_path: &Path,
+    ledger_path: &Path,
+    state: &mut AppState,
+    runtime: &mut CloudRuntime,
+) -> Result<(), String> {
+    validate_view(view)?;
+    let cfg = view_to_config(view)?;
+    write_config_atomic(config_path, &cfg)?;
+
+    // Swap the cloud runtime so the next tick honors the new settings.
+    runtime.config = cfg.cloud.clone();
+    runtime.delete_after_verify = cfg.delete_after_verify;
+
+    // Refresh the cloud flags the UI renders.
+    state.cloud.configured = cfg.cloud.is_some();
+    if cfg.cloud.is_some() {
+        seed_pending_from_ledger(ledger_path, &mut state.cloud);
+    } else {
+        state.cloud.pending = 0;
+        state.cloud.failed = 0;
+        state.cloud.uploading = None;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +254,112 @@ mod tests {
         // No ledger file -> nothing read; the in-memory count is preserved.
         assert_eq!(cloud.pending, 7);
         assert!(cloud.configured);
+    }
+
+    use crate::cloud_runtime::CloudRuntime;
+    use crate::config_io::{CloudView, ConfigView};
+
+    fn base_view(dest: &str) -> ConfigView {
+        ConfigView {
+            dest_root: dest.to_string(),
+            filename_template: "{name}".into(),
+            include_proxies: false,
+            include_thumbnails: false,
+            verify: true,
+            space_headroom: 0,
+            delete_after_verify: false,
+            auto_eject: false,
+            cloud: None,
+        }
+    }
+
+    fn cloud_view() -> CloudView {
+        CloudView {
+            destination_id: "nc1".into(),
+            base_url: "https://cloud.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: "auto".into(),
+            chunk_threshold: 10_000_000,
+            max_concurrency: 2,
+            max_attempts: 3,
+            has_password: true,
+        }
+    }
+
+    #[test]
+    fn apply_saved_config_writes_toml_and_marks_unconfigured_without_cloud() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("gpbeam.toml");
+        let ledger_path = dir.path().join("ledger.sqlite");
+        let mut state = AppState::default();
+        state.cloud.configured = true; // stale; should be cleared by a cloud-less save
+        let mut runtime = CloudRuntime::empty();
+
+        let view = base_view(dir.path().join("out").to_str().unwrap());
+        apply_saved_config(&view, &cfg_path, &ledger_path, &mut state, &mut runtime).unwrap();
+
+        assert!(cfg_path.exists(), "gpbeam.toml must be written");
+        assert!(!cfg_path.with_extension("toml.part").exists(), "no .part left behind");
+        assert!(!state.cloud.configured, "no [cloud] -> cloud.configured false");
+        assert!(runtime.config.is_none());
+    }
+
+    #[test]
+    fn apply_saved_config_with_cloud_sets_runtime_and_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("gpbeam.toml");
+        let ledger_path = dir.path().join("ledger.sqlite");
+        let mut state = AppState::default();
+        let mut runtime = CloudRuntime::empty();
+
+        let mut view = base_view(dir.path().join("out").to_str().unwrap());
+        view.cloud = Some(cloud_view());
+        view.delete_after_verify = true;
+
+        apply_saved_config(&view, &cfg_path, &ledger_path, &mut state, &mut runtime).unwrap();
+
+        assert!(state.cloud.configured, "[cloud] present -> configured true");
+        let rt_cloud = runtime.config.as_ref().expect("runtime.config swapped in");
+        assert_eq!(rt_cloud.destination_id, "nc1");
+        assert_eq!(rt_cloud.username, "alice");
+        assert!(runtime.delete_after_verify, "delete_after_verify carried into runtime");
+    }
+
+    #[test]
+    fn apply_saved_config_seeds_pending_from_existing_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("gpbeam.toml");
+        let ledger_path = dir.path().join("ledger.sqlite");
+        // Pre-seed one queued job.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let imp = l.record("C346", "GX010001.MP4", 1, 1, "/d/GX010001.MP4", None).unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/d/GX010001.MP4", "r/x", 1, None).unwrap();
+        }
+        let mut state = AppState::default();
+        let mut runtime = CloudRuntime::empty();
+        let mut view = base_view(dir.path().join("out").to_str().unwrap());
+        view.cloud = Some(cloud_view());
+
+        apply_saved_config(&view, &cfg_path, &ledger_path, &mut state, &mut runtime).unwrap();
+        assert_eq!(state.cloud.pending, 1);
+    }
+
+    #[test]
+    fn apply_saved_config_rejects_invalid_view_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("gpbeam.toml");
+        let ledger_path = dir.path().join("ledger.sqlite");
+        let mut state = AppState::default();
+        let mut runtime = CloudRuntime::empty();
+
+        let mut view = base_view(""); // empty dest_root is invalid
+        view.dest_root = String::new();
+
+        let err = apply_saved_config(&view, &cfg_path, &ledger_path, &mut state, &mut runtime)
+            .unwrap_err();
+        assert!(!err.is_empty(), "validation error message is non-empty");
+        assert!(!cfg_path.exists(), "invalid input must NOT write gpbeam.toml");
     }
 }
