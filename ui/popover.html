@@ -13,37 +13,10 @@
       display: flex; flex-direction: column; padding: 14px; box-sizing: border-box;
       border-radius: 10px;
     }
-    h1 { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: #5a5a60; }
-    .dot.working { background: #2878dc; }
-    .dot.error { background: #d23c3c; }
-    #log { flex: 1; overflow: auto; font: 11px/1.5 ui-monospace, Menlo, monospace;
-           background: rgba(0,0,0,0.25); border-radius: 6px; padding: 8px; white-space: pre-wrap; }
-    .muted { color: #999; }
   </style>
 </head>
 <body>
-  <h1><span id="dot" class="dot"></span> GPBeam <span id="state" class="muted">idle</span></h1>
-  <div id="log" class="muted">Plug in a GoPro (SD / storage mode) to begin…</div>
-  <script>
-    // M1: minimal status surface. Rich popover UI lands in M3.
-    const log = document.getElementById('log');
-    const dot = document.getElementById('dot');
-    const state = document.getElementById('state');
-    function line(t) {
-      if (log.classList.contains('muted')) { log.textContent = ''; log.classList.remove('muted'); }
-      log.textContent += t + "\n"; log.scrollTop = log.scrollHeight;
-    }
-    if (window.__TAURI__) {
-      const { listen } = window.__TAURI__.event;
-      listen('gpbeam://event', (e) => {
-        const s = String(e.payload);
-        line(s);
-        if (s.includes('Copying')) { dot.className = 'dot working'; state.textContent = 'working'; }
-        else if (s.includes('Failed') || s.includes('InsufficientSpace')) { dot.className = 'dot error'; state.textContent = 'error'; }
-        else if (s.includes('RunComplete')) { dot.className = 'dot'; state.textContent = 'idle'; }
-      });
-    }
-  </script>
+  <div id="app"></div>
+  <script type="module" src="/src/popover/main.ts"></script>
 </body>
 </html>
