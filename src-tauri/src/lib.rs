@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use gpbeam_core::cloud::{build_uploader, worker::CloudWorker, CloudEvent};
-use gpbeam_core::config::{config_path, load_config, Config, MirrorMode};
+use gpbeam_core::config::{config_path, load_config, Config};
 use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
@@ -168,6 +168,15 @@ fn build_app_ctx(
     }
 }
 
+/// Seed a fresh `AppState.cloud` from the loaded config + the ledger's pending
+/// count at startup, so a window opened before any event still shows the right
+/// configured/pending counts. Pure: the ledger count is read by the caller and
+/// passed in. `configured` is true iff a `[cloud]` table exists.
+fn seed_cloud_state(state: &mut AppState, cfg: &Config, pending: usize) {
+    state.cloud.configured = cfg.cloud.is_some();
+    state.cloud.pending = pending;
+}
+
 /// The single long-lived cloud-mirror loop. Ticks every 5s; on each tick it reads
 /// the swappable `CloudRuntime` and the `paused` flag from the managed `AppCtx`. If
 /// `should_drain` is false it idles; otherwise it builds an uploader through the
@@ -288,6 +297,40 @@ fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Resolve paths + load config ONCE, before the builder, so we can seed the
+    // managed AppCtx (and its AppState/CloudRuntime) up front.
+    let dest = dest_root();
+    let cfg = load_or_default_config(&dest);
+    let cfg_path = config_path(std::env::var("GPBEAM_CONFIG").ok(), &dest);
+    let led_path = ledger_path(&dest);
+
+    // Keychain-backed credential store: env (GPBEAM_NC_*) > keychain > toml fallback.
+    let env_username = std::env::var("GPBEAM_NC_USERNAME").ok();
+    let env_app_password = std::env::var("GPBEAM_NC_APP_PASSWORD").ok();
+    let fallback = std::fs::read_to_string(&cfg_path).ok().and_then(|s| {
+        EnvConfigStore::from_toml_str(&s, env_username.clone(), env_app_password.clone()).ok()
+    });
+    let ctx = build_app_ctx(
+        &cfg,
+        dest.clone(),
+        cfg_path.clone(),
+        led_path.clone(),
+        Arc::new(SystemKeyring),
+        env_username,
+        env_app_password,
+        fallback,
+    );
+
+    // Seed AppState.cloud from config + ledger pending count for a cold window.
+    {
+        let pending = Ledger::open(&led_path)
+            .ok()
+            .and_then(|l| l.pending_cloud_count().ok())
+            .unwrap_or(0);
+        let mut st = ctx.state.lock().expect("AppState mutex poisoned");
+        seed_cloud_state(&mut st, &cfg, pending);
+    }
+
     tauri::Builder::default()
         // single-instance MUST be registered first.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -297,6 +340,28 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(ctx)
+        .invoke_handler(tauri::generate_handler![
+            commands::get_state,
+            commands::get_config,
+            commands::save_config,
+            commands::pick_folder,
+            commands::open_path,
+            commands::reveal_path,
+            commands::set_nextcloud_credentials,
+            commands::clear_nextcloud_credentials,
+            commands::pause_cloud,
+            commands::resume_cloud,
+            commands::retry_failed_cloud,
+            commands::get_history,
+            commands::get_autostart,
+            commands::set_autostart,
+            commands::is_first_run,
+            commands::complete_wizard,
+            commands::quit,
+        ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -522,6 +587,36 @@ mod tests {
         assert!(snap.cloud.uploading.is_none());
         assert_eq!(snap.cloud.failed, 1);
         assert!(snap.message.is_some());
+    }
+
+    #[test]
+    fn seed_cloud_state_marks_configured_when_cloud_present() {
+        let mut cfg = gpbeam_core::config::Config::new(std::path::PathBuf::from("/tmp/x"));
+        cfg.cloud = Some(gpbeam_core::config::CloudConfig {
+            kind: gpbeam_core::config::CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://example.com".into(),
+            username: "alice".into(),
+            remote_root: "/GPBeam".into(),
+            mirror_mode: gpbeam_core::config::MirrorMode::Auto,
+            chunk_threshold: 10_000_000,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 3,
+        });
+        let mut st = crate::app_state::AppState::default();
+        seed_cloud_state(&mut st, &cfg, 7);
+        assert!(st.cloud.configured);
+        assert_eq!(st.cloud.pending, 7);
+    }
+
+    #[test]
+    fn seed_cloud_state_leaves_unconfigured_without_cloud() {
+        let cfg = gpbeam_core::config::Config::new(std::path::PathBuf::from("/tmp/x"));
+        let mut st = crate::app_state::AppState::default();
+        seed_cloud_state(&mut st, &cfg, 0);
+        assert!(!st.cloud.configured);
+        assert_eq!(st.cloud.pending, 0);
     }
 
     #[test]
