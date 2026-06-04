@@ -73,6 +73,23 @@ fn history_rows_from_ledger(ledger_path: &Path, limit: usize) -> Result<Vec<Hist
         .collect())
 }
 
+use crate::app_state::CloudState;
+
+/// Seed `cloud.pending` from the persisted cloud-job queue. Used by `get_state`
+/// so a window opened after an app restart (before the next drain tick) reflects
+/// the real backlog. No ledger file (or a read error) leaves `cloud` untouched —
+/// the in-memory counter, if any, stands.
+fn seed_pending_from_ledger(ledger_path: &Path, cloud: &mut CloudState) {
+    if !ledger_path.exists() {
+        return;
+    }
+    if let Ok(ledger) = Ledger::open(ledger_path) {
+        if let Ok(n) = ledger.pending_cloud_count() {
+            cloud.pending = n;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +174,40 @@ mod tests {
         let path = dir.path().join("does-not-exist.sqlite");
         let rows = history_rows_from_ledger(&path, 10).unwrap();
         assert!(rows.is_empty());
+    }
+
+    use crate::app_state::CloudState;
+
+    #[test]
+    fn seed_pending_reads_count_from_existing_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        // Enqueue one queued cloud job so pending_cloud_count() == 1.
+        {
+            let mut l = Ledger::open(&path).unwrap();
+            let imp = l
+                .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+                .unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/dest/GX010001.MP4", "r/GX010001.MP4", 4096, None)
+                .unwrap();
+        }
+        let mut cloud = CloudState::default();
+        seed_pending_from_ledger(&path, &mut cloud);
+        assert_eq!(cloud.pending, 1);
+    }
+
+    #[test]
+    fn seed_pending_missing_ledger_leaves_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("none.sqlite");
+        let mut cloud = CloudState {
+            configured: true,
+            pending: 7,
+            ..CloudState::default()
+        };
+        seed_pending_from_ledger(&path, &mut cloud);
+        // No ledger file -> nothing read; the in-memory count is preserved.
+        assert_eq!(cloud.pending, 7);
+        assert!(cloud.configured);
     }
 }
