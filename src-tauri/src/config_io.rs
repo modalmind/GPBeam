@@ -3,6 +3,12 @@
 //! `gpbeam_core::config::Config`. Also the atomic config writer used by the
 //! `save_config` / `complete_wizard` commands. No Tauri types here — every
 //! function is pure and unit-tested.
+//!
+//! These items are the typed UI<->Core bridge consumed by the Phase 5
+//! `commands` module (`save_config`, `complete_wizard`, `get_config`); until
+//! those commands land they are not yet called from non-test code, so the
+//! module opts out of `dead_code` for its public API.
+#![allow(dead_code)]
 
 use std::io::Write;
 use std::path::Path;
