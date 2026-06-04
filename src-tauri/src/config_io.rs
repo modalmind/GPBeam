@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use gpbeam_core::config::{CloudConfig, CloudKind, Config, MirrorMode};
+use gpbeam_core::config::{CloudConfig, CloudKind, Config, Layout, MirrorMode};
 
 /// UI view of a `[cloud]` table. `has_password` is a UI-only hint (true when a
 /// credential exists in env/keychain/fallback) and is NOT persisted to TOML.
@@ -79,6 +79,109 @@ fn cloud_to_view(c: &CloudConfig, has_password: bool) -> CloudView {
     }
 }
 
+/// Parse the UI mirror-mode string into a `MirrorMode`. The inverse of
+/// `mirror_mode_to_str`. Anything else is a user-facing error.
+fn parse_mirror_mode(s: &str) -> Result<MirrorMode, String> {
+    match s {
+        "off" => Ok(MirrorMode::Off),
+        "auto" => Ok(MirrorMode::Auto),
+        "manual" => Ok(MirrorMode::Manual),
+        other => Err(format!("invalid mirror mode {other:?} (want off|auto|manual)")),
+    }
+}
+
+/// True if `url` is a syntactically acceptable Nextcloud base URL: an
+/// `http://` or `https://` scheme followed by a non-empty host. Kept
+/// dependency-light (no `url` crate) — full WebDAV validation happens when the
+/// uploader actually connects.
+fn is_valid_base_url(url: &str) -> bool {
+    let rest = match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    // Host is everything up to the first '/'; it must be non-empty.
+    let host = rest.split('/').next().unwrap_or("");
+    !host.trim().is_empty()
+}
+
+/// Validate a `ConfigView` from the UI. Returns `Ok(())` when the view can be
+/// turned into a `Config`, else a user-facing `Err(String)`. Called by
+/// `view_to_config` and by the `save_config`/`complete_wizard` commands.
+pub fn validate_view(view: &ConfigView) -> Result<(), String> {
+    if view.dest_root.trim().is_empty() {
+        return Err("destination folder must not be empty".to_string());
+    }
+    if view.filename_template.trim().is_empty() {
+        return Err("filename template must not be empty".to_string());
+    }
+    if let Some(cloud) = &view.cloud {
+        // Validates the mirror-mode string regardless of which mode it is.
+        parse_mirror_mode(&cloud.mirror_mode)?;
+        if cloud.destination_id.trim().is_empty() {
+            return Err("cloud destination id must not be empty".to_string());
+        }
+        if cloud.base_url.trim().is_empty() {
+            return Err("cloud base url must not be empty".to_string());
+        }
+        if !is_valid_base_url(&cloud.base_url) {
+            return Err(format!(
+                "cloud base url {:?} must start with http:// or https:// and include a host",
+                cloud.base_url
+            ));
+        }
+        if cloud.remote_root.trim().is_empty() {
+            return Err("cloud remote root must not be empty".to_string());
+        }
+        if cloud.username.trim().is_empty() {
+            return Err("cloud username must not be empty".to_string());
+        }
+        if cloud.max_concurrency == 0 {
+            return Err("cloud max concurrency must be at least 1".to_string());
+        }
+        if cloud.max_attempts == 0 {
+            return Err("cloud max attempts must be at least 1".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Turn a validated `ConfigView` into a core `Config`. Validates first, so an
+/// `Err` mirrors `validate_view`. `layout` is always `Flat` (M3 has no other),
+/// and the `kind` is always `Nextcloud` (the only `CloudKind` in M3).
+pub fn view_to_config(view: &ConfigView) -> Result<Config, String> {
+    validate_view(view)?;
+    let cloud = match &view.cloud {
+        None => None,
+        Some(c) => Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: c.destination_id.trim().to_string(),
+            base_url: c.base_url.trim().to_string(),
+            username: c.username.trim().to_string(),
+            remote_root: c.remote_root.trim().to_string(),
+            mirror_mode: parse_mirror_mode(&c.mirror_mode)?,
+            chunk_threshold: c.chunk_threshold,
+            tls_ca_pem: None,
+            max_concurrency: c.max_concurrency,
+            max_attempts: c.max_attempts,
+        }),
+    };
+    Ok(Config {
+        dest_root: std::path::PathBuf::from(view.dest_root.trim()),
+        filename_template: view.filename_template.clone(),
+        include_proxies: view.include_proxies,
+        include_thumbnails: view.include_thumbnails,
+        layout: Layout::Flat,
+        verify: view.verify,
+        space_headroom: view.space_headroom,
+        cloud,
+        delete_after_verify: view.delete_after_verify,
+        auto_eject: view.auto_eject,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +250,159 @@ mod tests {
         assert!(cloud.get("mirrorMode").is_some());
         assert!(cloud.get("maxConcurrency").is_some());
         assert!(cloud.get("hasPassword").is_some());
+    }
+
+    fn base_view() -> ConfigView {
+        ConfigView {
+            dest_root: "/Users/alice/GPBeam".into(),
+            filename_template: "{date}_{original}".into(),
+            include_proxies: false,
+            include_thumbnails: false,
+            verify: true,
+            space_headroom: 1024 * 1024 * 1024,
+            delete_after_verify: false,
+            auto_eject: false,
+            cloud: None,
+        }
+    }
+
+    fn cloud_view() -> CloudView {
+        CloudView {
+            destination_id: "nc1".into(),
+            base_url: "https://cloud.example.com".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: "auto".into(),
+            chunk_threshold: 50 * 1024 * 1024,
+            max_concurrency: 2,
+            max_attempts: 8,
+            has_password: true,
+        }
+    }
+
+    #[test]
+    fn validate_view_accepts_minimal_no_cloud() {
+        assert!(validate_view(&base_view()).is_ok());
+    }
+
+    #[test]
+    fn validate_view_rejects_empty_dest_root() {
+        let mut v = base_view();
+        v.dest_root = "   ".into();
+        let err = validate_view(&v).unwrap_err();
+        assert!(err.to_lowercase().contains("destination"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_view_rejects_empty_filename_template() {
+        let mut v = base_view();
+        v.filename_template = String::new();
+        assert!(validate_view(&v).is_err());
+    }
+
+    #[test]
+    fn validate_view_rejects_bad_mirror_mode() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.mirror_mode = "sometimes".into();
+        v.cloud = Some(c);
+        let err = validate_view(&v).unwrap_err();
+        assert!(err.to_lowercase().contains("mirror"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_view_rejects_auto_with_empty_base_url() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.base_url = String::new();
+        v.cloud = Some(c);
+        let err = validate_view(&v).unwrap_err();
+        assert!(err.to_lowercase().contains("base url") || err.to_lowercase().contains("base_url"),
+                "got: {err}");
+    }
+
+    #[test]
+    fn validate_view_rejects_non_http_base_url() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.base_url = "ftp://cloud.example.com".into();
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_err());
+    }
+
+    #[test]
+    fn validate_view_rejects_base_url_without_host() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.base_url = "https://".into();
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_err());
+    }
+
+    #[test]
+    fn validate_view_rejects_empty_destination_id() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.destination_id = "  ".into();
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_err());
+    }
+
+    #[test]
+    fn validate_view_rejects_zero_concurrency_or_attempts() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.max_concurrency = 0;
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_err());
+
+        let mut v2 = base_view();
+        let mut c2 = cloud_view();
+        c2.max_attempts = 0;
+        v2.cloud = Some(c2);
+        assert!(validate_view(&v2).is_err());
+    }
+
+    #[test]
+    fn view_to_config_round_trips_via_config_to_view() {
+        let mut v = base_view();
+        v.cloud = Some(cloud_view());
+        let cfg = view_to_config(&v).expect("valid view -> config");
+        // dest_root and primitives survive.
+        assert_eq!(cfg.dest_root, PathBuf::from("/Users/alice/GPBeam"));
+        assert_eq!(cfg.layout, Layout::Flat); // always Flat in M3
+        let cloud = cfg.cloud.as_ref().expect("cloud present");
+        assert_eq!(cloud.kind, CloudKind::Nextcloud);
+        assert_eq!(cloud.mirror_mode, MirrorMode::Auto);
+        // Round-trip back to a view; has_password is a UI hint reset by config_to_view.
+        let back = config_to_view(&cfg, true);
+        let mut expected = v.clone();
+        // config_to_view stamps has_password from its arg, not from the original view.
+        if let Some(c) = expected.cloud.as_mut() {
+            c.has_password = true;
+        }
+        assert_eq!(back, expected);
+    }
+
+    #[test]
+    fn view_to_config_maps_off_and_manual_modes() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.mirror_mode = "off".into();
+        v.cloud = Some(c);
+        assert_eq!(view_to_config(&v).unwrap().cloud.unwrap().mirror_mode, MirrorMode::Off);
+
+        let mut v2 = base_view();
+        let mut c2 = cloud_view();
+        c2.mirror_mode = "manual".into();
+        v2.cloud = Some(c2);
+        assert_eq!(view_to_config(&v2).unwrap().cloud.unwrap().mirror_mode, MirrorMode::Manual);
+    }
+
+    #[test]
+    fn view_to_config_rejects_invalid_view() {
+        let mut v = base_view();
+        v.dest_root = String::new();
+        assert!(view_to_config(&v).is_err());
     }
 }
