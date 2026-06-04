@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Enumerate the host's IPv4 interface addresses via the `if-addrs` crate.
 /// Returns an empty vec on enumeration failure (e.g. restricted CI sandboxes).
@@ -46,6 +46,14 @@ pub fn candidate_camera_ips(host_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
         }
     }
     out
+}
+
+/// Pure de-bounce: the candidate IPs present **now** that were **absent** the previous
+/// tick. Mirrors `crate::detect::newly_appeared` but on probe-confirmed IPs. Returns the
+/// absent→present edges so the async poller fires `CameraFound` exactly once per present
+/// camera and re-arms after it disappears.
+pub fn probe_edge(before: &HashSet<IpAddr>, now: &HashSet<IpAddr>) -> Vec<IpAddr> {
+    now.difference(before).cloned().collect()
 }
 
 #[cfg(test)]
@@ -144,5 +152,47 @@ mod tests {
     #[test]
     fn empty_input_yields_empty() {
         assert!(candidate_camera_ips(&[]).is_empty());
+    }
+
+    use std::net::IpAddr;
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn edge_reports_only_newly_present_ips() {
+        let before: HashSet<IpAddr> = [v4(172, 26, 122, 51)].into_iter().collect();
+        let now: HashSet<IpAddr> =
+            [v4(172, 26, 122, 51), v4(172, 21, 7, 51)].into_iter().collect();
+        let mut appeared = probe_edge(&before, &now);
+        appeared.sort();
+        assert_eq!(appeared, vec![v4(172, 21, 7, 51)]);
+    }
+
+    #[test]
+    fn edge_debounces_a_still_present_camera() {
+        // Same camera present two ticks in a row -> no new edge the second time.
+        let s: HashSet<IpAddr> = [v4(172, 26, 122, 51)].into_iter().collect();
+        assert!(probe_edge(&s, &s).is_empty());
+    }
+
+    #[test]
+    fn edge_rearms_after_disappearance() {
+        let present: HashSet<IpAddr> = [v4(172, 26, 122, 51)].into_iter().collect();
+        let gone: HashSet<IpAddr> = HashSet::new();
+        // camera leaves -> nothing newly present
+        assert!(probe_edge(&present, &gone).is_empty());
+        // camera returns -> fires again
+        assert_eq!(
+            probe_edge(&gone, &present),
+            vec![v4(172, 26, 122, 51)]
+        );
+    }
+
+    #[test]
+    fn edge_empty_when_nothing_present() {
+        let empty: HashSet<IpAddr> = HashSet::new();
+        assert!(probe_edge(&empty, &empty).is_empty());
     }
 }
