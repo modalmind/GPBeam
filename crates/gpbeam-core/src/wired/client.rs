@@ -89,6 +89,39 @@ impl GoProClient {
         })?;
         Ok(body.version)
     }
+
+    /// `GET /gopro/camera/info` -> `CameraInfo`. Defensive parse: each field
+    /// defaults to "" when absent; unknown fields ignored. Non-200 -> `Http`.
+    pub async fn info(&self) -> Result<CameraInfo> {
+        #[derive(Deserialize, Default)]
+        struct InfoBody {
+            #[serde(default)]
+            model_name: String,
+            #[serde(default)]
+            serial_number: String,
+            #[serde(default)]
+            firmware_version: String,
+        }
+        let url = format!("{}/gopro/camera/info", self.base);
+        let resp = self.http.get(&url).send().await.map_err(transport_err)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(CoreError::Http {
+                status: Some(status),
+                msg: format!("GET {url} -> {status}"),
+            });
+        }
+        let text = resp.text().await.map_err(transport_err)?;
+        let body: InfoBody = serde_json::from_str(&text).map_err(|e| CoreError::Http {
+            status: None,
+            msg: format!("GET {url} parse error: {e}"),
+        })?;
+        Ok(CameraInfo {
+            model: body.model_name,
+            serial: body.serial_number,
+            firmware: body.firmware_version,
+        })
+    }
 }
 
 /// Map a reqwest transport error (no HTTP response) to a retryable
@@ -136,6 +169,65 @@ mod tests {
         let c = GoProClient::with_base(server.uri());
         let err = c.version().await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(404), .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn info_parses_model_serial_firmware() {
+        let server = MockServer::start().await;
+        let body = r#"{
+            "model_name": "Mission 1 Pro",
+            "model_number": 99,
+            "serial_number": "C3575424520622",
+            "firmware_version": "H26.01.01.10.00",
+            "ap_mac_address": "deadbeef"
+        }"#;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let info = c.info().await.unwrap();
+        assert_eq!(
+            info,
+            CameraInfo {
+                model: "Mission 1 Pro".into(),
+                serial: "C3575424520622".into(),
+                firmware: "H26.01.01.10.00".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn info_missing_fields_default_to_empty() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{}"#, "application/json"))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let info = c.info().await.unwrap();
+        assert_eq!(info.model, "");
+        assert_eq!(info.serial, "");
+        assert_eq!(info.firmware, "");
+    }
+
+    #[tokio::test]
+    async fn info_500_is_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let err = c.info().await.unwrap_err();
+        assert!(matches!(err, CoreError::Http { status: Some(500), .. }), "got {err:?}");
     }
 
     #[test]
