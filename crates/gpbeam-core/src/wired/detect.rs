@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 
+use crate::wired::client::GoProClient;
+
 /// Enumerate the host's IPv4 interface addresses via the `if-addrs` crate.
 /// Returns an empty vec on enumeration failure (e.g. restricted CI sandboxes).
 fn host_ipv4s() -> Vec<Ipv4Addr> {
@@ -54,6 +56,13 @@ pub fn candidate_camera_ips(host_ips: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
 /// camera and re-arms after it disappears.
 pub fn probe_edge(before: &HashSet<IpAddr>, now: &HashSet<IpAddr>) -> Vec<IpAddr> {
     now.difference(before).cloned().collect()
+}
+
+/// Probe one camera base URL's `/gopro/version`. Returns `true` only when a GoPro answered
+/// successfully (confirming a real Open GoPro device, not just any host on a `172.x` net).
+/// Any error — non-2xx, transport failure, or unparseable body — yields `false`.
+pub(crate) async fn probe_version(base: &str) -> bool {
+    GoProClient::with_base(base).version().await.is_ok()
 }
 
 #[cfg(test)]
@@ -194,5 +203,39 @@ mod tests {
     fn edge_empty_when_nothing_present() {
         let empty: HashSet<IpAddr> = HashSet::new();
         assert!(probe_edge(&empty, &empty).is_empty());
+    }
+
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn probe_version_true_when_gopro_answers_200() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"version":"2.0"}"#.to_vec(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        assert!(probe_version(&server.uri()).await);
+    }
+
+    #[tokio::test]
+    async fn probe_version_false_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/version"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(!probe_version(&server.uri()).await);
+    }
+
+    #[tokio::test]
+    async fn probe_version_false_on_unreachable_host() {
+        // Nothing listening on this base -> transport error -> false (no panic).
+        assert!(!probe_version("http://127.0.0.1:1").await);
     }
 }
