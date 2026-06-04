@@ -79,6 +79,32 @@ fn forward_cloud_event(app: &AppHandle, ev: CloudEvent) {
     }
 }
 
+/// Lock the shared `AppState`, fold one `RunEvent` into it at `now_unix`, and
+/// return a clone of the resulting snapshot for emission. Pure (no `AppHandle`) so
+/// the offload->state mapping is unit-testable; the caller emits the returned
+/// snapshot on `"gpbeam://state"`.
+fn fold_run_event(state: &Arc<Mutex<AppState>>, ev: &Ev, now_unix: i64) -> AppState {
+    let mut st = state.lock().expect("AppState mutex poisoned");
+    st.apply_run_event(ev, now_unix);
+    st.clone()
+}
+
+/// Lock the shared `AppState`, fold one `CloudEvent` into it, and return a clone of
+/// the resulting snapshot for emission. Pure; the caller emits it.
+fn fold_cloud_event(state: &Arc<Mutex<AppState>>, ev: &CloudEvent) -> AppState {
+    let mut st = state.lock().expect("AppState mutex poisoned");
+    st.apply_cloud_event(ev);
+    st.clone()
+}
+
+/// Emit a full `AppState` snapshot to every window on `"gpbeam://state"`. The UI
+/// replaces its store wholesale on each event (no TS-side reducer). Serialization
+/// failures are swallowed: a dropped frame is recoverable (the next event re-emits
+/// the full state), and there is nothing useful to do on a transport error here.
+fn emit_state(app: &AppHandle, snapshot: &AppState) {
+    let _ = app.emit("gpbeam://state", snapshot);
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -421,6 +447,43 @@ mod tests {
         let st = ctx.state.lock().unwrap();
         assert_eq!(st.status, crate::app_state::Status::Idle);
         assert!(st.run.is_none());
+    }
+
+    #[test]
+    fn fold_run_event_threads_through_appstate() {
+        use crate::app_state::Status;
+        use gpbeam_core::orchestrator::RunEvent;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::app_state::AppState::default()));
+        // A Scanned event must flip status to Working and seed totals.
+        let snap = fold_run_event(
+            &state,
+            &RunEvent::Scanned { new_files: 3, total_bytes: 9_000 },
+            1_600_000_000,
+        );
+        assert_eq!(snap.status, Status::Working);
+        let run = snap.run.expect("run present after Scanned");
+        assert_eq!(run.files_total, 3);
+        assert_eq!(run.bytes_total, 9_000);
+        assert_eq!(run.started_at_unix, 1_600_000_000);
+        // The shared state must have been mutated, not just the returned clone.
+        let shared = state.lock().unwrap();
+        assert_eq!(shared.status, Status::Working);
+    }
+
+    #[test]
+    fn fold_cloud_event_threads_through_appstate() {
+        use gpbeam_core::cloud::CloudEvent;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::app_state::AppState::default()));
+        let snap = fold_cloud_event(
+            &state,
+            &CloudEvent::Uploading { file: "a.mp4".into(), uploaded: 10, total: 100 },
+        );
+        let up = snap.cloud.uploading.expect("uploading present");
+        assert_eq!(up.file, "a.mp4");
+        assert_eq!(up.uploaded, 10);
+        assert_eq!(up.total, 100);
+        let shared = state.lock().unwrap();
+        assert!(shared.cloud.uploading.is_some());
     }
 
     #[test]
