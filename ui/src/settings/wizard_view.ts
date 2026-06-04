@@ -29,3 +29,38 @@ export function defaultConfigView(destRoot: string): ConfigView {
 export function withCloud(view: ConfigView, cloud: CloudView | null): ConfigView {
   return { ...view, cloud };
 }
+
+/** Raw fields collected by the wizard's Nextcloud step. */
+export interface CloudFields {
+  baseUrl: string;
+  username: string;
+  appPassword: string;
+  remoteRoot: string;
+  mirrorMode: "off" | "auto" | "manual";
+}
+
+const DEFAULT_CHUNK_THRESHOLD = 10485760; // 10 MiB
+const DEFAULT_MAX_CONCURRENCY = 2;
+const DEFAULT_MAX_ATTEMPTS = 5;
+
+/**
+ * Turn the wizard's Nextcloud fields into a CloudView, or `null` when the user
+ * left the base URL blank (i.e. skipped cloud). `hasPassword` reflects whether a
+ * non-blank app-password was entered; the password itself is stored separately
+ * via `setNextcloudCredentials` and never placed on the view.
+ */
+export function buildCloudView(fields: CloudFields): CloudView | null {
+  const baseUrl = fields.baseUrl.trim();
+  if (baseUrl === "") return null;
+  return {
+    destinationId: "nextcloud",
+    baseUrl,
+    username: fields.username.trim(),
+    remoteRoot: fields.remoteRoot.trim(),
+    mirrorMode: fields.mirrorMode,
+    chunkThreshold: DEFAULT_CHUNK_THRESHOLD,
+    maxConcurrency: DEFAULT_MAX_CONCURRENCY,
+    maxAttempts: DEFAULT_MAX_ATTEMPTS,
+    hasPassword: fields.appPassword.trim() !== "",
+  };
+}
