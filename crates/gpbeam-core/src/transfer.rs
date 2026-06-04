@@ -81,6 +81,59 @@ pub fn stream_hash_to_part(
     Ok((on_disk, hasher.finalize().to_hex().to_string()))
 }
 
+/// After a verified file exists at `dest_path`, persist it: record the import in
+/// the ledger, then (when `cfg.cloud`'s mirror mode is `Auto` or `Manual`, per
+/// Contract G3) enqueue a single cloud job. Returns the `imported` row id so the
+/// caller can stamp cloud status or correlate events.
+///
+/// `card_src` is the on-card source path retained on the cloud job so the worker
+/// can delete the original after a verified upload (`Some` for the filesystem
+/// path, `None` for the wired path, which has no on-disk source to delete).
+///
+/// This helper performs NO `RunEvent` emission — the caller emits `CloudQueued`
+/// (and any other events) itself, keeping the fs and wired call sites in control
+/// of their own event streams while sharing the ledger/enqueue logic.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_imported(
+    ledger: &mut crate::ledger::Ledger,
+    cfg: &crate::config::Config,
+    serial: &str,
+    name: &str,
+    size: u64,
+    captured_unix: i64,
+    dest_path: &Path,
+    dest_name: &str,
+    hash: Option<&str>,
+    card_src: Option<&str>,
+) -> Result<i64> {
+    use crate::config::MirrorMode;
+
+    let imported_id = ledger.record(
+        serial,
+        name,
+        size,
+        captured_unix,
+        &dest_path.to_string_lossy(),
+        hash,
+    )?;
+
+    if let Some(cloud) = &cfg.cloud {
+        if matches!(cloud.mirror_mode, MirrorMode::Auto | MirrorMode::Manual) {
+            let remote = crate::orchestrator::remote_path_for(&cloud.remote_root, dest_name);
+            ledger.enqueue_cloud_job(
+                imported_id,
+                &cloud.destination_id,
+                &dest_path.to_string_lossy(),
+                &remote,
+                size,
+                card_src,
+            )?;
+        }
+    }
+
+    Ok(imported_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +215,138 @@ mod tests {
         assert_eq!(total, payload.len() as u64);
         assert_eq!(hash, blake3_hex(&payload));
         assert_eq!(std::fs::read(&part).unwrap(), payload, "stale .part fully replaced");
+    }
+
+    use crate::config::{CloudConfig, CloudKind, Config, MirrorMode};
+    use crate::ledger::{JobState, Ledger};
+    use std::path::PathBuf;
+
+    fn cfg_no_cloud() -> Config {
+        Config::new(PathBuf::from("/dest"))
+    }
+
+    fn cfg_with_cloud(mode: MirrorMode) -> Config {
+        let mut cfg = Config::new(PathBuf::from("/dest"));
+        cfg.cloud = Some(CloudConfig {
+            kind: CloudKind::Nextcloud,
+            destination_id: "nc1".into(),
+            base_url: "https://nc.example".into(),
+            username: "alice".into(),
+            remote_root: "GoPro".into(),
+            mirror_mode: mode,
+            chunk_threshold: 50 * 1024 * 1024,
+            tls_ca_pem: None,
+            max_concurrency: 2,
+            max_attempts: 8,
+        });
+        cfg
+    }
+
+    #[test]
+    fn commit_records_but_enqueues_nothing_when_no_cloud() {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let cfg = cfg_no_cloud();
+        let dest = PathBuf::from("/dest/2026_GX010001.MP4");
+
+        let id = commit_imported(
+            &mut ledger,
+            &cfg,
+            "C346",
+            "GX010001.MP4",
+            4096,
+            1000,
+            &dest,
+            "2026_GX010001.MP4",
+            Some("deadbeef"),
+            None,
+        )
+        .unwrap();
+
+        assert!(id > 0);
+        assert!(ledger.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 0, "no cloud => no jobs");
+    }
+
+    #[test]
+    fn commit_off_mirror_enqueues_nothing() {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let cfg = cfg_with_cloud(MirrorMode::Off);
+        let dest = PathBuf::from("/dest/2026_GX010001.MP4");
+
+        commit_imported(
+            &mut ledger, &cfg, "C346", "GX010001.MP4", 4096, 1000, &dest,
+            "2026_GX010001.MP4", None, None,
+        )
+        .unwrap();
+
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 0, "Off mirror enqueues nothing");
+    }
+
+    #[test]
+    fn commit_auto_mirror_enqueues_one_job_with_remote_path_and_card_src() {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let cfg = cfg_with_cloud(MirrorMode::Auto);
+        let dest = PathBuf::from("/dest/2026_GX010001.MP4");
+
+        let id = commit_imported(
+            &mut ledger,
+            &cfg,
+            "C346",
+            "GX010001.MP4",
+            4096,
+            1000,
+            &dest,
+            "2026_GX010001.MP4",
+            Some("cafef00d"),
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4"),
+        )
+        .unwrap();
+
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 1);
+        let jobs = ledger.list_cloud_jobs(Some(JobState::Queued)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let j = &jobs[0];
+        assert_eq!(j.imported_id, id);
+        assert_eq!(j.destination_id, "nc1");
+        assert_eq!(j.local_path, "/dest/2026_GX010001.MP4");
+        assert_eq!(j.remote_path, "GoPro/2026_GX010001.MP4", "remote_root + '/' + dest_name");
+        assert_eq!(j.total_bytes, 4096);
+        assert_eq!(
+            j.card_src.as_deref(),
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4")
+        );
+    }
+
+    #[test]
+    fn commit_manual_mirror_also_enqueues() {
+        // Contract G3: enqueue for BOTH Auto and Manual.
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let cfg = cfg_with_cloud(MirrorMode::Manual);
+        let dest = PathBuf::from("/dest/clip.MP4");
+
+        commit_imported(
+            &mut ledger, &cfg, "C346", "clip.MP4", 10, 1, &dest, "clip.MP4", None, None,
+        )
+        .unwrap();
+
+        assert_eq!(ledger.pending_cloud_count().unwrap(), 1, "Manual mirror queues a job");
+    }
+
+    #[test]
+    fn commit_wired_passes_no_card_src() {
+        // The wired path has no card source path; card_src=None must round-trip.
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let cfg = cfg_with_cloud(MirrorMode::Auto);
+        let dest = PathBuf::from("/dest/wired.MP4");
+
+        commit_imported(
+            &mut ledger, &cfg, "C346", "wired.MP4", 7, 2, &dest, "wired.MP4",
+            Some("abc123"), None,
+        )
+        .unwrap();
+
+        let jobs = ledger.list_cloud_jobs(None).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].card_src, None, "wired enqueues with no card_src");
     }
 }

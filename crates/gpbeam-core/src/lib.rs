@@ -20,3 +20,4 @@ pub use error::{CoreError, Result};
 pub use eject::{default_ejector, Ejector, SystemEjector};
 pub use orchestrator::{run_offload, RunEvent, RunSummary};
 pub use scanner::{scan_card, scan_with_skips, PlannedCopy};
+pub use transfer::{commit_imported, stream_hash_to_part};
