@@ -148,48 +148,46 @@ pub fn run_offload_with_ejector(
         match copy_verified(&item.src, &item.dest_path, cfg.verify, &mut |_| {}) {
             Ok(out) => {
                 let n = out.bytes;
-                let imported_id = ledger.record(
+                // Shared commit: record the import + (for Auto|Manual) enqueue a
+                // cloud job. card_src is the on-card source so the worker can delete
+                // it after a verified upload (Auto + delete-after-verify).
+                let src_str = item.src.to_string_lossy();
+                let imported_id = crate::transfer::commit_imported(
+                    ledger,
+                    cfg,
                     serial_key,
                     &item.name,
                     item.size,
                     item.mtime_unix,
-                    &item.dest_path.to_string_lossy(),
+                    &item.dest_path,
+                    &item.dest_name,
                     out.hash.as_deref(),
+                    Some(&src_str),
                 )?;
+                let _ = imported_id; // returned id not needed inline (kept for parity)
                 bytes += n;
                 copied += 1;
                 emit(RunEvent::Progress { file: item.name.clone(), copied: n, total: n });
                 emit(RunEvent::Verified { file: item.name.clone() });
 
-                // Cloud mirror: enqueue a job for Auto OR Manual (Contract G3).
-                // Off (and no [cloud] config at all) enqueues nothing. The card
-                // source path is retained so the worker can delete it after a
-                // verified upload (Auto + delete-after-verify).
-                if let Some(cloud) = &cfg.cloud {
-                    if matches!(cloud.mirror_mode, MirrorMode::Auto | MirrorMode::Manual) {
-                        let remote = remote_path_for(&cloud.remote_root, &item.dest_name);
-                        ledger.enqueue_cloud_job(
-                            imported_id,
-                            &cloud.destination_id,
-                            &item.dest_path.to_string_lossy(),
-                            &remote,
-                            item.size,
-                            Some(&item.src.to_string_lossy()),
-                        )?;
-                        queued += 1;
-                        emit(RunEvent::CloudQueued { file: item.name.clone() });
-                    }
+                // Cloud mirror: the job was enqueued inside commit_imported for
+                // Auto|Manual; emit the matching CloudQueued event + bump the
+                // counter here (the helper is event-free by design — Contract G3).
+                let mirror = cfg
+                    .cloud
+                    .as_ref()
+                    .map(|c| c.mirror_mode)
+                    .unwrap_or(MirrorMode::Off);
+                if cfg.cloud.is_some() && matches!(mirror, MirrorMode::Auto | MirrorMode::Manual)
+                {
+                    queued += 1;
+                    emit(RunEvent::CloudQueued { file: item.name.clone() });
                 }
 
                 // delete-after-verify (opt-in, default OFF): once the file is
                 // verified locally, delete the card SOURCE for the non-Auto path.
                 // Under Auto, deletion is deferred to the cloud worker after the
                 // upload reaches Done (the card_src is retained on the queued job).
-                let mirror = cfg
-                    .cloud
-                    .as_ref()
-                    .map(|c| c.mirror_mode)
-                    .unwrap_or(MirrorMode::Off);
                 if cfg.delete_after_verify && should_delete_card(true, mirror) {
                     match std::fs::remove_file(&item.src) {
                         Ok(()) => emit(RunEvent::CardFileDeleted { file: item.name.clone() }),
@@ -355,6 +353,30 @@ mod tests {
         assert!(jobs
             .iter()
             .all(|j| j.card_src.as_deref().is_some_and(|s| s.contains("DCIM"))));
+    }
+
+    #[test]
+    fn copied_file_imported_row_matches_its_cloud_job() {
+        // Pins the commit_imported wiring: the enqueued cloud job's imported_id
+        // must equal the imported row id for that same (serial,name,size,mtime).
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Auto);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
+
+        let jobs = ledger.list_cloud_jobs(None).unwrap();
+        assert_eq!(jobs.len(), 4);
+        for j in &jobs {
+            // Each job's imported_id is a real, present imported row.
+            assert!(j.imported_id > 0);
+        }
+        // The four jobs reference four distinct imported rows.
+        let mut ids: Vec<i64> = jobs.iter().map(|j| j.imported_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "one distinct imported row per copied file");
     }
 
     #[test]
