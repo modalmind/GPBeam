@@ -456,11 +456,15 @@ pub fn run() {
         .run(|app, event| {
             if let RunEvent::WindowEvent { event, label, .. } = event {
                 match event {
-                    // Window-less app: closing a window only hides it; the tray
-                    // "Quit" is the real exit.
+                    // Window-less app: closing a window only HIDES it (the tray
+                    // "Quit" is the real exit). We must both prevent the close AND
+                    // hide — prevent_close alone leaves the window stuck on screen.
                     WindowEvent::CloseRequested { api, .. } => {
                         if label == "popover" || label == "settings" {
                             api.prevent_close();
+                            if let Some(w) = app.get_webview_window(&label) {
+                                let _ = w.hide();
+                            }
                         }
                     }
                     // The tray popover auto-dismisses when it loses focus (i.e. the
