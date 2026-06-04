@@ -543,11 +543,20 @@ pub fn run() {
                 let state = app.state::<AppCtx>().state.clone();
                 tauri::async_runtime::spawn(async move {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                    tauri::async_runtime::spawn(gpbeam_core::wired::detect::poll_for_camera(tx));
+                    // The Open GoPro HTTP server handles ONE client at a time, so the poller
+                    // must NOT probe the camera while an offload is downloading from it. We
+                    // pause the poller for the duration of each offload (exclusive access).
+                    let paused = Arc::new(AtomicBool::new(false));
+                    tauri::async_runtime::spawn(gpbeam_core::wired::detect::poll_for_camera(
+                        tx,
+                        paused.clone(),
+                    ));
                     while let Some(found) = rx.recv().await {
-                        // One camera at a time (design §5): each detection runs to
-                        // completion before the next is handled.
+                        // One camera at a time (design §5): each detection runs to completion
+                        // before the next is handled. Pause probing so the offload owns the camera.
+                        paused.store(true, std::sync::atomic::Ordering::Relaxed);
                         run_wired_offload_for_camera(&handle, &state, found.ip).await;
+                        paused.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 });
             }

@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -124,11 +126,19 @@ async fn poll_once<S, B>(
 /// absent→present edge fetch `info()` and send `CameraFound` on `tx`. De-bounced so a present
 /// camera fires once and re-arms after it disconnects. Mirrors
 /// `crate::detect::poll_removable_mounts`. Stops when the receiver is dropped.
-pub async fn poll_for_camera(tx: UnboundedSender<CameraFound>) {
+/// `paused` lets the caller grant an in-progress offload EXCLUSIVE access to the camera:
+/// the Open GoPro HTTP server serves one client at a time, so probing it concurrently with a
+/// download hangs the download. The caller sets `paused` true around an offload; while paused
+/// we skip probing entirely (and don't touch `present`, so the camera stays de-bounced and
+/// does not re-fire when probing resumes).
+pub async fn poll_for_camera(tx: UnboundedSender<CameraFound>, paused: Arc<AtomicBool>) {
     let mut present: HashSet<IpAddr> = HashSet::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         ticker.tick().await;
+        if paused.load(Ordering::Relaxed) {
+            continue; // an offload holds the camera; don't probe concurrently
+        }
         poll_once(&host_ipv4s, &base_for, &mut present, &tx).await;
         if tx.is_closed() {
             return; // receiver dropped -> stop

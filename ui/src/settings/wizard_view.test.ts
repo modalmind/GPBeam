@@ -6,7 +6,7 @@ describe("defaultConfigView", () => {
   it("mirrors the Rust M1 defaults with the given destination", () => {
     const v = defaultConfigView("/Users/me/GPBeam");
     expect(v.destRoot).toBe("/Users/me/GPBeam");
-    expect(v.filenameTemplate).toBe("{date}/{name}");
+    expect(v.filenameTemplate).toBe("{date}_{original}");
     expect(v.includeProxies).toBe(false);
     expect(v.includeThumbnails).toBe(false);
     expect(v.verify).toBe(true);

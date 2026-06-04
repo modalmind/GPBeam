@@ -9,7 +9,6 @@
 use crate::error::{CoreError, Result};
 use reqwest::Client;
 use serde::Deserialize;
-use std::io::Cursor;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -183,7 +182,7 @@ impl GoProClient {
         };
 
         let url = self.media_url(m);
-        let resp = self
+        let mut resp = self
             .http
             .get(&url)
             .header(reqwest::header::RANGE, format!("bytes={already}-"))
@@ -191,20 +190,69 @@ impl GoProClient {
             .await
             .map_err(transport_err)?;
         let status = resp.status().as_u16();
-        // 200 (full) and 206 (partial) are both acceptable; the helper appends
-        // from `already`, so a server that ignores Range and resends from 0 would
-        // double-append — but the Open GoPro API honors Range (Accept-Ranges:
-        // bytes), and resume only triggers when `already > 0`.
         if status != 200 && status != 206 {
             return Err(CoreError::Http {
                 status: Some(status),
                 msg: format!("GET {url} (Range bytes={already}-) -> {status}"),
             });
         }
+        // Only a 206 with prior bytes is a genuine resume (append). A 200 means the server
+        // (re)sent the whole file, so restart from scratch and truncate any stale `.part`.
+        let resume = status == 206 && already > 0;
 
-        let body = resp.bytes().await.map_err(transport_err)?;
-        let mut reader = Cursor::new(body);
-        crate::transfer::stream_hash_to_part(&mut reader, part_path, already, progress)
+        // Templates may include subfolders (e.g. `{date}/...`), so make the parent exist.
+        if let Some(parent) = part_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| CoreError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+
+        // Hash the WHOLE on-disk file: seed with the resumed prefix, then the streamed bytes.
+        let mut hasher = blake3::Hasher::new();
+        let mut total: u64 = 0;
+        if resume {
+            let existing = std::fs::File::open(part_path).map_err(|e| CoreError::Io {
+                path: part_path.to_path_buf(),
+                source: e,
+            })?;
+            hasher.update_reader(existing).map_err(|e| CoreError::Io {
+                path: part_path.to_path_buf(),
+                source: e,
+            })?;
+            total = already;
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(resume)
+            .truncate(!resume)
+            .open(part_path)
+            .await
+            .map_err(|e| CoreError::Io {
+                path: part_path.to_path_buf(),
+                source: e,
+            })?;
+
+        // Stream chunk-by-chunk: bounded memory (no full-file buffering), live progress,
+        // and an incremental BLAKE3 — essential for multi-GB GoPro clips.
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = resp.chunk().await.map_err(transport_err)? {
+            file.write_all(&chunk).await.map_err(|e| CoreError::Io {
+                path: part_path.to_path_buf(),
+                source: e,
+            })?;
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            progress(total);
+        }
+        file.flush().await.map_err(|e| CoreError::Io {
+            path: part_path.to_path_buf(),
+            source: e,
+        })?;
+
+        Ok((total, hasher.finalize().to_hex().to_string()))
     }
 
     /// `GET /gopro/media/delete?path={dir}/{name}` — delete a file from the
