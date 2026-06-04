@@ -395,6 +395,9 @@ pub fn run() {
     // managed AppCtx (and its AppState/CloudRuntime) up front.
     let dest = dest_root();
     let cfg = load_or_default_config(&dest);
+    // Captured for the setup() closure's wired-ingest spawn gate (Task 6.4). A
+    // copied bool avoids moving `cfg` (still needed below to build the AppCtx).
+    let wired_ingest = wired_ingest_enabled(&cfg);
     let cfg_path = config_path(std::env::var("GPBEAM_CONFIG").ok(), &dest);
     let led_path = ledger_path(&dest);
 
@@ -457,7 +460,7 @@ pub fn run() {
             commands::complete_wizard,
             commands::quit,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
@@ -528,6 +531,26 @@ pub fn run() {
                     .await;
                 }
             });
+
+            // M4: USB-wired GoPro detector. Gated by `wired_ingest` (default true);
+            // when off, this is never spawned and behavior is byte-for-byte M1–M3.
+            // On each CameraFound we run the async wired offload ON the tokio runtime
+            // (NOT spawn_blocking — it is async HTTP I/O), folding every RunEvent into
+            // the shared AppState + emitting "gpbeam://state" exactly like the SD path.
+            // Cloud jobs it enqueues are drained by the M2 cloud loop below, unchanged.
+            if wired_ingest {
+                let handle = app.handle().clone();
+                let state = app.state::<AppCtx>().state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    tauri::async_runtime::spawn(gpbeam_core::wired::detect::poll_for_camera(tx));
+                    while let Some(found) = rx.recv().await {
+                        // One camera at a time (design §5): each detection runs to
+                        // completion before the next is handled.
+                        run_wired_offload_for_camera(&handle, &state, found.ip).await;
+                    }
+                });
+            }
 
             // M3: one long-lived cloud-mirror loop. It self-guards each tick via
             // `should_drain`, so with no [cloud] table (or mirror_mode = Off) it is
