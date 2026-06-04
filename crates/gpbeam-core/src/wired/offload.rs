@@ -4,12 +4,15 @@
 //! shared `commit_imported` leaf helper. Emits the existing `RunEvent`s.
 
 use crate::capture::Captured;
-use crate::config::Config;
-use crate::error::Result;
+use crate::config::{Config, MirrorMode};
+use crate::diskguard;
+use crate::error::{io_at, CoreError, Result};
 use crate::gopro::classify;
 use crate::ledger::Ledger;
 use crate::naming::{render_name, resolve_collision};
-use crate::wired::client::RemoteMedia;
+use crate::orchestrator::{RunEvent, RunSummary};
+use crate::transfer::commit_imported;
+use crate::wired::client::{GoProClient, RemoteMedia};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -66,12 +69,165 @@ fn plan_wired(
     Ok((plan, skipped))
 }
 
+/// Offload a USB-connected GoPro (reachable via `client`) into `cfg.dest_root`, reusing the
+/// shared verify/ledger/cloud pipeline. Emits `RunEvent`s. Non-destructive unless
+/// `cfg.delete_after_verify` is set (then each verified file is deleted from the CAMERA via
+/// the API — inline, since the cloud worker uploads the local copy and can't reach the camera).
+pub async fn run_wired_offload(
+    client: &GoProClient,
+    cfg: &Config,
+    ledger: &mut Ledger,
+    emit: &mut dyn FnMut(RunEvent),
+) -> Result<RunSummary> {
+    let info = client.info().await?;
+    let serial = if info.serial.is_empty() { "unknown".to_string() } else { info.serial.clone() };
+    let model = (!info.model.is_empty()).then(|| info.model.clone());
+    emit(RunEvent::CardDetected { model: model.clone(), serial: Some(serial.clone()) });
+
+    // Best-effort: enable wired control. Non-fatal — many cameras work without it.
+    let _ = client.enable_wired_control().await;
+
+    let listing = client.media_list().await?;
+    let (plan, skipped) = plan_wired(listing, cfg, ledger, &serial, model.as_deref())?;
+    let total_bytes: u64 = plan.iter().map(|p| p.media.size).sum();
+    emit(RunEvent::Scanned { new_files: plan.len(), total_bytes });
+
+    // Low-disk guard before downloading anything.
+    if !diskguard::has_room(&cfg.dest_root, total_bytes, cfg.space_headroom)? {
+        let have = diskguard::available(&cfg.dest_root)?;
+        let need = total_bytes.saturating_add(cfg.space_headroom);
+        emit(RunEvent::InsufficientSpace { need, have });
+        return Err(CoreError::InsufficientSpace { need, have });
+    }
+    std::fs::create_dir_all(&cfg.dest_root).map_err(io_at(&cfg.dest_root))?;
+
+    let mirror = cfg.cloud.as_ref().map(|c| c.mirror_mode).unwrap_or(MirrorMode::Off);
+    let total = plan.len();
+    let (mut copied, mut failed, mut bytes, mut queued) = (0usize, 0usize, 0u64, 0usize);
+
+    for (i, p) in plan.iter().enumerate() {
+        emit(RunEvent::Copying { file: p.media.name.clone(), index: i + 1, total });
+        let part = part_path(&p.dest_path);
+        // download_resumable streams + hashes on disk and resumes from any existing `.part`.
+        // No-op progress: emit one Progress per file after it completes (emitting live would
+        // require re-borrowing `emit`, which this per-file loop already holds — same tradeoff
+        // the filesystem orchestrator makes).
+        match client.download_resumable(&p.media, &part, &mut |_| {}).await {
+            Ok((nbytes, hash)) => {
+                if nbytes != p.media.size {
+                    failed += 1;
+                    emit(RunEvent::Failed {
+                        file: p.media.name.clone(),
+                        error: format!("size mismatch: got {nbytes}, expected {}", p.media.size),
+                    });
+                    // keep the `.part` for a later resume
+                    continue;
+                }
+                std::fs::rename(&part, &p.dest_path).map_err(io_at(&p.dest_path))?;
+                bytes += nbytes;
+                copied += 1;
+                emit(RunEvent::Progress { file: p.media.name.clone(), copied: nbytes, total: nbytes });
+                emit(RunEvent::Verified { file: p.media.name.clone() });
+
+                // Record + (for Auto|Manual) enqueue the cloud job. card_src=None: the worker
+                // uploads the local copy; it can't delete from the camera.
+                commit_imported(
+                    ledger, cfg, &serial, &p.media.name, p.media.size, p.media.captured_unix,
+                    &p.dest_path, &p.dest_name, Some(&hash), None,
+                )?;
+                if matches!(mirror, MirrorMode::Auto | MirrorMode::Manual) {
+                    queued += 1;
+                    emit(RunEvent::CloudQueued { file: p.media.name.clone() });
+                }
+
+                // delete-after-verify (opt-in): delete from the camera inline.
+                if cfg.delete_after_verify {
+                    match client.delete(&p.media).await {
+                        Ok(()) => emit(RunEvent::CardFileDeleted { file: p.media.name.clone() }),
+                        Err(e) => emit(RunEvent::Failed {
+                            file: p.media.name.clone(),
+                            error: format!("delete-after-verify failed: {e}"),
+                        }),
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                emit(RunEvent::Failed { file: p.media.name.clone(), error: e.to_string() });
+                // `.part` retained on disk -> resumes via Range on the next run.
+            }
+        }
+    }
+
+    let summary = RunSummary { copied, skipped, failed, bytes, queued };
+    emit(RunEvent::RunComplete { copied, skipped, failed, bytes });
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::RunEvent;
+    use crate::wired::client::GoProClient;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn media(name: &str, size: u64, cre: i64) -> RemoteMedia {
         RemoteMedia { dir: "100GOPRO".into(), name: name.into(), size, captured_unix: cre }
+    }
+
+    // Serve the minimal Open GoPro surface run_wired_offload needs against a mock server.
+    async fn mock_camera(server: &MockServer, files: &[(&str, &[u8], i64)]) {
+        // info() parses TOP-LEVEL keys (Phase 2: model_name/serial_number/firmware_version).
+        Mock::given(method("GET")).and(path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model_name": "MISSION 1 PRO", "serial_number": "C3575424520622", "firmware_version": "H26.01"
+            })))
+            .mount(server).await;
+        Mock::given(method("GET")).and(path_regex(r"^/gopro/camera/control/wired_usb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server).await;
+        let fs: Vec<_> = files.iter().map(|(n, b, cre)| serde_json::json!({
+            "n": n, "s": b.len().to_string(), "cre": cre.to_string(), "mod": cre.to_string()
+        })).collect();
+        Mock::given(method("GET")).and(path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "1", "media": [ { "d": "100GOPRO", "fs": fs } ]
+            })))
+            .mount(server).await;
+        for (n, b, _) in files {
+            Mock::given(method("GET")).and(path(format!("/videos/DCIM/100GOPRO/{n}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b.to_vec()))
+                .mount(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_path_offloads_new_files_and_records_them() {
+        let server = MockServer::start().await;
+        mock_camera(&server, &[
+            ("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910),
+            ("GX010199.MP4", &vec![9u8; 8192], 1_780_515_924),
+        ]).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf()); // verify on, no cloud, delete off
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        let summary = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+
+        assert_eq!(summary.copied, 2);
+        assert_eq!(summary.failed, 0);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CardDetected { serial: Some(s), .. } if s == "C3575424520622")));
+        assert!(events.iter().filter(|e| matches!(e, RunEvent::Verified { .. })).count() == 2);
+        assert!(events.iter().any(|e| matches!(e, RunEvent::RunComplete { copied: 2, .. })));
+        // both files landed at the dest with the right sizes
+        let landed: Vec<_> = std::fs::read_dir(dest.path()).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(landed.len(), 2);
+        // ledger now dedups them
+        assert!(ledger.is_imported("C3575424520622", "GX010198.MP4", 4096, 1_780_515_910).unwrap());
     }
 
     #[test]
