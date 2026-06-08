@@ -18,6 +18,7 @@ function makeView() {
     spaceHeadroom: 1073741824,
     deleteAfterVerify: false,
     autoEject: false,
+    wiredIngest: true,
     cloud: null,
   };
 }

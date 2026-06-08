@@ -35,6 +35,9 @@ fn default_max_concurrency() -> usize {
 fn default_max_attempts() -> u32 {
     8
 }
+fn default_true() -> bool {
+    true
+}
 
 /// A single cloud destination, parsed from the `[cloud]` table of `gpbeam.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +74,10 @@ pub struct Config {
     pub delete_after_verify: bool,
     #[serde(default)]
     pub auto_eject: bool,
+    /// Offload a USB-connected GoPro over the Open GoPro HTTP API (M4). Defaults
+    /// to `true`; configs written before M4 (no key) keep wired ingest enabled.
+    #[serde(default = "default_true")]
+    pub wired_ingest: bool,
 }
 
 impl Config {
@@ -86,6 +93,7 @@ impl Config {
             cloud: None,
             delete_after_verify: false,
             auto_eject: false,
+            wired_ingest: true,
         }
     }
 }
@@ -132,6 +140,54 @@ mod tests {
         assert!(c.cloud.is_none());
         assert!(!c.delete_after_verify);
         assert!(!c.auto_eject);
+    }
+
+    #[test]
+    fn new_sets_wired_ingest_true_by_default() {
+        let c = Config::new(PathBuf::from("/tmp/dest"));
+        assert!(c.wired_ingest, "wired_ingest defaults to true in Config::new");
+    }
+
+    #[test]
+    fn load_config_defaults_wired_ingest_true_when_absent() {
+        // A config file that predates M4 has no `wired_ingest` key; the serde
+        // default must fill it in as `true` so existing installs keep wired
+        // ingest on after upgrading.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let sample = r#"
+            dest_root = "/Users/alice/GPBeam"
+            filename_template = "{date}_{original}"
+            include_proxies = false
+            include_thumbnails = false
+            layout = "Flat"
+            verify = true
+            space_headroom = 1073741824
+        "#;
+        std::fs::write(&path, sample).unwrap();
+        let cfg = load_config(&path).unwrap();
+        assert!(cfg.wired_ingest, "absent wired_ingest -> default true");
+    }
+
+    #[test]
+    fn load_config_round_trips_wired_ingest_false() {
+        // An explicit `wired_ingest = false` must parse as false (the user opted
+        // out of USB offload).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let sample = r#"
+            dest_root = "/Users/alice/GPBeam"
+            filename_template = "{date}_{original}"
+            include_proxies = false
+            include_thumbnails = false
+            layout = "Flat"
+            verify = true
+            space_headroom = 1073741824
+            wired_ingest = false
+        "#;
+        std::fs::write(&path, sample).unwrap();
+        let cfg = load_config(&path).unwrap();
+        assert!(!cfg.wired_ingest, "explicit wired_ingest = false -> false");
     }
 
     #[test]
@@ -191,6 +247,7 @@ mod tests {
             space_headroom = 1073741824
             delete_after_verify = true
             auto_eject = false
+            wired_ingest = true
 
             [cloud]
             kind = "nextcloud"
@@ -206,6 +263,7 @@ mod tests {
         assert_eq!(cfg.dest_root, PathBuf::from("/Users/alice/GPBeam"));
         assert!(cfg.delete_after_verify);
         assert!(!cfg.auto_eject);
+        assert!(cfg.wired_ingest);
 
         let cloud = cfg.cloud.expect("cloud table present");
         assert_eq!(cloud.kind, CloudKind::Nextcloud);

@@ -70,6 +70,7 @@ export interface ConfigView {
   spaceHeadroom: number;
   deleteAfterVerify: boolean;
   autoEject: boolean;
+  wiredIngest: boolean;
   cloud: CloudView | null;
 }
 

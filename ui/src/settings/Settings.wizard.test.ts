@@ -40,7 +40,7 @@ describe("Settings.svelte first-run gate", () => {
     getConfig.mockReset();
     getConfig.mockResolvedValue({
       destRoot: "/Users/me/GPBeam",
-      filenameTemplate: "{date}/{name}",
+      filenameTemplate: "{date}_{original}",
       includeProxies: false,
       includeThumbnails: false,
       verify: true,

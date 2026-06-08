@@ -11,13 +11,16 @@ const DEFAULT_SPACE_HEADROOM = 1073741824;
 export function defaultConfigView(destRoot: string): ConfigView {
   return {
     destRoot,
-    filenameTemplate: "{date}/{name}",
+    // Must match the Rust Config::new default. Valid tokens: {date} {time} {original}
+    // {ext} {camera} {model} — note {original}, NOT {name}, and no "/" (flat layout).
+    filenameTemplate: "{date}_{original}",
     includeProxies: false,
     includeThumbnails: false,
     verify: true,
     spaceHeadroom: DEFAULT_SPACE_HEADROOM,
     deleteAfterVerify: false,
     autoEject: false,
+    wiredIngest: true,
     cloud: null,
   };
 }

@@ -22,6 +22,8 @@ use gpbeam_core::config::{config_path, load_config, Config};
 use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::ledger::Ledger;
 use gpbeam_core::orchestrator::{run_offload, RunEvent as Ev};
+use gpbeam_core::error::CoreError;
+use gpbeam_core::orchestrator::RunSummary;
 
 use crate::app_state::AppState;
 use crate::cloud_runtime::CloudRuntime;
@@ -48,6 +50,33 @@ fn set_tray_state(app: &AppHandle, state: &str) {
 
 fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// The terminal toast for a finished run, or `None` when nothing was copied
+/// (a no-op run must stay silent). On failures it returns the failure toast.
+/// Pure and shared by the SD (`handle_mount`) and wired offload paths so their
+/// completion notifications cannot drift.
+fn summary_notification(s: &RunSummary) -> Option<(&'static str, String)> {
+    if s.failed > 0 {
+        return Some(("GPBeam", format!("{} file(s) failed to copy", s.failed)));
+    }
+    if s.copied > 0 {
+        return Some((
+            "GPBeam",
+            format!("Copied {} file(s), {} skipped", s.copied, s.skipped),
+        ));
+    }
+    None
+}
+
+/// The terminal tray-icon state for a finished run: `"idle"` on a clean run,
+/// `"error"` on any per-file failure or a hard run error. Pure; shared by both
+/// offload paths.
+fn tray_state_for_summary(summary: &Result<RunSummary, CoreError>) -> &'static str {
+    match summary {
+        Ok(s) if s.failed == 0 => "idle",
+        _ => "error",
+    }
 }
 
 /// Map one `CloudEvent` to tray-icon + native-notification side effects. The full
@@ -185,6 +214,14 @@ fn seed_cloud_state(state: &mut AppState, cfg: &Config, pending: usize) {
     state.cloud.pending = pending;
 }
 
+/// Whether the USB-wired GoPro detector should be spawned. Gated by the
+/// `wired_ingest` config flag (default true): with it off, the poller is never
+/// started and the process behaves byte-for-byte like M1–M3. Pure so `setup()`'s
+/// (untestable) spawn branch reduces to a single named, tested decision.
+fn wired_ingest_enabled(cfg: &Config) -> bool {
+    cfg.wired_ingest
+}
+
 /// The single long-lived cloud-mirror loop. Ticks every 5s; on each tick it reads
 /// the swappable `CloudRuntime` and the `paused` flag from the managed `AppCtx`. If
 /// `should_drain` is false it idles; otherwise it builds an uploader through the
@@ -281,23 +318,72 @@ fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
         emit_state(&app2, &snap);
     });
 
+    set_tray_state(app, tray_state_for_summary(&summary));
     match summary {
-        Ok(s) if s.failed == 0 => {
-            set_tray_state(app, "idle");
-            if s.copied > 0 {
-                notify(
-                    app,
-                    "GPBeam",
-                    &format!("Copied {} file(s), {} skipped", s.copied, s.skipped),
-                );
+        Ok(s) => {
+            if let Some((title, body)) = summary_notification(&s) {
+                notify(app, title, &body);
             }
         }
-        Ok(s) => {
+        Err(e) => {
+            notify(app, "GPBeam error", &e.to_string());
+        }
+    }
+}
+
+/// Run one wired (USB GoPro) offload pass for a freshly-detected camera at `ip`.
+/// Async — driven on the tokio runtime (NOT `spawn_blocking`): `run_wired_offload`
+/// is itself async I/O over HTTP. Each `RunEvent` folds into the shared `AppState`
+/// and broadcasts on `"gpbeam://state"` using the SAME M3 helpers as the SD path;
+/// the terminal tray icon + notification reuse the shared Task 6.2 helpers, so the
+/// two paths are behaviorally identical at the boundary. Cloud jobs enqueued by
+/// the offload are drained by the existing M2 cloud loop, unchanged.
+async fn run_wired_offload_for_camera(
+    app: &AppHandle,
+    state: &Arc<Mutex<AppState>>,
+    ip: std::net::IpAddr,
+) {
+    let dest = dest_root();
+    if let Err(e) = std::fs::create_dir_all(&dest) {
+        notify(app, "GPBeam error", &format!("cannot create destination: {e}"));
+        set_tray_state(app, "error");
+        return;
+    }
+    let cfg = load_or_default_config(&dest);
+    let mut ledger = match Ledger::open(&ledger_path(&dest)) {
+        Ok(l) => l,
+        Err(e) => {
+            notify(app, "GPBeam error", &e.to_string());
             set_tray_state(app, "error");
-            notify(app, "GPBeam", &format!("{} file(s) failed to copy", s.failed));
+            return;
+        }
+    };
+
+    set_tray_state(app, "working");
+    let client = gpbeam_core::wired::client::GoProClient::new(ip);
+    let app2 = app.clone();
+    let state2 = state.clone();
+    let summary = gpbeam_core::wired::offload::run_wired_offload(
+        &client,
+        &cfg,
+        &mut ledger,
+        &mut |e: Ev| {
+            // Fold every event into the shared AppState and broadcast the snapshot
+            // (identical to handle_mount's emitter).
+            let snap = fold_run_event(&state2, &e, cloud_runtime::now_unix());
+            emit_state(&app2, &snap);
+        },
+    )
+    .await;
+
+    set_tray_state(app, tray_state_for_summary(&summary));
+    match summary {
+        Ok(s) => {
+            if let Some((title, body)) = summary_notification(&s) {
+                notify(app, title, &body);
+            }
         }
         Err(e) => {
-            set_tray_state(app, "error");
             notify(app, "GPBeam error", &e.to_string());
         }
     }
@@ -309,6 +395,9 @@ pub fn run() {
     // managed AppCtx (and its AppState/CloudRuntime) up front.
     let dest = dest_root();
     let cfg = load_or_default_config(&dest);
+    // Captured for the setup() closure's wired-ingest spawn gate (Task 6.4). A
+    // copied bool avoids moving `cfg` (still needed below to build the AppCtx).
+    let wired_ingest = wired_ingest_enabled(&cfg);
     let cfg_path = config_path(std::env::var("GPBEAM_CONFIG").ok(), &dest);
     let led_path = ledger_path(&dest);
 
@@ -371,7 +460,7 @@ pub fn run() {
             commands::complete_wizard,
             commands::quit,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
@@ -442,6 +531,35 @@ pub fn run() {
                     .await;
                 }
             });
+
+            // M4: USB-wired GoPro detector. Gated by `wired_ingest` (default true);
+            // when off, this is never spawned and behavior is byte-for-byte M1–M3.
+            // On each CameraFound we run the async wired offload ON the tokio runtime
+            // (NOT spawn_blocking — it is async HTTP I/O), folding every RunEvent into
+            // the shared AppState + emitting "gpbeam://state" exactly like the SD path.
+            // Cloud jobs it enqueues are drained by the M2 cloud loop below, unchanged.
+            if wired_ingest {
+                let handle = app.handle().clone();
+                let state = app.state::<AppCtx>().state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    // The Open GoPro HTTP server handles ONE client at a time, so the poller
+                    // must NOT probe the camera while an offload is downloading from it. We
+                    // pause the poller for the duration of each offload (exclusive access).
+                    let paused = Arc::new(AtomicBool::new(false));
+                    tauri::async_runtime::spawn(gpbeam_core::wired::detect::poll_for_camera(
+                        tx,
+                        paused.clone(),
+                    ));
+                    while let Some(found) = rx.recv().await {
+                        // One camera at a time (design §5): each detection runs to completion
+                        // before the next is handled. Pause probing so the offload owns the camera.
+                        paused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        run_wired_offload_for_camera(&handle, &state, found.ip).await;
+                        paused.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
 
             // M3: one long-lived cloud-mirror loop. It self-guards each tick via
             // `should_drain`, so with no [cloud] table (or mirror_mode = Off) it is
@@ -658,5 +776,78 @@ mod tests {
         );
         let rt = ctx.runtime.lock().unwrap();
         assert!(rt.config.is_none());
+    }
+
+    #[test]
+    fn wired_ingest_enabled_follows_config_flag() {
+        // Default config: wired_ingest defaults to true (Phase 5), so the poller spawns.
+        let mut cfg = Config::new(std::path::PathBuf::from("/tmp/gpbeam-test-dest"));
+        assert!(
+            wired_ingest_enabled(&cfg),
+            "default config enables wired ingest"
+        );
+        // Explicitly disabled -> the poller is NOT spawned (byte-for-byte M1–M3).
+        cfg.wired_ingest = false;
+        assert!(
+            !wired_ingest_enabled(&cfg),
+            "wired_ingest=false suppresses the camera poller"
+        );
+    }
+
+    #[test]
+    fn summary_notification_clean_run_with_copies_announces_counts() {
+        use gpbeam_core::orchestrator::RunSummary;
+        let s = RunSummary { copied: 3, skipped: 1, failed: 0, bytes: 4096, queued: 2 };
+        let (title, body) = summary_notification(&s).expect("clean copy toast");
+        assert_eq!(title, "GPBeam");
+        assert_eq!(body, "Copied 3 file(s), 1 skipped");
+    }
+
+    #[test]
+    fn summary_notification_nothing_copied_is_silent() {
+        use gpbeam_core::orchestrator::RunSummary;
+        // A no-op run (nothing new) must not raise a toast.
+        let s = RunSummary { copied: 0, skipped: 5, failed: 0, bytes: 0, queued: 0 };
+        assert!(summary_notification(&s).is_none());
+    }
+
+    #[test]
+    fn summary_notification_failures_announce_failure_count() {
+        use gpbeam_core::orchestrator::RunSummary;
+        let s = RunSummary { copied: 2, skipped: 0, failed: 1, bytes: 20, queued: 0 };
+        let (title, body) = summary_notification(&s).expect("failure toast");
+        assert_eq!(title, "GPBeam");
+        assert_eq!(body, "1 file(s) failed to copy");
+    }
+
+    #[test]
+    fn tray_state_for_summary_maps_results_to_icon() {
+        use gpbeam_core::error::CoreError;
+        use gpbeam_core::orchestrator::RunSummary;
+        let clean = Ok(RunSummary { copied: 1, skipped: 0, failed: 0, bytes: 1, queued: 0 });
+        assert_eq!(tray_state_for_summary(&clean), "idle");
+        let with_failures = Ok(RunSummary { copied: 0, skipped: 0, failed: 2, bytes: 0, queued: 0 });
+        assert_eq!(tray_state_for_summary(&with_failures), "error");
+        let hard_err: Result<RunSummary, CoreError> = Err(CoreError::Config("boom".into()));
+        assert_eq!(tray_state_for_summary(&hard_err), "error");
+    }
+
+    #[test]
+    fn run_wired_offload_for_camera_signature_is_pinned() {
+        // Compile-time pin: existence + exact signature of the async wired driver.
+        // The poller loop in setup() calls it as
+        //   run_wired_offload_for_camera(&handle, &state, ip).await
+        // The returned future borrows `app`/`state`, so the boxed future's lifetime
+        // is tied to the inputs (`'a`); it MUST be `Send` so the setup() spawn (which
+        // requires `Future + Send`) compiles.
+        fn pin_check<'a>(
+            h: &'a tauri::AppHandle,
+            s: &'a std::sync::Arc<std::sync::Mutex<crate::app_state::AppState>>,
+            ip: std::net::IpAddr,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(run_wired_offload_for_camera(h, s, ip))
+        }
+        let _f = pin_check; // silence unused; this is a type-level assertion only.
+        let _ = _f;
     }
 }

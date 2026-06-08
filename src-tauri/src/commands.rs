@@ -539,6 +539,7 @@ mod tests {
             space_headroom: 0,
             delete_after_verify: false,
             auto_eject: false,
+            wired_ingest: true,
             cloud: None,
         }
     }

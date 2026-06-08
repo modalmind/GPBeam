@@ -80,6 +80,13 @@
     </label>
   </Field>
 
+  <Field label="USB GoPro" help="Automatically offload a GoPro connected over USB (Open GoPro API).">
+    <label class="check">
+      <input type="checkbox" aria-label="Offload a USB-connected GoPro" bind:checked={view.wiredIngest} />
+      Offload a USB-connected GoPro
+    </label>
+  </Field>
+
   <Field label="Low-disk headroom (GiB)" htmlFor="headroom"
     help="Refuse to start a run unless this much free space remains on the destination.">
     <input

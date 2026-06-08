@@ -6,7 +6,7 @@ describe("defaultConfigView", () => {
   it("mirrors the Rust M1 defaults with the given destination", () => {
     const v = defaultConfigView("/Users/me/GPBeam");
     expect(v.destRoot).toBe("/Users/me/GPBeam");
-    expect(v.filenameTemplate).toBe("{date}/{name}");
+    expect(v.filenameTemplate).toBe("{date}_{original}");
     expect(v.includeProxies).toBe(false);
     expect(v.includeThumbnails).toBe(false);
     expect(v.verify).toBe(true);
@@ -14,6 +14,11 @@ describe("defaultConfigView", () => {
     expect(v.deleteAfterVerify).toBe(false);
     expect(v.autoEject).toBe(false);
     expect(v.cloud).toBeNull();
+  });
+
+  it("defaults wiredIngest to true (USB GoPro offload on)", () => {
+    const v = defaultConfigView("/Users/me/GPBeam");
+    expect(v.wiredIngest).toBe(true);
   });
 
   it("returns a fresh object each call (no shared mutation)", () => {
