@@ -496,6 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_and_post_completion_ticks_are_idempotent() {
+        // Both the throttle's 100% tick and the loop's explicit post-completion
+        // Progress carry copied == file size. Under the cumulative reducer the second
+        // one is an idempotent assignment, NOT a second add — bytes_done stays == size.
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 500 }, 0);
+        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 500 }, 0); // throttle terminal tick
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 500 }, 0); // post-completion emit
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 500, "idempotent, not 1000");
+        s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().completed_bytes, 500);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 500);
+    }
+
+    #[test]
     fn second_file_progress_adds_to_completed_base() {
         let mut s = AppState::default();
         s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, 0);
