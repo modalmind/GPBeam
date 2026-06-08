@@ -11,6 +11,7 @@ use crate::gopro::classify;
 use crate::ledger::Ledger;
 use crate::naming::{render_name, resolve_collision};
 use crate::orchestrator::{RunEvent, RunSummary};
+use crate::progress::ProgressThrottle;
 use crate::transfer::commit_imported;
 use crate::wired::client::{GoProClient, RemoteMedia};
 use std::collections::HashSet;
@@ -108,11 +109,23 @@ pub async fn run_wired_offload(
     for (i, p) in plan.iter().enumerate() {
         emit(RunEvent::Copying { file: p.media.name.clone(), index: i + 1, total });
         let part = part_path(&p.dest_path);
-        // download_resumable streams + hashes on disk and resumes from any existing `.part`.
-        // No-op progress: emit one Progress per file after it completes (emitting live would
-        // require re-borrowing `emit`, which this per-file loop already holds — same tradeoff
-        // the filesystem orchestrator makes).
-        match client.download_resumable(&p.media, &part, &mut |_| {}).await {
+        // Forward live, throttled progress. download_resumable calls back with the
+        // cumulative on-disk byte count per chunk; ProgressThrottle gates that to ~one
+        // Progress per integer-percent (plus a guaranteed terminal tick) so the GUI
+        // snapshot channel isn't flooded on multi-GB clips. `copied` is the current
+        // file's cumulative count — the reducer adds it to its completed-files base.
+        let expected = p.media.size;
+        let name = p.media.name.clone();
+        let mut throttle = ProgressThrottle::new(expected);
+        let outcome = {
+            let mut on_progress = |cum: u64| {
+                if throttle.should_emit(cum) {
+                    emit(RunEvent::Progress { file: name.clone(), copied: cum, total: expected });
+                }
+            };
+            client.download_resumable(&p.media, &part, &mut on_progress).await
+        };
+        match outcome {
             Ok((nbytes, hash)) => {
                 if nbytes != p.media.size {
                     failed += 1;
@@ -373,6 +386,32 @@ mod tests {
         run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
         assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
         // `server` drop verifies the `.expect(1)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn emits_live_progress_during_download() {
+        // Regression guard: the per-file loop must FORWARD download_resumable's
+        // cumulative progress (not pass a no-op). The throttle always fires the
+        // terminal tick and the loop also emits a post-completion Progress, so a
+        // single file yields >= 2 Progress events; the old no-op path emitted one.
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+
+        let copied_seq: Vec<u64> = events.iter().filter_map(|e| match e {
+            RunEvent::Progress { copied, .. } => Some(*copied),
+            _ => None,
+        }).collect();
+        assert!(copied_seq.len() >= 2, "expected live + post-completion Progress, got {copied_seq:?}");
+        assert!(copied_seq.iter().all(|c| *c <= 4096), "cumulative within file size: {copied_seq:?}");
+        assert!(copied_seq.contains(&4096), "a Progress reaches the file size");
+        assert!(copied_seq.windows(2).all(|w| w[0] <= w[1]), "cumulative copied is monotonic: {copied_seq:?}");
     }
 
     #[tokio::test]
