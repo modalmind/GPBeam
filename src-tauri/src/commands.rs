@@ -611,6 +611,7 @@ mod tests {
             auto_eject: false,
             wired_ingest: true,
             cloud: None,
+            plaintext_credential_ids: Vec::new(),
         }
     }
 
