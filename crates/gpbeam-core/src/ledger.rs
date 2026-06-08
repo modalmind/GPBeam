@@ -130,6 +130,26 @@ impl Ledger {
                  PRAGMA user_version = 2;",
             )?;
         }
+        if version < 3 {
+            // Additive v3 migration (M4 deferred delete-after-verify): a per-file
+            // marker that the camera original may be deleted once its cloud upload
+            // reaches Done. Reaped on the next wired connect (see wired/offload.rs).
+            conn.execute_batch(
+                "CREATE TABLE camera_delete_pending (
+                     id            INTEGER PRIMARY KEY,
+                     camera_serial TEXT NOT NULL,
+                     dir           TEXT NOT NULL,
+                     name          TEXT NOT NULL,
+                     imported_id   INTEGER NOT NULL,
+                     deleted       INTEGER NOT NULL DEFAULT 0,
+                     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY (imported_id) REFERENCES imported(id)
+                 );
+                 CREATE INDEX idx_cam_del_pending
+                     ON camera_delete_pending(camera_serial, deleted);
+                 PRAGMA user_version = 3;",
+            )?;
+        }
         Ok(Ledger { conn })
     }
 
@@ -510,17 +530,28 @@ mod tests {
     }
 
     #[test]
-    fn fresh_in_memory_ledger_is_v2() {
+    fn fresh_in_memory_ledger_is_v3() {
         let l = mem();
-        assert_eq!(user_version(&l), 2);
+        assert_eq!(user_version(&l), 3);
     }
 
     #[test]
-    fn fresh_file_ledger_is_v2() {
+    fn fresh_file_ledger_is_v3() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.db");
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 2);
+        assert_eq!(user_version(&l), 3);
+    }
+
+    #[test]
+    fn v3_creates_camera_delete_pending_table() {
+        let l = mem();
+        // The table exists and is queryable.
+        let n: i64 = l
+            .conn
+            .query_row("SELECT COUNT(*) FROM camera_delete_pending", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -554,9 +585,9 @@ mod tests {
             .unwrap();
         }
 
-        // Re-open through Ledger -> should migrate to v2 in place.
+        // Re-open through Ledger -> should migrate to latest (v3) in place.
         let l = Ledger::open(&path).unwrap();
-        assert_eq!(user_version(&l), 2);
+        assert_eq!(user_version(&l), 3);
 
         // The pre-existing v1 row is still there and still dedup-detectable.
         assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
