@@ -36,6 +36,15 @@ mod keyring_store;
 
 mod app_state;
 
+/// Lock a `Mutex`, recovering the guard even if a previous holder panicked while
+/// holding it (L2). `AppState`/`CloudRuntime` are plain snapshots, so the
+/// post-panic data is still structurally valid; bricking every command AND the
+/// cloud loop permanently on one stray panic (the old `.expect(...)` behavior)
+/// is strictly worse than proceeding with recovered state.
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Swap the tray icon for the current state ("idle" | "working" | "error").
 fn set_tray_state(app: &AppHandle, state: &str) {
     let bytes: &[u8] = match state {
@@ -108,7 +117,7 @@ fn forward_cloud_event(app: &AppHandle, ev: CloudEvent) {
 /// the offload->state mapping is unit-testable; the caller emits the returned
 /// snapshot on `"gpbeam://state"`.
 fn fold_run_event(state: &Arc<Mutex<AppState>>, ev: &Ev, now_unix: i64) -> AppState {
-    let mut st = state.lock().expect("AppState mutex poisoned");
+    let mut st = lock_recover(state);
     st.apply_run_event(ev, now_unix);
     st.clone()
 }
@@ -116,7 +125,7 @@ fn fold_run_event(state: &Arc<Mutex<AppState>>, ev: &Ev, now_unix: i64) -> AppSt
 /// Lock the shared `AppState`, fold one `CloudEvent` into it, and return a clone of
 /// the resulting snapshot for emission. Pure; the caller emits it.
 fn fold_cloud_event(state: &Arc<Mutex<AppState>>, ev: &CloudEvent) -> AppState {
-    let mut st = state.lock().expect("AppState mutex poisoned");
+    let mut st = lock_recover(state);
     st.apply_cloud_event(ev);
     st.clone()
 }
@@ -199,10 +208,25 @@ fn build_app_ctx(
         paused: Arc::new(AtomicBool::new(false)),
         creds: Arc::new(creds),
         runtime: Arc::new(Mutex::new(CloudRuntime::from_config(cfg))),
+        offload_lock: Arc::new(tokio::sync::Mutex::new(())),
         dest_root,
         config_path,
         ledger_path,
     }
+}
+
+/// Startup crash recovery + pending count for the cold-window seed. Opens the
+/// ledger, resets any job orphaned in `Uploading` by a prior crash back to
+/// `Queued` (H1), then returns the pending count. A missing/unopenable ledger
+/// (fresh install) yields 0. Kept separate from `seed_cloud_state` so the
+/// recovery is unit-testable without a Tauri runtime.
+fn recover_and_count_pending(ledger_path: &Path) -> usize {
+    let mut ledger = match Ledger::open(ledger_path) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    let _ = ledger.reclaim_orphaned_uploading();
+    ledger.pending_cloud_count().unwrap_or(0)
 }
 
 /// Seed a fresh `AppState.cloud` from the loaded config + the ledger's pending
@@ -238,7 +262,7 @@ fn spawn_cloud_loop(app: &AppHandle) {
 
             let ctx = app.state::<AppCtx>();
             let paused = ctx.paused.load(std::sync::atomic::Ordering::SeqCst);
-            let runtime = ctx.runtime.lock().expect("CloudRuntime mutex poisoned").clone();
+            let runtime = lock_recover(&ctx.runtime).clone();
 
             if !cloud_runtime::should_drain(paused, &runtime) {
                 continue;
@@ -247,6 +271,20 @@ fn spawn_cloud_loop(app: &AppHandle) {
                 Some(c) => c,
                 None => continue,
             };
+
+            // L4: skip the (TLS-handshaking) uploader build on idle ticks. With
+            // Auto mirror enabled but an empty queue this loop fires every 5s, so
+            // a cheap pending-count check avoids rebuilding a reqwest Client for
+            // nothing. Fail OPEN: if the count can't be read, fall through and let
+            // the worker (which re-checks + reclaims orphans) make the decision.
+            let has_work = Ledger::open(&ctx.ledger_path)
+                .ok()
+                .and_then(|l| l.pending_cloud_count().ok())
+                .map(|n| n > 0)
+                .unwrap_or(true);
+            if !has_work {
+                continue;
+            }
 
             // Build the uploader through the keychain-backed credential store.
             let uploader = match build_uploader(&cloud, ctx.creds.as_ref()) {
@@ -293,6 +331,11 @@ fn handle_mount(app: &AppHandle, state: &Arc<Mutex<AppState>>, mount: PathBuf) {
     if !gpbeam_core::gopro::is_gopro_card(&mount) {
         return;
     }
+    // M6: serialize against the wired path (and any other SD mount) sharing this
+    // dest_root/ledger. handle_mount runs on a spawn_blocking thread, so a
+    // blocking acquire is correct here; the guard is held across the offload.
+    let ctx = app.state::<AppCtx>();
+    let _offload_guard = ctx.offload_lock.blocking_lock();
     let dest = dest_root();
     if let Err(e) = std::fs::create_dir_all(&dest) {
         notify(app, "GPBeam error", &format!("cannot create destination: {e}"));
@@ -343,6 +386,11 @@ async fn run_wired_offload_for_camera(
     state: &Arc<Mutex<AppState>>,
     ip: std::net::IpAddr,
 ) {
+    // M6: serialize against the SD path (handle_mount) sharing this dest_root/
+    // ledger. This future is async, so an awaited acquire keeps it Send; the
+    // guard is held across the whole wired offload.
+    let ctx = app.state::<AppCtx>();
+    let _offload_guard = ctx.offload_lock.lock().await;
     let dest = dest_root();
     if let Err(e) = std::fs::create_dir_all(&dest) {
         notify(app, "GPBeam error", &format!("cannot create destination: {e}"));
@@ -419,12 +467,11 @@ pub fn run() {
     );
 
     // Seed AppState.cloud from config + ledger pending count for a cold window.
+    // recover_and_count_pending also reclaims any job orphaned in Uploading by a
+    // prior crash (H1) before the count is read.
     {
-        let pending = Ledger::open(&led_path)
-            .ok()
-            .and_then(|l| l.pending_cloud_count().ok())
-            .unwrap_or(0);
-        let mut st = ctx.state.lock().expect("AppState mutex poisoned");
+        let pending = recover_and_count_pending(&led_path);
+        let mut st = lock_recover(&ctx.state);
         seed_cloud_state(&mut st, &cfg, pending);
     }
 
@@ -624,6 +671,23 @@ mod tests {
     }
 
     #[test]
+    fn lock_recover_yields_guard_after_poison() {
+        // L2: a panic while holding the lock poisons it; lock_recover must still
+        // hand back the (intact) data instead of propagating the poison, so one
+        // stray panic can't permanently brick the cloud loop and all commands.
+        let m = std::sync::Arc::new(std::sync::Mutex::new(7i32));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex is poisoned after the panic");
+        let g = lock_recover(&m);
+        assert_eq!(*g, 7, "data is recovered intact");
+    }
+
+    #[test]
     fn build_app_ctx_seeds_runtime_from_cloud_config() {
         let cfg = cfg_with_cloud();
         let backend = Arc::new(MemoryKeyring::new());
@@ -728,6 +792,41 @@ mod tests {
         assert!(snap.cloud.uploading.is_none());
         assert_eq!(snap.cloud.failed, 1);
         assert!(snap.message.is_some());
+    }
+
+    #[test]
+    fn recover_and_count_pending_reclaims_orphaned_uploading() {
+        // H1 startup recovery: any job left in Uploading by a prior crash must be
+        // reset to Queued before the cold-window pending count is read, so it is
+        // re-drained (not silently stalled) and the UI shows it as pending.
+        use gpbeam_core::ledger::JobState;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let mut l = Ledger::open(&path).unwrap();
+            let imp = l.record("C", "f.MP4", 1, 1, "/d/f", None).unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/d/f", "r", 1, None).unwrap();
+            l.claim_due_cloud_jobs(0, 10).unwrap(); // -> Uploading, then "crash"
+            assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 1);
+        }
+
+        let pending = recover_and_count_pending(&path);
+        assert_eq!(pending, 1, "the reclaimed job counts as pending");
+
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(
+            l.list_cloud_jobs(Some(JobState::Queued)).unwrap().len(),
+            1,
+            "orphaned Uploading was reset to Queued at startup"
+        );
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn recover_and_count_pending_is_zero_for_missing_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        // No ledger file written: a fresh install has nothing pending.
+        assert_eq!(recover_and_count_pending(&dir.path().join("absent.sqlite")), 0);
     }
 
     #[test]

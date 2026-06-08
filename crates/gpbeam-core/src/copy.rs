@@ -6,6 +6,26 @@ use tempfile::NamedTempFile;
 #[derive(Debug, Clone)]
 pub struct CopyOutcome { pub dest: PathBuf, pub bytes: u64, pub hash: Option<String> }
 
+/// Re-read the quiescent file at `path` from disk and confirm its BLAKE3 matches
+/// `expected_hex`. A no-op when `verify` is false. On mismatch the file is
+/// removed and [`CoreError::VerifyFailed`] is returned. Shared by the SD copy
+/// (`copy_verified`) and the wired download (`wired::offload`) so the "verify"
+/// contract — *the bytes intended are the bytes durably written* — is honored
+/// identically on every ingest path (finding H2).
+pub fn verify_dest_hash(path: &Path, expected_hex: &str, verify: bool) -> Result<()> {
+    if !verify {
+        return Ok(());
+    }
+    let mut dh = blake3::Hasher::new();
+    dh.update_mmap_rayon(path).map_err(io_at(path))?;
+    let got = dh.finalize().to_hex().to_string();
+    if got != expected_hex {
+        let _ = std::fs::remove_file(path);
+        return Err(CoreError::VerifyFailed(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 /// Copy `src` to `final_path` atomically. The temp file is created on the
 /// destination volume so `persist()` is an intra-fs rename (never EXDEV).
 /// When `verify` is true, the BLAKE3 hash is computed inline during the copy
@@ -44,14 +64,9 @@ pub fn copy_verified(
     persisted.sync_all().map_err(io_at(final_path))?;
 
     if let Some(ref expected) = src_hash {
-        // Re-hash the quiescent destination (local disk read, fast).
-        let mut dh = blake3::Hasher::new();
-        dh.update_mmap_rayon(final_path).map_err(io_at(final_path))?;
-        let got = dh.finalize().to_hex().to_string();
-        if &got != expected {
-            let _ = std::fs::remove_file(final_path);
-            return Err(CoreError::VerifyFailed(final_path.to_path_buf()));
-        }
+        // Re-hash the quiescent destination (local disk read, fast) via the
+        // shared helper the wired path also uses.
+        verify_dest_hash(final_path, expected, true)?;
     }
 
     Ok(CopyOutcome { dest: final_path.to_path_buf(), bytes: copied, hash: src_hash })
@@ -62,6 +77,38 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn verify_dest_hash_passes_on_match_and_keeps_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.MP4");
+        fs::write(&path, b"gopro bytes on disk").unwrap();
+        let expected = blake3::hash(b"gopro bytes on disk").to_hex().to_string();
+        verify_dest_hash(&path, &expected, true).expect("matching hash verifies");
+        assert!(path.exists(), "a verified file is kept");
+    }
+
+    #[test]
+    fn verify_dest_hash_removes_file_and_errors_on_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.MP4");
+        fs::write(&path, b"what actually landed").unwrap();
+        let wrong = blake3::hash(b"what we expected").to_hex().to_string();
+        let err = verify_dest_hash(&path, &wrong, true).unwrap_err();
+        assert!(matches!(err, CoreError::VerifyFailed(_)), "got {err:?}");
+        assert!(!path.exists(), "a corrupt file is removed, not left half-verified");
+    }
+
+    #[test]
+    fn verify_dest_hash_is_a_noop_when_verify_disabled() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.MP4");
+        fs::write(&path, b"unchecked").unwrap();
+        // Even a deliberately-wrong hash passes when verify is off, and the
+        // file is untouched.
+        verify_dest_hash(&path, "deadbeef", false).expect("disabled verify never fails");
+        assert!(path.exists());
+    }
 
     #[test]
     fn copies_bytes_and_verifies() {

@@ -99,21 +99,63 @@ fn parse_mirror_mode(s: &str) -> Result<MirrorMode, String> {
     }
 }
 
-/// True if `url` is a syntactically acceptable Nextcloud base URL: an
-/// `http://` or `https://` scheme followed by a non-empty host. Kept
-/// dependency-light (no `url` crate) — full WebDAV validation happens when the
-/// uploader actually connects.
+/// True if `url` is an acceptable Nextcloud base URL: `https://` with a
+/// non-empty host (any host), or `http://` **only** for a loopback host. Plain
+/// http to a remote host would send the app password and all uploaded footage
+/// in cleartext (the uploader uses HTTP Basic auth), so it is rejected here
+/// (finding M3). Kept dependency-light (no `url` crate) — full WebDAV validation
+/// happens when the uploader actually connects.
 fn is_valid_base_url(url: &str) -> bool {
-    let rest = match url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    {
-        Some(r) => r,
-        None => return false,
+    let (rest, is_https) = if let Some(r) = url.strip_prefix("https://") {
+        (r, true)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, false)
+    } else {
+        return false;
     };
-    // Host is everything up to the first '/'; it must be non-empty.
-    let host = rest.split('/').next().unwrap_or("");
-    !host.trim().is_empty()
+    // Authority is everything up to the first '/'; it must be non-empty.
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.trim().is_empty() {
+        return false;
+    }
+    is_https || is_loopback_host(authority)
+}
+
+/// True for a loopback authority — `localhost`, `127.0.0.1`, or `::1` — with or
+/// without a `[...]` IPv6 wrapper and/or a trailing `:port`.
+fn is_loopback_host(authority: &str) -> bool {
+    // Strip any `userinfo@` prefix first: the real host is after the last '@'.
+    // Otherwise `http://[::1]@evil.com` would parse as loopback but actually
+    // connect to evil.com in cleartext (an M3 bypass).
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        // Bracketed IPv6: `[host]` optionally followed by `:port`. A missing
+        // closing bracket, or any junk after `]` other than a numeric port,
+        // is malformed and rejected (e.g. `[::1]extra` must not pass).
+        let (ipv6, suffix) = match after_bracket.split_once(']') {
+            Some(parts) => parts,
+            None => return false,
+        };
+        let suffix_ok = suffix.is_empty()
+            || (suffix.starts_with(':') && suffix[1..].chars().all(|c| c.is_ascii_digit()));
+        if !suffix_ok {
+            return false;
+        }
+        ipv6
+    } else {
+        // `host` / `host:port` -> strip a single trailing numeric port. A bare
+        // IPv6 like `::1` has multiple colons and no port, so only strip when
+        // the part before the last colon is itself colon-free.
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    // Hostnames are case-insensitive (RFC 1035/1123); IPv6 hex is too.
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 /// Validate a `ConfigView` from the UI. Returns `Ok(())` when the view can be
@@ -137,7 +179,8 @@ pub fn validate_view(view: &ConfigView) -> Result<(), String> {
         }
         if !is_valid_base_url(&cloud.base_url) {
             return Err(format!(
-                "cloud base url {:?} must start with http:// or https:// and include a host",
+                "cloud base url {:?} must be https:// with a host (http:// is allowed only \
+                 for loopback hosts like localhost/127.0.0.1)",
                 cloud.base_url
             ));
         }
@@ -219,6 +262,16 @@ pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
         toml::to_string(cfg).map_err(|e| format!("serialize config: {e}"))?;
 
     if let Some(creds) = extract_credentials_table(path) {
+        // M2: a plaintext [credentials] table on disk is a liability — it can be
+        // replicated off-box when dest_root is a synced/removable volume, and is
+        // readable by other users without the 0600 hardening below. Preserve it
+        // (don't silently drop a hand-managed fallback) but warn so the user can
+        // migrate it into the OS keychain via "Set Nextcloud credentials".
+        eprintln!(
+            "gpbeam: warning: {} contains a plaintext [credentials] table; consider \
+             migrating it into the OS keychain and deleting it from the file",
+            path.display()
+        );
         if !body.ends_with('\n') {
             body.push('\n');
         }
@@ -250,6 +303,16 @@ pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
             .map_err(|e| format!("write {}: {e}", part.display()))?;
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", part.display()))?;
+    }
+
+    // M2: tighten to owner-only (0600) BEFORE the rename, so a secret-bearing
+    // config is never even briefly group/world-readable. Unix only — on Windows
+    // the file inherits the user-profile ACL (no octal-mode equivalent).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("set 0600 on {}: {e}", part.display()))?;
     }
 
     // Atomic replace. On failure, best-effort remove the temp file so we never
@@ -425,6 +488,71 @@ mod tests {
     }
 
     #[test]
+    fn base_url_https_accepts_any_host() {
+        assert!(is_valid_base_url("https://cloud.example.com"));
+        assert!(is_valid_base_url("https://192.168.1.10:8443/nextcloud"));
+    }
+
+    #[test]
+    fn base_url_http_allowed_only_for_loopback() {
+        // M3: plain http:// sends the app password + footage in cleartext, so it
+        // is permitted only for loopback hosts (a self-hosted instance on the
+        // same machine); every other host must use https://.
+        assert!(is_valid_base_url("http://localhost:8080"));
+        assert!(is_valid_base_url("http://127.0.0.1"));
+        assert!(is_valid_base_url("http://[::1]:8080/nextcloud"));
+        assert!(!is_valid_base_url("http://cloud.example.com"));
+        assert!(!is_valid_base_url("http://192.168.1.10"));
+        assert!(!is_valid_base_url("http://192.168.1.10:8080"));
+    }
+
+    #[test]
+    fn http_loopback_is_case_insensitive() {
+        // Hostnames are case-insensitive (RFC 1035/1123); a local Nextcloud at
+        // http://LOCALHOST must validate.
+        assert!(is_valid_base_url("http://LOCALHOST:8080"));
+        assert!(is_valid_base_url("http://LocalHost"));
+    }
+
+    #[test]
+    fn malformed_ipv6_authority_is_rejected() {
+        // Only `[ipv6]` optionally followed by `:port` is a loopback; junk after
+        // the bracket (or a missing closing bracket) must be rejected.
+        assert!(!is_valid_base_url("http://[::1]extra:8080"));
+        assert!(!is_valid_base_url("http://[::1"));
+    }
+
+    #[test]
+    fn http_userinfo_cannot_spoof_loopback() {
+        // M3 hardening: `userinfo@host` must not let a remote host masquerade as
+        // loopback — the real host is after the last '@'. Without stripping it,
+        // `http://[::1]@evil.com` would connect to evil.com in cleartext.
+        assert!(!is_valid_base_url("http://[::1]@evil.com"));
+        assert!(!is_valid_base_url("http://127.0.0.1@evil.com"));
+        assert!(!is_valid_base_url("http://localhost@evil.com"));
+        // A genuine loopback host with userinfo is still allowed.
+        assert!(is_valid_base_url("http://user@127.0.0.1"));
+    }
+
+    #[test]
+    fn validate_view_rejects_http_non_loopback() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.base_url = "http://cloud.example.com".into();
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_err());
+    }
+
+    #[test]
+    fn validate_view_accepts_http_loopback() {
+        let mut v = base_view();
+        let mut c = cloud_view();
+        c.base_url = "http://localhost:8080".into();
+        v.cloud = Some(c);
+        assert!(validate_view(&v).is_ok());
+    }
+
+    #[test]
     fn validate_view_rejects_non_http_base_url() {
         let mut v = base_view();
         let mut c = cloud_view();
@@ -537,6 +665,21 @@ mod tests {
         assert_eq!(lc.destination_id, "nc1");
         assert_eq!(lc.base_url, "https://cloud.example.com");
         assert_eq!(lc.mirror_mode, MirrorMode::Auto);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_sets_owner_only_permissions() {
+        // M2: gpbeam.toml may carry a plaintext [credentials] fallback and often
+        // lives under a user media folder, so it must be owner-only (0600), not
+        // the default 0644 a fresh File::create would leave on a multi-user box.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        let cfg = Config::new(dir.path().join("dest"));
+        write_config_atomic(&path, &cfg).expect("write ok");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config must be owner-only, got {mode:o}");
     }
 
     #[test]

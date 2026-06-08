@@ -137,6 +137,20 @@ pub async fn run_wired_offload(
                     continue;
                 }
                 std::fs::rename(&part, &p.dest_path).map_err(io_at(&p.dest_path))?;
+
+                // H2: re-read the persisted file and confirm it matches the
+                // streamed BLAKE3, exactly like the SD path's copy_verified. This
+                // honors cfg.verify (previously dead code on the wired path) and,
+                // on a storage write/flush mismatch, removes the file instead of
+                // recording a corrupt copy. The camera-delete below is gated on a
+                // successful copy, so a failed verify can never erase the only
+                // other copy (see M4).
+                if let Err(e) = crate::copy::verify_dest_hash(&p.dest_path, &hash, cfg.verify) {
+                    failed += 1;
+                    emit(RunEvent::Failed { file: p.media.name.clone(), error: e.to_string() });
+                    continue;
+                }
+
                 bytes += nbytes;
                 copied += 1;
                 emit(RunEvent::Progress { file: p.media.name.clone(), copied: nbytes, total: nbytes });
@@ -153,8 +167,17 @@ pub async fn run_wired_offload(
                     emit(RunEvent::CloudQueued { file: p.media.name.clone() });
                 }
 
-                // delete-after-verify (opt-in): delete from the camera inline.
-                if cfg.delete_after_verify {
+                // delete-after-verify (opt-in): delete from the camera inline,
+                // but only when the mirror mode does NOT defer deletion to the
+                // cloud (M4). Under Auto the SD path defers the card delete until
+                // the upload reaches Done — the wired worker can't do that (it
+                // uploads the LOCAL copy and can't reach the camera), so deferral
+                // is impossible. Keeping the camera original is the safe choice:
+                // never erase the only other copy before the cloud confirms it.
+                // Manual/Off still delete inline after the now-real verify (H2).
+                if cfg.delete_after_verify
+                    && crate::orchestrator::should_delete_card(true, mirror)
+                {
                     match client.delete(&p.media).await {
                         Ok(()) => emit(RunEvent::CardFileDeleted { file: p.media.name.clone() }),
                         Err(e) => emit(RunEvent::Failed {
@@ -386,6 +409,58 @@ mod tests {
         run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
         assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
         // `server` drop verifies the `.expect(1)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn delete_after_verify_skips_camera_delete_under_auto_mirror() {
+        // M4: under Auto mirror the wired worker uploads the LOCAL copy and
+        // cannot reach the camera to defer the delete, so the camera original
+        // must be KEPT — never erased before the cloud confirms it. The delete
+        // endpoint must not be hit; the file is still queued for mirroring.
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let mut cfg = cloud_cfg(dest.path().to_path_buf(), MirrorMode::Auto);
+        cfg.delete_after_verify = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        let s = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!(s.copied, 1);
+        assert_eq!(s.queued, 1, "still enqueued for the cloud mirror");
+        assert!(
+            !events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })),
+            "no camera delete under Auto+wired"
+        );
+        // `server` drop verifies the `.expect(0)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn delete_after_verify_deletes_under_manual_mirror() {
+        // Contrast to Auto: under Manual mirror there is no deferral expectation,
+        // so the inline camera delete still happens after the (now real) verify.
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let mut cfg = cloud_cfg(dest.path().to_path_buf(), MirrorMode::Manual);
+        cfg.delete_after_verify = true;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri());
+
+        let mut events = Vec::new();
+        run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
     }
 
     #[tokio::test]

@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+/// Backstop sleep for the (post-H1, effectively unreachable) degenerate drain
+/// state where jobs are pending but none are claimable and no retry is
+/// scheduled. Bounds CPU so a future regression can never hot-spin.
+const IDLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Drives the persisted `cloud_jobs` queue: claims due jobs, uploads each via
 /// the injected `CloudUploader`, and records terminal state. Opens its OWN
 /// `Ledger` at `ledger_path` per call so network I/O never holds the DB lock.
@@ -101,14 +106,25 @@ impl CloudWorker {
 
                 // Persist progress as bytes arrive so an interrupted upload can
                 // resume — keep the deterministic upload_id so it survives restarts.
+                // L4: open the progress ledger ONCE per task here, not on every
+                // callback (which fired a fresh SQLite connection per persisted
+                // chunk on the hot path).
                 let progress_upload_id = upload_id.clone();
+                let mut progress_ledger = Ledger::open(&progress_ledger_path).ok();
                 let mut on_progress = |uploaded: u64| {
-                    if let Ok(mut l) = Ledger::open(&progress_ledger_path) {
+                    if let Some(l) = progress_ledger.as_mut() {
                         let state = ResumeState {
                             upload_id: Some(progress_upload_id.clone()),
                             uploaded_bytes: uploaded,
                         };
-                        let _ = l.save_job_progress(job_id, uploaded, &state);
+                        // L5: surface a systematically failing progress write
+                        // instead of dropping it silently (a lost resume
+                        // checkpoint under contention is otherwise invisible).
+                        if let Err(e) = l.save_job_progress(job_id, uploaded, &state) {
+                            eprintln!(
+                                "gpbeam: failed to persist upload progress for job {job_id}: {e}"
+                            );
+                        }
                     }
                 };
 
@@ -121,6 +137,13 @@ impl CloudWorker {
         }
 
         let mut terminal = 0usize;
+        // L4: one ledger connection for every terminal update this pass, instead
+        // of reopening SQLite per finished job. rusqlite's Connection is Send (so
+        // holding it across join_next().await keeps this spawned future Send) but
+        // !Sync — fine here: it never leaves this task, and the spawned upload
+        // tasks persist progress through their OWN connections, with WAL +
+        // busy_timeout serializing the concurrent writers.
+        let mut ledger = Ledger::open(&self.ledger_path)?;
         while let Some(joined) = set.join_next().await {
             // A spawned task panicking is a bug; surface it.
             let JobResult { job, result } = joined.expect("upload task panicked");
@@ -129,7 +152,6 @@ impl CloudWorker {
             // upload). Mark it Done + Mirrored without emitting an Uploading
             // event, then move on.
             if matches!(result, Ok(None)) {
-                let mut ledger = Ledger::open(&self.ledger_path)?;
                 ledger.mark_job_done(job.id)?;
                 ledger.set_cloud_status(job.imported_id, "done")?;
                 emit(CloudEvent::Mirrored { file: job.remote_path.clone() });
@@ -145,7 +167,6 @@ impl CloudWorker {
 
             match result {
                 Ok(outcome) => {
-                    let mut ledger = Ledger::open(&self.ledger_path)?;
                     // Record full byte count on success, then mark Done. A
                     // verified upload means the whole file landed; persist the
                     // deterministic upload_id so a later resume can reuse it.
@@ -185,7 +206,6 @@ impl CloudWorker {
                     // exhaustion check and the backoff schedule.
                     let attempt_num = job.attempts.saturating_add(1);
                     let err_text = e.to_string();
-                    let mut ledger = Ledger::open(&self.ledger_path)?;
                     if is_retryable(&e) && attempt_num < self.max_attempts {
                         // Reschedule: park in Failed with a future next_retry_at.
                         let delay = backoff_delay(attempt_num, crate::backoff::jitter_ms());
@@ -219,6 +239,21 @@ impl CloudWorker {
         &self,
         emit: &mut (dyn FnMut(CloudEvent) + Send),
     ) -> Result<()> {
+        // H1 crash recovery: reset any job left stuck in `Uploading` by a prior
+        // crash/force-quit back to `Queued` before draining. Exactly one worker
+        // runs at a time and a healthy pass always leaves jobs terminal, so any
+        // `Uploading` row seen here is orphaned; without this it is never
+        // reclaimed (claim only takes Queued/due-Failed) AND `pending_cloud_count`
+        // would keep the loop alive on an unclaimable job — a silent stall.
+        {
+            let mut ledger = Ledger::open(&self.ledger_path)?;
+            let reclaimed = ledger.reclaim_orphaned_uploading()?;
+            if reclaimed > 0 {
+                eprintln!(
+                    "gpbeam: reclaimed {reclaimed} orphaned cloud upload(s) after a restart"
+                );
+            }
+        }
         loop {
             // Are there any jobs left to do (Queued or retry-due/parked Failed)?
             let pending = {
@@ -240,9 +275,20 @@ impl CloudWorker {
                 if let Some(secs) = sleep_secs {
                     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 } else {
-                    // Pending but nothing due and no retry time known: yield once,
-                    // then re-check. Prevents a hot loop in degenerate states.
-                    tokio::task::yield_now().await;
+                    // Degenerate: pending > 0 but nothing is claimable and no
+                    // retry time is known. After the reclaim above this is
+                    // unreachable under correct code, so reaching it points at a
+                    // claim/pending-count regression — log it instead of failing
+                    // silently. NEVER hot-spin (the old `yield_now` looped tight,
+                    // pegging a core + churning SQLite): sleep briefly and hand
+                    // back to the 5s drain ticker.
+                    eprintln!(
+                        "gpbeam: WARNING: cloud drain idling with {pending} pending but \
+                         unclaimable job(s) and no scheduled retry — possible \
+                         claim_due_cloud_jobs/pending_cloud_count regression"
+                    );
+                    tokio::time::sleep(IDLE_BACKSTOP).await;
+                    return Ok(());
                 }
             }
         }
@@ -728,6 +774,41 @@ mod tests {
             resume.uploaded_bytes, 2048,
             "the persisted uploaded_bytes is carried into the upload"
         );
+    }
+
+    #[tokio::test]
+    async fn run_until_drained_reclaims_orphaned_uploading_then_uploads() {
+        // H1: a job stuck in Uploading by a crash must be reclaimed at the top
+        // of a drain and actually uploaded — never left as a silent stall + a
+        // CPU busy-spin (pending counts Uploading, but claim never picks it up).
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            l.claim_due_cloud_jobs(0, 10).unwrap(); // -> Uploading, then "crash"
+            assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 1);
+        }
+
+        let uploader = Arc::new(MockUploader::ok(4096));
+        let worker =
+            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+
+        // Bound it: a regression to the busy-spin would hang here instead of
+        // returning, so the timeout converts that into a clean failure.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            worker.run_until_drained(&mut |_| {}),
+        )
+        .await;
+        assert!(res.is_ok(), "run_until_drained must not spin on an orphaned Uploading job");
+        res.unwrap().unwrap();
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0, "orphaned job drained");
+        let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].id, job_id);
+        assert_eq!(uploader.call_count(), 1, "the reclaimed job was actually uploaded");
     }
 
     #[tokio::test]
