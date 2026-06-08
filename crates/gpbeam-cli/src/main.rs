@@ -25,9 +25,12 @@ async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (after_config, config) = split_config(&raw);
     let (args, flags) = gpbeam_cli::parse_safety_flags(&after_config);
-    let usage = "usage: gpbeam-cli [--config <path>] [--delete-after-verify] [--auto-eject] offload <card> <dest> | watch <dest> | mirror <dest> | mirror-status <dest> | retry-cloud <dest>";
+    let usage = "usage: gpbeam-cli [--version] [--config <path>] [--delete-after-verify] [--auto-eject] offload <card> <dest> | watch <dest> | mirror <dest> | mirror-status <dest> | retry-cloud <dest>";
 
     match args.first().map(|s| s.as_str()) {
+        Some("--version") | Some("-V") => {
+            println!("{}", gpbeam_cli::version_line());
+        }
         Some("offload") => {
             let (Some(card), Some(dest)) = (args.get(1), args.get(2)) else {
                 eprintln!("{usage}");

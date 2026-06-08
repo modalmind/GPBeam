@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "gpbeam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpbeam-core",
  "keyring",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "gpbeam-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpbeam-core",
  "reqwest",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "gpbeam-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",

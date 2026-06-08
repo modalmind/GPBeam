@@ -11,7 +11,6 @@
   import AboutTab from './tabs/AboutTab.svelte';
 
   export let configPath = 'gpbeam.toml';
-  export let version = '0.3.0';
 
   type TabId = 'destination' | 'behavior' | 'cloud' | 'history' | 'advanced' | 'about';
   const TABS: { id: TabId; label: string }[] = [
@@ -86,7 +85,7 @@
       {:else if active === 'cloud'}<CloudTab {view} />
       {:else if active === 'history'}<HistoryTab />
       {:else if active === 'advanced'}<AdvancedTab {configPath} destRoot={view.destRoot} />
-      {:else if active === 'about'}<AboutTab {version} />
+      {:else if active === 'about'}<AboutTab />
       {/if}
     {:else}
       <p class="muted">Loading…</p>
