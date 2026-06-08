@@ -1,5 +1,17 @@
 <script lang="ts">
-  export let version: string;
+  import { onMount } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
+
+  // Live app version from the Tauri bundle — single source of truth (the Rust
+  // crate version, inherited from the Cargo workspace). No hardcoded fallback.
+  let version = '';
+  onMount(async () => {
+    try {
+      version = await getVersion();
+    } catch {
+      version = 'unknown';
+    }
+  });
 </script>
 
 <section>

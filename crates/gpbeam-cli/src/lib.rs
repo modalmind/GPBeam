@@ -19,6 +19,12 @@ pub fn ledger_path_for(dest: &Path) -> PathBuf {
     dest.join(".gpbeam-ledger.sqlite")
 }
 
+/// The `--version` line for the CLI: `gpbeam-cli <semver>`, where the version is
+/// the crate's `CARGO_PKG_VERSION` (inherited from the Cargo workspace version).
+pub fn version_line() -> String {
+    format!("gpbeam-cli {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Format a sync-offload `RunEvent` as one human-readable line. `Progress` is
 /// suppressed (returns `None`) to keep the stream readable.
 pub fn format_run_event(e: &RunEvent) -> Option<String> {
