@@ -166,10 +166,12 @@ pub fn get_config(ctx: State<'_, AppCtx>) -> Result<ConfigView, String> {
             // Honor the destination the wizard/Settings wrote into the config. An
             // explicit GPBEAM_DEST env still wins (power-user override, captured in
             // ctx.dest_root); a config with no dest_root falls back to the default.
-            let env_dest = std::env::var("GPBEAM_DEST").ok().filter(|s| !s.is_empty());
-            if env_dest.is_some() || c.dest_root.as_os_str().is_empty() {
-                c.dest_root = ctx.dest_root.clone();
-            }
+            let env_override = std::env::var("GPBEAM_DEST")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let resolved = resolve_dest_root(&c.dest_root, &ctx.dest_root, env_override);
+            c.dest_root = resolved;
             c
         }
         Err(_) => gpbeam_core::config::Config::new(ctx.dest_root.clone()),
@@ -313,6 +315,33 @@ pub async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Resolve which destination to reveal/use. The configured `dest_root` (from
+/// `gpbeam.toml`) wins, EXCEPT when an explicit `GPBEAM_DEST` override is set or
+/// the config carries no `dest_root` — then the bootstrap default applies. Same
+/// precedence as `get_config`, so "Open destination" reveals the exact folder
+/// offloads write to (not the config/bootstrap directory).
+fn resolve_dest_root(config_dest: &Path, default_dest: &Path, env_override: bool) -> PathBuf {
+    if env_override || config_dest.as_os_str().is_empty() {
+        default_dest.to_path_buf()
+    } else {
+        config_dest.to_path_buf()
+    }
+}
+
+/// The destination root offloads write to: the configured `dest_root` from
+/// `gpbeam.toml`, resolved via [`resolve_dest_root`]. Falls back to the bootstrap
+/// default when no/invalid config exists yet.
+fn configured_dest_root(ctx: &AppCtx) -> PathBuf {
+    let env_override = std::env::var("GPBEAM_DEST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    match load_config(&ctx.config_path) {
+        Ok(cfg) => resolve_dest_root(&cfg.dest_root, &ctx.dest_root, env_override),
+        Err(_) => ctx.dest_root.clone(),
+    }
+}
+
 /// Open a path with the OS default handler (e.g. the destination folder in the
 /// file manager). `None` for `with` lets the OS pick the default application.
 #[tauri::command]
@@ -321,11 +350,11 @@ pub fn open_path(
     ctx: tauri::State<'_, AppCtx>,
     path: String,
 ) -> Result<(), String> {
-    // Empty path = the popover's "Open destination" action: resolve the configured
-    // destination root (creating it if absent, so a brand-new install can still
-    // reveal the folder before the first offload has run).
+    // Empty path = the popover's "Open destination" action: resolve the CONFIGURED
+    // destination root from gpbeam.toml (creating it if absent, so a brand-new
+    // install can still reveal the folder before the first offload has run).
     let target = if path.is_empty() {
-        let dest = ctx.dest_root.clone();
+        let dest = configured_dest_root(&ctx);
         let _ = std::fs::create_dir_all(&dest);
         dest.to_string_lossy().into_owned()
     } else {
@@ -524,6 +553,41 @@ mod tests {
         // No ledger file -> nothing read; the in-memory count is preserved.
         assert_eq!(cloud.pending, 7);
         assert!(cloud.configured);
+    }
+
+    #[test]
+    fn resolve_dest_root_prefers_configured_dest() {
+        // The folder offloads actually write to (gpbeam.toml's dest_root) wins —
+        // this is what "Open destination" must reveal.
+        let r = resolve_dest_root(
+            std::path::Path::new("/Volumes/videos/GoPro"),
+            std::path::Path::new("/home/u/GPBeam"),
+            false,
+        );
+        assert_eq!(r, std::path::PathBuf::from("/Volumes/videos/GoPro"));
+    }
+
+    #[test]
+    fn resolve_dest_root_falls_back_when_config_dest_empty() {
+        // No dest_root in the config -> bootstrap default.
+        let r = resolve_dest_root(
+            std::path::Path::new(""),
+            std::path::Path::new("/home/u/GPBeam"),
+            false,
+        );
+        assert_eq!(r, std::path::PathBuf::from("/home/u/GPBeam"));
+    }
+
+    #[test]
+    fn resolve_dest_root_env_override_uses_default() {
+        // An explicit GPBEAM_DEST override (captured in the bootstrap default) beats
+        // the configured dest_root.
+        let r = resolve_dest_root(
+            std::path::Path::new("/Volumes/videos/GoPro"),
+            std::path::Path::new("/env/override"),
+            true,
+        );
+        assert_eq!(r, std::path::PathBuf::from("/env/override"));
     }
 
     use crate::cloud_runtime::CloudRuntime;
