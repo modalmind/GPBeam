@@ -292,7 +292,14 @@ impl Ledger {
     /// `next_retry_at <= now_unix` (a NULL retry time is never reclaimed).
     /// Claimed rows are flipped to Uploading and returned.
     pub fn claim_due_cloud_jobs(&mut self, now_unix: i64, limit: usize) -> Result<Vec<CloudJob>> {
-        let tx = self.conn.transaction()?;
+        // Immediate (not the Deferred default): take the write lock at BEGIN so
+        // two concurrent drainers can never both pass the initial `SELECT` of
+        // eligible ids before either flips them to Uploading (finding M5). The
+        // claim is SELECT -> UPDATE -> re-SELECT; under Deferred a second claimer
+        // racing on a stale WAL snapshot would error or double-claim.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // 1. Pick eligible ids deterministically (oldest first).
         let ids: Vec<i64> = {
@@ -396,6 +403,22 @@ impl Ledger {
              SET state=?1, attempts=0, next_retry_at=NULL, last_error=NULL
              WHERE state=?2 AND next_retry_at IS NULL",
             rusqlite::params![JobState::Queued.as_str(), JobState::Failed.as_str()],
+        )?;
+        Ok(n)
+    }
+
+    /// Reclaim cloud jobs left stuck in `Uploading` by a crash/force-quit
+    /// (finding H1). Exactly one cloud worker runs at a time, and a healthy
+    /// worker always transitions a claimed job to a terminal state before
+    /// returning — so any `Uploading` row observed at process start (or at the
+    /// top of a drain) is definitionally orphaned and would otherwise never be
+    /// reclaimed (`claim_due_cloud_jobs` only selects `queued`/due-`failed`).
+    /// Reset them to `Queued` (preserving `attempts`/`last_error` history) so
+    /// the next claim picks them up. Returns how many were reclaimed.
+    pub fn reclaim_orphaned_uploading(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE cloud_jobs SET state=?1 WHERE state=?2",
+            rusqlite::params![JobState::Queued.as_str(), JobState::Uploading.as_str()],
         )?;
         Ok(n)
     }
@@ -568,6 +591,23 @@ mod tests {
         assert!(!l.is_imported(serial, "GX010001.MP4", 4096, 1000).unwrap());
         l.record(serial, "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", Some("deadbeef")).unwrap();
         assert!(l.is_imported(serial, "GX010001.MP4", 4096, 1000).unwrap());
+    }
+
+    #[test]
+    fn unknown_serial_files_collide_across_cameras() {
+        // L1: a camera whose serial can't be read uses the literal "unknown" as
+        // its dedup serial. Two DIFFERENT serial-less cameras with an identical
+        // (name, size, second-mtime) file therefore share one key — the second
+        // is treated as already-imported and skipped. Pinned so a future
+        // multi-camera discriminator is a conscious behavior change, not a
+        // regression (see orchestrator's serial_key fallback).
+        let mut l = mem();
+        l.record("unknown", "GX010001.MP4", 4096, 1000, "/destA/GX010001.MP4", None)
+            .unwrap();
+        assert!(
+            l.is_imported("unknown", "GX010001.MP4", 4096, 1000).unwrap(),
+            "a second serial-less camera's identical file is (mis)treated as a dup"
+        );
     }
 
     #[test]
@@ -850,6 +890,125 @@ mod tests {
         assert_eq!(jobs[0].id, job_id);
         assert_eq!(jobs[0].uploaded_bytes, 1500);
         assert_eq!(jobs[0].resume_state.as_ref(), Some(&rs));
+    }
+
+    #[test]
+    fn reclaim_orphaned_uploading_resets_uploading_to_queued() {
+        // A crash mid-upload leaves a job stuck in Uploading: claim moved it
+        // there, but the process died before mark_job_done/failed. Startup
+        // recovery must reset it to Queued so a future claim can pick it up
+        // (otherwise it is silently never mirrored — finding H1).
+        let mut l = mem();
+        let (_imp, job_id) = enqueue_sample(&mut l);
+        l.claim_due_cloud_jobs(0, 10).unwrap();
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 1);
+
+        let n = l.reclaim_orphaned_uploading().unwrap();
+        assert_eq!(n, 1, "the one orphaned Uploading row is reclaimed");
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 0);
+        let queued = l.list_cloud_jobs(Some(JobState::Queued)).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, job_id);
+        // It is claimable again after the reclaim.
+        assert_eq!(l.claim_due_cloud_jobs(0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reclaim_orphaned_uploading_only_touches_uploading_rows() {
+        // Reclaim must leave Queued, Done, and Failed rows untouched — only
+        // Uploading is definitionally orphaned at process start.
+        let mut l = mem();
+        let mk = |l: &mut Ledger, name: &str, mt: i64, state: &str| -> i64 {
+            let imp = l.record("C346", name, 1, mt, "/d", None).unwrap();
+            let j = l.enqueue_cloud_job(imp, "nc1", "/d", name, 1, None).unwrap();
+            l.conn
+                .execute(
+                    "UPDATE cloud_jobs SET state=?2 WHERE id=?1",
+                    rusqlite::params![j, state],
+                )
+                .unwrap();
+            j
+        };
+        mk(&mut l, "q.MP4", 1, "queued");
+        let u = mk(&mut l, "u.MP4", 2, "uploading");
+        let d = mk(&mut l, "d.MP4", 3, "done");
+        let f = mk(&mut l, "f.MP4", 4, "failed");
+
+        let n = l.reclaim_orphaned_uploading().unwrap();
+        assert_eq!(n, 1, "only the single Uploading row is reclaimed");
+
+        let state_of = |l: &Ledger, id: i64| -> String {
+            l.conn
+                .query_row(
+                    "SELECT state FROM cloud_jobs WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(state_of(&l, u), "queued", "uploading -> queued");
+        assert_eq!(state_of(&l, d), "done", "done untouched");
+        assert_eq!(state_of(&l, f), "failed", "failed untouched");
+    }
+
+    #[test]
+    fn reclaim_orphaned_uploading_is_zero_on_a_clean_queue() {
+        let mut l = mem();
+        enqueue_sample(&mut l); // a Queued job, nothing Uploading
+        assert_eq!(l.reclaim_orphaned_uploading().unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_claims_never_double_claim_the_same_job() {
+        // M5: claim must acquire the write lock up front (Immediate), so two
+        // concurrent drainers never both observe the same Queued row before
+        // either flips it to Uploading. With a Deferred transaction the racing
+        // UPDATE on a stale WAL snapshot errors (or double-claims); Immediate
+        // serializes cleanly.
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let mut l = Ledger::open(&path).unwrap();
+            for i in 0..60 {
+                let imp = l
+                    .record("C346", &format!("f{i}.MP4"), 1, i, "/d", None)
+                    .unwrap();
+                l.enqueue_cloud_job(imp, "nc1", "/d", &format!("r{i}"), 1, None)
+                    .unwrap();
+            }
+        }
+
+        let path = Arc::new(path);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let p = Arc::clone(&path);
+            handles.push(thread::spawn(move || {
+                let mut claimed = Vec::new();
+                loop {
+                    let mut l = Ledger::open(&p).unwrap();
+                    let jobs = l.claim_due_cloud_jobs(0, 3).unwrap();
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    for j in jobs {
+                        claimed.push(j.id);
+                    }
+                }
+                claimed
+            }));
+        }
+
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        let unique: HashSet<i64> = all.iter().copied().collect();
+        assert_eq!(all.len(), unique.len(), "no job claimed twice: {all:?}");
+        assert_eq!(unique.len(), 60, "every job claimed exactly once");
     }
 
     #[test]

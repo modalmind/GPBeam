@@ -136,18 +136,28 @@ pub(crate) fn parse_chunk_listing(xml: &str) -> std::collections::HashMap<u32, u
 
 /// Lowercase-hex md5 of a file's contents, for the `OC-Checksum` metadata header.
 ///
-/// First consumed by `send_put`/`put_simple`; wired into the public `upload`
-/// dispatcher in Task 2.9, so `allow(dead_code)` keeps the incremental build
-/// warning-clean until then.
-#[allow(dead_code)]
+/// Streams the file in bounded chunks rather than reading it whole — the
+/// chunked-upload path (M1) computes this over multi-GB GoPro clips, which must
+/// not be slurped into memory.
 pub(crate) fn md5_hex_of(path: &Path) -> Result<String> {
     use md5::{Digest, Md5};
-    let bytes = std::fs::read(path).map_err(|e| CoreError::Io {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| CoreError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
     let mut hasher = Md5::new();
-    hasher.update(&bytes);
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| CoreError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -255,6 +265,16 @@ pub struct NextcloudUploader {
     pub(crate) app_password: String,
     pub(crate) remote_root: String,
     pub(crate) chunk_threshold: u64,
+}
+
+impl Drop for NextcloudUploader {
+    fn drop(&mut self) {
+        // L3: wipe the long-lived app-password copy from memory on drop. (The
+        // field stays a plain String so the six `basic_auth` call sites are
+        // unchanged; reqwest's Client holds no other copy of it.)
+        use zeroize::Zeroize;
+        self.app_password.zeroize();
+    }
 }
 
 impl NextcloudUploader {
@@ -619,6 +639,19 @@ impl NextcloudUploader {
             .basic_auth(&self.username, Some(&self.app_password))
             .header("Destination", dest)
             .header("OC-Total-Length", total.to_string());
+        // M1: attach the whole-file md5 so Nextcloud verifies the reassembled
+        // chunks, matching the integrity guarantee the simple PUT gives small
+        // files. BEST-EFFORT: the chunks already live server-side, so if the
+        // local copy is no longer readable at assembly time (e.g. a resume where
+        // every chunk was uploaded in a prior session and the dest volume has
+        // since been unmounted), assemble WITHOUT the checksum rather than
+        // failing an otherwise-complete upload — OC-Total-Length still guards size.
+        match md5_hex_of(local) {
+            Ok(md5) => req = req.header("OC-Checksum", format!("md5:{md5}")),
+            Err(e) => eprintln!(
+                "gpbeam: assembling {dest} without OC-Checksum (local file unreadable: {e})"
+            ),
+        }
         if let Some(m) = mtime_secs(local) {
             req = req.header("X-OC-Mtime", m.to_string());
         }
@@ -1018,6 +1051,114 @@ mod tests {
             1,
             "Destination+OC-Total-Length asserted on a chunk PUT"
         );
+    }
+
+    #[tokio::test]
+    async fn put_chunked_move_carries_oc_checksum() {
+        // M1: the assembling MOVE must carry `OC-Checksum: md5:<hex>` of the whole
+        // file so Nextcloud verifies the reassembled chunks. Previously only the
+        // simple/small-file PUT sent a checksum, so the LARGEST files (the ones
+        // that cross chunk_threshold) got the LEAST verification.
+        let server = MockServer::start().await;
+        let total: u64 = 12 * 1024 * 1024; // 3 chunks @ 5 MiB
+        let f = tmp_file(&vec![7u8; total as usize]);
+        let expected_md5 = super::md5_hex_of(f.path()).unwrap();
+
+        Mock::given(wm_method("MKCOL"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        // The MOVE only matches if it carries the exact OC-Checksum; otherwise
+        // there is no mock and move_assemble sees a 404 -> the call errors.
+        Mock::given(wm_method("MOVE"))
+            .and(header("OC-Checksum", format!("md5:{expected_md5}").as_str()))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"e\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let mut cb = |_n: u64| {};
+        let out = up
+            .put_chunked(f.path(), "GoPro/big.mp4", total, None, &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.etag.as_deref(), Some("\"e\""));
+    }
+
+    #[test]
+    fn md5_hex_of_matches_known_digest() {
+        // Guards the streaming refactor of md5_hex_of (memory-bounded read for
+        // multi-GB clips) against a regression in the digest value.
+        let f = tmp_file(b"abc");
+        assert_eq!(
+            super::md5_hex_of(f.path()).unwrap(),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_chunked_assembles_without_checksum_when_local_unreadable() {
+        // M1 robustness: if every chunk was already uploaded in a prior session
+        // and the local file is no longer readable at assembly time, the MOVE
+        // must still assemble (the chunks live server-side) — WITHOUT OC-Checksum
+        // — rather than fail a complete upload with an Io error.
+        struct NoChecksum;
+        impl wiremock::Match for NoChecksum {
+            fn matches(&self, req: &wiremock::Request) -> bool {
+                req.headers.get("oc-checksum").is_none()
+            }
+        }
+
+        let server = MockServer::start().await;
+        let total: u64 = 10 * 1024 * 1024; // 2 chunks @ 5 MiB
+        let chunk = 5u64 * 1024 * 1024;
+        let listing = format!(
+            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/remote.php/dav/uploads/alice/gpbeam-resume-2/00001</d:href>
+    <d:propstat><d:prop><d:getcontentlength>{chunk}</d:getcontentlength></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/remote.php/dav/uploads/alice/gpbeam-resume-2/00002</d:href>
+    <d:propstat><d:prop><d:getcontentlength>{chunk}</d:getcontentlength></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#
+        );
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-2"))
+            .respond_with(ResponseTemplate::new(207).set_body_raw(listing, "application/xml"))
+            .mount(&server)
+            .await;
+        // Nothing left to PUT.
+        Mock::given(wm_method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // The MOVE must arrive WITHOUT an OC-Checksum (the local file is gone).
+        Mock::given(wm_method("MOVE"))
+            .and(NoChecksum)
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"e\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let missing = std::path::Path::new("/nonexistent/gpbeam/gone.mp4");
+        let resume = ResumeState {
+            upload_id: Some("gpbeam-resume-2".into()),
+            uploaded_bytes: total,
+        };
+        let mut cb = |_n: u64| {};
+        let out = up
+            .put_chunked(missing, "GoPro/big.mp4", total, Some(resume), &mut cb)
+            .await
+            .unwrap();
+        assert_eq!(out.etag.as_deref(), Some("\"e\""));
     }
 
     #[tokio::test]

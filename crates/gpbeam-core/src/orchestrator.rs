@@ -110,6 +110,13 @@ pub fn run_offload_with_ejector(
         return Err(CoreError::InsufficientSpace { need: needed, have });
     }
 
+    // L1: when `version.txt` has no serial, the dedup key degrades to the
+    // literal "unknown". Two DIFFERENT serial-less cameras with a same-named,
+    // same-sized, same-second-mtime file then collide on this key, so the
+    // second mount's file is treated as already-imported and silently skipped.
+    // Very low probability today (one camera at a time); a future multi-camera
+    // discriminator (content/inode, or refusing to dedupe under "unknown")
+    // should be a conscious behavior change, not an accident. See [`Ledger`].
     let serial_key = serial.as_deref().unwrap_or("unknown");
     let total = plan.len();
     let mut copied = 0usize;

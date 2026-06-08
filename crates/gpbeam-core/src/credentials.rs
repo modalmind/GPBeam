@@ -3,7 +3,11 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 /// A resolved credential for a cloud destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `ZeroizeOnDrop` wipes the `app_password` (and `username`) bytes from memory
+/// when the `Secret` is dropped, so a resolved credential does not linger in a
+/// heap buffer after use (finding L3, defense-in-depth against memory dumps).
+#[derive(Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
 pub struct Secret {
     pub username: String,
     pub app_password: String,
@@ -120,6 +124,15 @@ mod tests {
         username = "bob"
         app_password = "file-pw-bbbb"
     "#;
+
+    #[test]
+    fn secret_zeroizes_on_drop() {
+        // L3: the resolved credential must wipe its app_password from memory on
+        // drop. Compile-time assertion that the ZeroizeOnDrop derive is present
+        // (removing it breaks this test's bound).
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<Secret>();
+    }
 
     #[test]
     fn known_id_returns_file_secret() {

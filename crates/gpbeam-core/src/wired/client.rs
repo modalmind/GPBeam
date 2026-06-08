@@ -170,7 +170,7 @@ impl GoProClient {
         progress: &mut (dyn FnMut(u64) + Send),
     ) -> Result<(u64, String)> {
         // Bytes already on disk -> the Range start offset.
-        let already = match std::fs::metadata(part_path) {
+        let mut already = match std::fs::metadata(part_path) {
             Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => {
@@ -180,6 +180,15 @@ impl GoProClient {
                 })
             }
         };
+
+        // M7: a `.part` longer than the advertised size is stale/corrupt (a
+        // leftover from different content, or a truncation artifact). Discard it
+        // and restart from scratch, so the Range start never points past the end
+        // of the remote file — `Range: bytes=<too-big>-` is answered with 416.
+        if already > m.size {
+            let _ = std::fs::remove_file(part_path);
+            already = 0;
+        }
 
         let url = self.media_url(m);
         let mut resp = self
@@ -655,6 +664,56 @@ mod tests {
         assert_eq!(hash, blake3_hex(&full), "hash is over the FULL reassembled file");
         assert_eq!(last, full.len() as u64);
         assert_eq!(std::fs::read(&part).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn download_resumable_discards_oversized_part() {
+        // M7: a .part longer than the advertised media size is stale/corrupt and
+        // must be discarded + re-fetched fresh (Range: bytes=0-), never resumed
+        // with a Range start past the end of the file (a 416 trap).
+        let server = MockServer::start().await;
+        let full = b"0123456789ABCDEFGHIJ".to_vec(); // 20 bytes
+
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .and(RangeFrom { from: 0 })
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(full.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Guard: a resume from the oversized length (30) must NOT happen.
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .and(RangeFrom { from: 30 })
+            .respond_with(ResponseTemplate::new(416))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri());
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: full.len() as u64, // 20
+            captured_unix: 1780515910,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        // Pre-create an oversized .part (30 bytes > media.size 20).
+        {
+            let mut f = std::fs::File::create(&part).unwrap();
+            f.write_all(&[1u8; 30]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut last = 0u64;
+        let mut cb = |n: u64| last = n;
+        let (total, hash) = c.download_resumable(&m, &part, &mut cb).await.unwrap();
+
+        assert_eq!(total, full.len() as u64);
+        assert_eq!(hash, blake3_hex(&full), "hash is over the freshly downloaded file");
+        assert_eq!(last, full.len() as u64);
+        assert_eq!(std::fs::read(&part).unwrap(), full, "oversized .part was replaced");
     }
 
     #[tokio::test]

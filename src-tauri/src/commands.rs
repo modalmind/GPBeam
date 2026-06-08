@@ -26,6 +26,12 @@ pub struct AppCtx {
     /// Mutable cloud settings the tick loop reads each pass; `save_config`
     /// swaps `runtime.config` so the next tick uses the new settings.
     pub runtime: Arc<Mutex<CloudRuntime>>,
+    /// Serializes the two ingest paths (SD `handle_mount` + wired
+    /// `run_wired_offload_for_camera`) against the shared `dest_root`/ledger, so
+    /// a card that is reachable as BOTH a mount and a USB camera can't have both
+    /// offloads plan + copy the same files concurrently (M6). A unit `Mutex`; the
+    /// guard is held across the whole offload.
+    pub offload_lock: Arc<tokio::sync::Mutex<()>>,
     /// Resolved offload destination root (`$GPBEAM_DEST`, else `~/GPBeam`).
     pub dest_root: PathBuf,
     /// Resolved `gpbeam.toml` path for atomic writes.
@@ -150,7 +156,7 @@ fn apply_saved_config(
 /// so the popover is accurate after an app restart (design §7).
 #[tauri::command]
 pub fn get_state(ctx: State<'_, AppCtx>) -> AppState {
-    let mut state = ctx.state.lock().expect("AppState mutex poisoned").clone();
+    let mut state = crate::lock_recover(&ctx.state).clone();
     seed_pending_from_ledger(&ctx.ledger_path, &mut state.cloud);
     state
 }
@@ -212,8 +218,8 @@ pub fn save_config(
     view: ConfigView,
 ) -> Result<AppState, String> {
     let updated = {
-        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
-        let mut runtime = ctx.runtime.lock().expect("CloudRuntime mutex poisoned");
+        let mut state = crate::lock_recover(&ctx.state);
+        let mut runtime = crate::lock_recover(&ctx.runtime);
         apply_saved_config(&view, &ctx.config_path, &ctx.ledger_path, &mut state, &mut runtime)?;
         state.clone()
     };
@@ -260,7 +266,7 @@ pub fn clear_nextcloud_credentials(
 pub fn pause_cloud(app: tauri::AppHandle, ctx: State<'_, AppCtx>) -> Result<AppState, String> {
     ctx.paused.store(true, Ordering::SeqCst);
     let updated = {
-        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
+        let mut state = crate::lock_recover(&ctx.state);
         state.cloud.paused = true;
         state.clone()
     };
@@ -273,7 +279,7 @@ pub fn pause_cloud(app: tauri::AppHandle, ctx: State<'_, AppCtx>) -> Result<AppS
 pub fn resume_cloud(app: tauri::AppHandle, ctx: State<'_, AppCtx>) -> Result<AppState, String> {
     ctx.paused.store(false, Ordering::SeqCst);
     let updated = {
-        let mut state = ctx.state.lock().expect("AppState mutex poisoned");
+        let mut state = crate::lock_recover(&ctx.state);
         state.cloud.paused = false;
         state.clone()
     };

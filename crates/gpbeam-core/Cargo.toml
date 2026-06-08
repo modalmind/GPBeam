@@ -26,6 +26,7 @@ hex = "0.4"
 quick-xml = "0.37"
 tokio-util = { version = "0.7", features = ["io"] }
 if-addrs = "0.13"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
