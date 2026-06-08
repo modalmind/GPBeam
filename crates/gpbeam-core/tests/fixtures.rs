@@ -38,6 +38,18 @@ pub fn hero11_card() -> Card {
     card
 }
 
+/// A minimal HERO11 card with a single MP4 clip of `mp4_bytes` bytes — used to
+/// exercise multi-chunk streaming progress (copy_verified reads in 1 MiB chunks).
+pub fn card_with_one_clip(mp4_bytes: usize) -> Card {
+    let card = Card { dir: TempDir::new().unwrap() };
+    card.write_file("DCIM/100GOPRO/GX010001.MP4", mp4_bytes, 1);
+    let version = "{\n\"info version\":\"2.0\",\n\"firmware version\":\"H22.01.02.32.00\",\n\"wifi mac\":\"aabbccddeeff\",\n\"camera type\":\"HERO11 Black\",\n\"camera serial number\":\"C3461324500001\",\n}";
+    let misc = card.root().join("MISC");
+    fs::create_dir_all(&misc).unwrap();
+    fs::write(misc.join("version.txt"), version).unwrap();
+    card
+}
+
 /// A non-GoPro removable volume (no DCIM/NNNGOPRO).
 pub fn not_a_gopro() -> Card {
     let card = Card { dir: TempDir::new().unwrap() };

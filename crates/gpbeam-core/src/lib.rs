@@ -10,6 +10,7 @@ pub mod cloud;
 pub mod scanner;
 pub mod detect;
 pub mod orchestrator;
+pub mod progress;
 pub mod transfer;
 pub mod backoff;
 pub mod credentials;

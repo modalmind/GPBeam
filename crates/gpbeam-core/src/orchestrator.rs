@@ -1,6 +1,7 @@
 use crate::config::{Config, MirrorMode};
 use crate::copy::copy_verified;
 use crate::diskguard;
+use crate::progress::ProgressThrottle;
 use crate::eject::{default_ejector, Ejector};
 use crate::error::{CoreError, Result};
 use crate::gopro::{is_gopro_card, model_family, read_version};
@@ -15,6 +16,8 @@ pub enum RunEvent {
     Scanned { new_files: usize, total_bytes: u64 },
     InsufficientSpace { need: u64, have: u64 },
     Copying { file: String, index: usize, total: usize },
+    /// `copied` is the CUMULATIVE bytes for the current file (not a delta); `total`
+    /// is the current file's expected size. Emitted live during a transfer.
     Progress { file: String, copied: u64, total: u64 },
     Verified { file: String },
     Skipped { file: String },
@@ -142,10 +145,23 @@ pub fn run_offload_with_ejector(
         }
 
         emit(RunEvent::Copying { file: item.name.clone(), index: i + 1, total });
-        // M1: no streaming progress from the orchestrator (the UI Channel is M3).
-        // Passing a no-op callback avoids borrowing `emit` twice. We emit one
-        // Progress event per file after it completes, then Verified.
-        match copy_verified(&item.src, &item.dest_path, cfg.verify, &mut |_| {}) {
+        // Forward live, throttled progress. copy_verified calls back with the
+        // cumulative bytes copied per 1 MiB read; ProgressThrottle gates that to ~one
+        // Progress per integer-percent (plus a guaranteed terminal tick). `copied` is
+        // the current file's cumulative count — the reducer adds it to its
+        // completed-files base. A post-completion Progress + Verified still follow.
+        let expected = item.size;
+        let name = item.name.clone();
+        let mut throttle = ProgressThrottle::new(expected);
+        let copy_result = {
+            let mut on_progress = |cum: u64| {
+                if throttle.should_emit(cum) {
+                    emit(RunEvent::Progress { file: name.clone(), copied: cum, total: expected });
+                }
+            };
+            copy_verified(&item.src, &item.dest_path, cfg.verify, &mut on_progress)
+        };
+        match copy_result {
             Ok(out) => {
                 let n = out.bytes;
                 // Shared commit: record the import + (for Auto|Manual) enqueue a
@@ -304,6 +320,31 @@ mod tests {
         let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.skipped, 4);
         assert_eq!(s2.copied, 0);
+    }
+
+    #[test]
+    fn emits_live_progress_during_copy() {
+        // Regression guard: the per-file loop must FORWARD copy_verified's cumulative
+        // progress (not pass a no-op). copy_verified reads in 1 MiB chunks, so a 5 MiB
+        // clip yields several mid-file Progress ticks (copied < size) plus a terminal
+        // one — the old no-op path emitted a single Progress at the file size.
+        let card = fixtures::card_with_one_clip(5 * 1024 * 1024);
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let mut events = Vec::new();
+        run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        let size = 5 * 1024 * 1024u64;
+        let copied_seq: Vec<u64> = events.iter().filter_map(|e| match e {
+            RunEvent::Progress { copied, .. } => Some(*copied),
+            _ => None,
+        }).collect();
+        assert!(copied_seq.len() >= 3, "expected several streaming Progress ticks, got {copied_seq:?}");
+        assert!(copied_seq.iter().any(|c| *c < size), "at least one mid-file tick (copied < size)");
+        assert!(copied_seq.contains(&size), "a Progress reaches the file size");
+        assert!(copied_seq.windows(2).all(|w| w[0] <= w[1]), "cumulative copied is monotonic: {copied_seq:?}");
     }
 
     fn cloud_cfg(dest: std::path::PathBuf, mode: crate::config::MirrorMode) -> Config {
