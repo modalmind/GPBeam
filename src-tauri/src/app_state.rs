@@ -33,6 +33,11 @@ pub struct RunProgress {
     pub bytes_total: u64,
     pub current_file: Option<String>,
     pub started_at_unix: i64,
+    /// Bytes from files already fully verified this run. The in-flight file's
+    /// `bytes_done` is `completed_bytes + <current file's cumulative bytes>`.
+    /// Internal bookkeeping — not serialized to the UI.
+    #[serde(skip)]
+    pub completed_bytes: u64,
 }
 
 /// A single cloud upload in flight.
@@ -88,6 +93,7 @@ impl RunProgress {
             bytes_total: 0,
             current_file: None,
             started_at_unix: now_unix,
+            completed_bytes: 0,
         }
     }
 
@@ -126,6 +132,7 @@ impl AppState {
                 run.bytes_total = *total_bytes;
                 run.files_done = 0;
                 run.bytes_done = 0;
+                run.completed_bytes = 0;
                 run.current_file = None;
                 run.started_at_unix = now_unix;
                 self.run = Some(run);
@@ -146,16 +153,18 @@ impl AppState {
                 run.current_file = Some(file.clone());
                 // `index` is 1-based; files fully done before this one is index-1.
                 run.files_done = index.saturating_sub(1);
+                run.bytes_done = run.completed_bytes;
                 self.status = Status::Working;
             }
             RunEvent::Progress { copied, .. } => {
                 if let Some(run) = self.run.as_mut() {
-                    run.bytes_done = run.bytes_done.saturating_add(*copied);
+                    run.bytes_done = run.completed_bytes.saturating_add(*copied);
                 }
             }
             RunEvent::Verified { .. } => {
                 if let Some(run) = self.run.as_mut() {
                     run.files_done = (run.files_done + 1).min(run.files_total);
+                    run.completed_bytes = run.bytes_done;
                 }
             }
             RunEvent::Failed { file, error } => {
@@ -249,6 +258,7 @@ mod tests {
             bytes_total: 1000,
             current_file: Some("GX010001.MP4".into()),
             started_at_unix: 1_000,
+            completed_bytes: 0,
         };
         let up = UploadProgress { file: "clip.mp4".into(), uploaded: 5, total: 10 };
         let summary = RunSummaryView { copied: 3, skipped: 1, failed: 0, bytes: 4096 };
@@ -467,6 +477,76 @@ mod tests {
     }
 
     #[test]
+    fn multiple_progress_per_file_accumulate_via_base() {
+        // Live progress sends several cumulative values for ONE file; bytes_done must
+        // track the cumulative value, NOT sum the deltas (the old additive bug).
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 1000 }, 0);
+        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
+
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 200, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 200);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 500, "cumulative, not 200+500");
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 1000, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
+
+        s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
+        assert_eq!(s.run.as_ref().unwrap().completed_bytes, 1000, "verified file rolled into base");
+    }
+
+    #[test]
+    fn second_file_progress_adds_to_completed_base() {
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, 0);
+        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 2 }, 0);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 400, total: 400 }, 0);
+        s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
+
+        // File 2 starts: bytes_done resets to the completed base (400), not 0.
+        s.apply_run_event(&RunEvent::Copying { file: "b".into(), index: 2, total: 2 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 400, "in-flight file starts from the base");
+        s.apply_run_event(&RunEvent::Progress { file: "b".into(), copied: 250, total: 600 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 650, "base 400 + current 250");
+    }
+
+    #[test]
+    fn failed_file_does_not_advance_base() {
+        // A file that streams partway then fails emits no Verified; its partial bytes
+        // must not leak into the base, so the next file starts from the real base.
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, 0);
+        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 2 }, 0);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 300, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 300);
+        // No Verified for "a" (it failed). Next file's Copying drops the partial.
+        s.apply_run_event(&RunEvent::Copying { file: "b".into(), index: 2, total: 2 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 0, "failed partial dropped");
+        assert_eq!(s.run.as_ref().unwrap().completed_bytes, 0);
+    }
+
+    #[test]
+    fn resume_first_progress_starts_mid_file() {
+        // Cross-run resume: the first cumulative value for a file is large (the .part
+        // prefix already on disk). bytes_done jumps to it, then continues.
+        let mut s = AppState::default();
+        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 1000 }, 0);
+        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 800, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 800);
+        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 1000, total: 1000 }, 0);
+        assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
+    }
+
+    #[test]
+    fn completed_bytes_is_not_serialized() {
+        let run = RunProgress { completed_bytes: 123, ..RunProgress::started(0) };
+        let v = serde_json::to_value(&run).unwrap();
+        assert!(v.get("completedBytes").is_none(), "internal base must not leak to UI");
+        assert!(v.get("completed_bytes").is_none());
+    }
+
+    #[test]
     fn skipped_and_other_noop_events_do_not_change_run() {
         let mut s = AppState::default();
         s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 20 }, 0);
@@ -572,6 +652,7 @@ mod tests {
             bytes_total,
             current_file: None,
             started_at_unix,
+            completed_bytes: 0,
         }
     }
 
@@ -620,6 +701,7 @@ mod tests {
                 bytes_total: 1000,
                 current_file: Some("GX010001.MP4".into()),
                 started_at_unix: 1_700_000_000,
+                completed_bytes: 0,
             }),
             last_run: Some(RunSummaryView { copied: 3, skipped: 1, failed: 0, bytes: 4096 }),
             cloud: CloudState {

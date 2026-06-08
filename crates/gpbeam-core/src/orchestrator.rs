@@ -15,6 +15,8 @@ pub enum RunEvent {
     Scanned { new_files: usize, total_bytes: u64 },
     InsufficientSpace { need: u64, have: u64 },
     Copying { file: String, index: usize, total: usize },
+    /// `copied` is the CUMULATIVE bytes for the current file (not a delta); `total`
+    /// is the current file's expected size. Emitted live during a transfer.
     Progress { file: String, copied: u64, total: u64 },
     Verified { file: String },
     Skipped { file: String },
