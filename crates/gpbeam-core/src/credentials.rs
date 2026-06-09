@@ -21,6 +21,11 @@ pub trait CredentialStore: Send + Sync {
 #[derive(Debug, Deserialize)]
 struct CredEntry {
     username: String,
+    // Optional so a `[credentials.<id>]` entry that keeps only the (non-secret)
+    // username after a keychain migration still parses (finding M2). A missing
+    // app_password resolves to empty, which the keychain/env password then wins
+    // over in `KeyringCredentialStore::get`.
+    #[serde(default)]
     app_password: String,
 }
 
@@ -190,6 +195,21 @@ mod tests {
     fn empty_store_no_env_returns_none() {
         let store = EnvConfigStore::empty(None, None);
         assert!(store.get("nc1").unwrap().is_none());
+    }
+
+    #[test]
+    fn entry_without_app_password_parses_with_empty_password() {
+        // After a keychain migration the file keeps only the username; that
+        // entry must still parse (M2) so resolution can supply the username.
+        let store = EnvConfigStore::from_toml_str(
+            "[credentials.nc1]\nusername = \"alice\"\n",
+            None,
+            None,
+        )
+        .unwrap();
+        let s = store.get("nc1").unwrap().expect("nc1 present");
+        assert_eq!(s.username, "alice");
+        assert_eq!(s.app_password, "");
     }
 
     #[test]

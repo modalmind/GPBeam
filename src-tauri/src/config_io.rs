@@ -278,23 +278,29 @@ pub fn plaintext_app_password(path: &Path, id: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Rewrite `path` without the `[credentials.<id>]` entry, preserving every other
-/// key and the atomic/0600 write discipline. Dropping the last entry removes the
-/// whole `[credentials]` table. A missing file is a successful no-op.
-pub fn strip_credential_entry(path: &Path, id: &str) -> Result<(), String> {
+/// Remove the plaintext `app_password` from `[credentials.<id>]`, preserving the
+/// (non-secret) `username` so credential resolution still has it after the secret
+/// moves to the keychain (finding M2). Only the password is a liability; the
+/// username is not. If removing the password leaves the entry empty (it had no
+/// username), the entry is dropped; dropping the last entry drops the whole
+/// `[credentials]` table. A missing file is a successful no-op. Preserves the
+/// atomic/0600 write discipline.
+pub fn strip_credential_password(path: &Path, id: &str) -> Result<(), String> {
     let Ok(raw) = std::fs::read_to_string(path) else { return Ok(()) };
     let mut doc: toml::Value =
         toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     if let Some(table) = doc.as_table_mut() {
-        let now_empty = if let Some(creds) =
-            table.get_mut("credentials").and_then(|c| c.as_table_mut())
-        {
-            creds.remove(id);
-            creds.is_empty()
-        } else {
-            false
-        };
-        if now_empty {
+        let mut table_empty = false;
+        if let Some(creds) = table.get_mut("credentials").and_then(|c| c.as_table_mut()) {
+            if let Some(entry) = creds.get_mut(id).and_then(|e| e.as_table_mut()) {
+                entry.remove("app_password");
+                if entry.is_empty() {
+                    creds.remove(id);
+                }
+            }
+            table_empty = creds.is_empty();
+        }
+        if table_empty {
             table.remove("credentials");
         }
     }
@@ -841,35 +847,49 @@ mod tests {
     }
 
     #[test]
-    fn strip_credential_entry_removes_only_the_named_entry() {
+    fn strip_credential_password_keeps_username_drops_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"alice\"\napp_password=\"pw1\"\n").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
+        // No longer flagged (no plaintext password) but the username is preserved.
+        assert!(plaintext_credential_ids(&path).is_empty());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("alice"), "username preserved for resolution");
+        assert!(!raw.contains("pw1"), "plaintext password removed");
+        assert!(raw.contains("dest_root"), "other config survives");
+    }
+
+    #[test]
+    fn strip_credential_password_leaves_other_entries_and_keeps_0600() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gpbeam.toml");
         std::fs::write(&path,
             "dest_root = \"/d\"\n\
              [credentials.nc1]\nusername=\"a\"\napp_password=\"pw1\"\n\
              [credentials.nc2]\nusername=\"b\"\napp_password=\"pw2\"\n").unwrap();
-        strip_credential_entry(&path, "nc1").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
         assert_eq!(plaintext_credential_ids(&path), vec!["nc2".to_string()]);
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("dest_root"), "other config survives");
-    }
-
-    #[test]
-    fn strip_last_credential_drops_table_and_keeps_0600() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gpbeam.toml");
-        std::fs::write(&path,
-            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"a\"\napp_password=\"pw\"\n").unwrap();
-        strip_credential_entry(&path, "nc1").unwrap();
-        assert!(plaintext_credential_ids(&path).is_empty());
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("credentials"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn strip_credential_password_drops_empty_entry_and_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        // An entry with only a password (no username) becomes empty -> dropped,
+        // and the now-empty [credentials] table is dropped too.
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\napp_password=\"pw\"\n").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("credentials"), "empty entry and table dropped");
     }
 
     #[test]
