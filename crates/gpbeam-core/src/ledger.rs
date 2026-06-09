@@ -59,11 +59,15 @@ pub struct CloudJob {
 }
 
 /// One due row of `camera_delete_pending` (joined to a Done cloud upload).
+/// `size`/`captured_unix` identify the exact recording so the reap never deletes
+/// a different file that happens to reuse the same on-card path (M4 safety).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraDeleteRow {
     pub id: i64,
     pub dir: String,
     pub name: String,
+    pub size: u64,
+    pub captured_unix: i64,
 }
 
 /// One row of recent-import history for the M3 History tab. Read-only view
@@ -148,6 +152,8 @@ impl Ledger {
                      camera_serial TEXT NOT NULL,
                      dir           TEXT NOT NULL,
                      name          TEXT NOT NULL,
+                     size          INTEGER NOT NULL DEFAULT 0,
+                     captured_unix INTEGER NOT NULL DEFAULT 0,
                      imported_id   INTEGER NOT NULL,
                      deleted       INTEGER NOT NULL DEFAULT 0,
                      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
@@ -236,18 +242,22 @@ impl Ledger {
     }
 
     /// Record a file to delete from the camera once its cloud upload completes.
-    /// Returns the pending-row id.
+    /// `size`/`captured_unix` pin the exact recording so a later reap can verify
+    /// the on-card path still holds the same file. Returns the pending-row id.
     pub fn enqueue_camera_delete(
         &mut self,
         camera_serial: &str,
         dir: &str,
         name: &str,
+        size: u64,
+        captured_unix: i64,
         imported_id: i64,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO camera_delete_pending (camera_serial, dir, name, imported_id)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![camera_serial, dir, name, imported_id],
+            "INSERT INTO camera_delete_pending
+             (camera_serial, dir, name, size, captured_unix, imported_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![camera_serial, dir, name, size as i64, captured_unix, imported_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -256,7 +266,7 @@ impl Ledger {
     /// `cloud_status='done'`. Rows already `deleted` are excluded.
     pub fn due_camera_deletes(&self, camera_serial: &str) -> Result<Vec<CameraDeleteRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.dir, p.name
+            "SELECT p.id, p.dir, p.name, p.size, p.captured_unix
              FROM camera_delete_pending p
              JOIN imported i ON i.id = p.imported_id
              WHERE p.deleted = 0 AND p.camera_serial = ?1 AND i.cloud_status = 'done'
@@ -264,7 +274,13 @@ impl Ledger {
         )?;
         let rows = stmt
             .query_map(rusqlite::params![camera_serial], |r| {
-                Ok(CameraDeleteRow { id: r.get(0)?, dir: r.get(1)?, name: r.get(2)? })
+                Ok(CameraDeleteRow {
+                    id: r.get(0)?,
+                    dir: r.get(1)?,
+                    name: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                    captured_unix: r.get(4)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -614,7 +630,7 @@ mod tests {
     fn camera_delete_is_hidden_until_cloud_status_done() {
         let mut l = mem();
         let imp = record_imported(&mut l, "C346", "GX010001.MP4");
-        l.enqueue_camera_delete("C346", "100GOPRO", "GX010001.MP4", imp).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "GX010001.MP4", 4096, 1000, imp).unwrap();
 
         // cloud_status NULL -> not due.
         assert!(l.due_camera_deletes("C346").unwrap().is_empty());
@@ -627,6 +643,8 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].dir, "100GOPRO");
         assert_eq!(due[0].name, "GX010001.MP4");
+        assert_eq!(due[0].size, 4096);
+        assert_eq!(due[0].captured_unix, 1000);
     }
 
     #[test]
@@ -634,8 +652,8 @@ mod tests {
         let mut l = mem();
         let a = record_imported(&mut l, "C346", "A.MP4");
         let b = record_imported(&mut l, "C999", "B.MP4");
-        let ia = l.enqueue_camera_delete("C346", "100GOPRO", "A.MP4", a).unwrap();
-        l.enqueue_camera_delete("C999", "100GOPRO", "B.MP4", b).unwrap();
+        let ia = l.enqueue_camera_delete("C346", "100GOPRO", "A.MP4", 1, 1, a).unwrap();
+        l.enqueue_camera_delete("C999", "100GOPRO", "B.MP4", 1, 1, b).unwrap();
         l.set_cloud_status(a, "done").unwrap();
         l.set_cloud_status(b, "done").unwrap();
 
