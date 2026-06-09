@@ -497,6 +497,7 @@ pub fn run() {
             commands::open_settings,
             commands::set_nextcloud_credentials,
             commands::clear_nextcloud_credentials,
+            commands::migrate_plaintext_credentials,
             commands::pause_cloud,
             commands::resume_cloud,
             commands::retry_failed_cloud,

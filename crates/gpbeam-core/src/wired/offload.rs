@@ -89,6 +89,14 @@ pub async fn run_wired_offload(
     let _ = client.enable_wired_control().await;
 
     let listing = client.media_list().await?;
+
+    // Reap camera-deletes deferred on a previous connect (M4) whose cloud upload
+    // has since reached Done — but only files still present on the card AND still
+    // the same recording (size+captured), so a reused on-card path can never erase
+    // a different file. Honors the current delete_after_verify opt-out. Non-fatal:
+    // failures leave rows for a later connect.
+    reap_camera_deletes(client, ledger, &serial, &listing, cfg, emit).await?;
+
     let (plan, skipped) = plan_wired(listing, cfg, ledger, &serial, model.as_deref())?;
     let total_bytes: u64 = plan.iter().map(|p| p.media.size).sum();
     emit(RunEvent::Scanned { new_files: plan.len(), total_bytes });
@@ -158,7 +166,7 @@ pub async fn run_wired_offload(
 
                 // Record + (for Auto|Manual) enqueue the cloud job. card_src=None: the worker
                 // uploads the local copy; it can't delete from the camera.
-                commit_imported(
+                let imported_id = commit_imported(
                     ledger, cfg, &serial, &p.media.name, p.media.size, p.media.captured_unix,
                     &p.dest_path, &p.dest_name, Some(&hash), None,
                 )?;
@@ -167,23 +175,28 @@ pub async fn run_wired_offload(
                     emit(RunEvent::CloudQueued { file: p.media.name.clone() });
                 }
 
-                // delete-after-verify (opt-in): delete from the camera inline,
-                // but only when the mirror mode does NOT defer deletion to the
-                // cloud (M4). Under Auto the SD path defers the card delete until
-                // the upload reaches Done — the wired worker can't do that (it
-                // uploads the LOCAL copy and can't reach the camera), so deferral
-                // is impossible. Keeping the camera original is the safe choice:
-                // never erase the only other copy before the cloud confirms it.
-                // Manual/Off still delete inline after the now-real verify (H2).
-                if cfg.delete_after_verify
-                    && crate::orchestrator::should_delete_card(true, mirror)
-                {
-                    match client.delete(&p.media).await {
-                        Ok(()) => emit(RunEvent::CardFileDeleted { file: p.media.name.clone() }),
-                        Err(e) => emit(RunEvent::Failed {
-                            file: p.media.name.clone(),
-                            error: format!("delete-after-verify failed: {e}"),
-                        }),
+                // delete-after-verify (opt-in, M4):
+                //  * Manual/Off (should_delete_card == true): delete from the camera
+                //    inline now, after the now-real verify (H2).
+                //  * Auto: the wired worker uploads the LOCAL copy and can't reach the
+                //    camera, so it cannot delete inline once the cloud confirms. Instead
+                //    record a deferral marker now and reap it on the NEXT wired connect
+                //    once the upload reaches Done — never erasing the only other copy
+                //    before the cloud has it.
+                if cfg.delete_after_verify {
+                    if crate::orchestrator::should_delete_card(true, mirror) {
+                        match client.delete(&p.media).await {
+                            Ok(()) => emit(RunEvent::CardFileDeleted { file: p.media.name.clone() }),
+                            Err(e) => emit(RunEvent::Failed {
+                                file: p.media.name.clone(),
+                                error: format!("delete-after-verify failed: {e}"),
+                            }),
+                        }
+                    } else if mirror == MirrorMode::Auto {
+                        ledger.enqueue_camera_delete(
+                            &serial, &p.media.dir, &p.media.name,
+                            p.media.size, p.media.captured_unix, imported_id,
+                        )?;
                     }
                 }
             }
@@ -200,12 +213,62 @@ pub async fn run_wired_offload(
     Ok(summary)
 }
 
+/// Delete from the camera any files deferred on a previous connect (M4) whose
+/// cloud upload has since reached Done.
+///
+/// Safety against on-card path reuse: a marker is only acted on when `listing`
+/// still has a file at the same dir/name AND its `size`/`captured_unix` match the
+/// recorded recording. If the path is gone, or now holds a *different* file (e.g.
+/// after a card format reused the `GX0xNNNN` name), the marker is cleared WITHOUT
+/// deleting — never erasing a file we did not upload. A 404 on the delete means it
+/// was already removed (treat as reaped); other errors leave the row pending.
+///
+/// Honors the live `delete_after_verify` opt-out (matches the SD/cloud path):
+/// when it is off, markers are left pending so the user can re-enable later.
+/// Non-fatal — a failed reap never aborts the offload (only ledger errors propagate).
+async fn reap_camera_deletes(
+    client: &GoProClient,
+    ledger: &mut Ledger,
+    serial: &str,
+    listing: &[RemoteMedia],
+    cfg: &Config,
+    emit: &mut (dyn FnMut(RunEvent) + Send),
+) -> Result<()> {
+    if !cfg.delete_after_verify {
+        return Ok(());
+    }
+    for row in ledger.due_camera_deletes(serial)? {
+        let on_card = listing.iter().find(|m| m.dir == row.dir && m.name == row.name);
+        match on_card {
+            // Already gone from the card -> clear the marker, nothing to delete.
+            None => ledger.mark_camera_delete_done(row.id)?,
+            // A different file now occupies this path (reuse after a format) ->
+            // never delete it; clear the marker so we stop tracking the old file.
+            Some(m) if m.size != row.size || m.captured_unix != row.captured_unix => {
+                ledger.mark_camera_delete_done(row.id)?;
+            }
+            // Same recording, cloud copy confirmed Done -> safe to delete.
+            Some(_) => match client.delete_path(&row.dir, &row.name).await {
+                Ok(()) => {
+                    ledger.mark_camera_delete_done(row.id)?;
+                    emit(RunEvent::CardFileDeleted { file: row.name });
+                }
+                Err(CoreError::Http { status: Some(404), .. }) => {
+                    ledger.mark_camera_delete_done(row.id)?;
+                }
+                Err(_) => { /* leave pending; retry on the next connect */ }
+            },
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestrator::RunEvent;
     use crate::wired::client::GoProClient;
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn media(name: &str, size: u64, cre: i64) -> RemoteMedia {
@@ -461,6 +524,151 @@ mod tests {
         let mut events = Vec::new();
         run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await.unwrap();
         assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn auto_defers_delete_then_reaps_on_next_connect() {
+        const SERIAL: &str = "C3575424520622";
+        let server = MockServer::start().await;
+        mock_camera(&server, &[("GX010198.MP4", &vec![7u8; 4096], 1_780_515_910)]).await;
+        // The camera delete must happen exactly once, on the SECOND connect.
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .and(query_param("path", "100GOPRO/GX010198.MP4"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let mut cfg = cloud_cfg(dest.path().to_path_buf(), MirrorMode::Auto);
+        cfg.delete_after_verify = true;
+        let client = GoProClient::with_base(server.uri());
+        let ledger_path = dest.path().join("ledger.db");
+
+        // First connect: verify + enqueue a deferral marker, NO camera delete yet.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let mut events = Vec::new();
+            let s = run_wired_offload(&client, &cfg, &mut l, &mut |e| events.push(e)).await.unwrap();
+            assert_eq!(s.copied, 1);
+            assert_eq!(s.queued, 1, "still enqueued for the cloud mirror");
+            assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })),
+                "no camera delete on the first connect under Auto");
+            // Nothing due yet (upload not Done); a pending marker exists once Done.
+            assert!(l.due_camera_deletes(SERIAL).unwrap().is_empty());
+            let imp = l.imported_id(SERIAL, "GX010198.MP4", 4096, 1_780_515_910).unwrap().unwrap();
+            l.set_cloud_status(imp, "done").unwrap();
+            assert_eq!(l.due_camera_deletes(SERIAL).unwrap().len(), 1, "now due after Done");
+        }
+
+        // Second connect: reaps the now-Done marker -> the single delete fires.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let mut events = Vec::new();
+            run_wired_offload(&client, &cfg, &mut l, &mut |e| events.push(e)).await.unwrap();
+            assert!(l.due_camera_deletes(SERIAL).unwrap().is_empty(), "marker reaped");
+            assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        }
+        // `server` drop verifies the `.expect(1)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn reap_deletes_due_and_marks_404_done() {
+        let server = MockServer::start().await;
+        // A.MP4 deletes cleanly (200); B.MP4 is already gone (404).
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .and(query_param("path", "100GOPRO/A.MP4"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .and(query_param("path", "100GOPRO/B.MP4"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server).await;
+        let client = GoProClient::with_base(server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(dir.path().to_path_buf());
+        cfg.delete_after_verify = true;
+
+        let mut l = Ledger::open_in_memory().unwrap();
+        let a = l.record("C346", "A.MP4", 1, 1, "/d/A", None).unwrap();
+        let b = l.record("C346", "B.MP4", 1, 1, "/d/B", None).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "A.MP4", 1, 1, a).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "B.MP4", 1, 1, b).unwrap();
+        l.set_cloud_status(a, "done").unwrap();
+        l.set_cloud_status(b, "done").unwrap();
+
+        // Both still present on the card and matching identity -> both reaped.
+        let listing = vec![media("A.MP4", 1, 1), media("B.MP4", 1, 1)];
+        let mut events = Vec::new();
+        let mut emit = |e: RunEvent| events.push(e);
+        reap_camera_deletes(&client, &mut l, "C346", &listing, &cfg, &mut emit).await.unwrap();
+
+        // Both rows are now reaped (200 + 404 both clear the marker).
+        assert!(l.due_camera_deletes("C346").unwrap().is_empty());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { file } if file == "A.MP4")));
+        // 404 is silent (already gone): no CardFileDeleted for B.
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { file } if file == "B.MP4")));
+    }
+
+    #[tokio::test]
+    async fn reap_skips_delete_when_card_path_holds_a_different_file() {
+        // M4 safety: after a card format reuses the GX0xNNNN name, the on-card path
+        // can hold a brand-new, un-uploaded recording. The reap must NOT delete it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server).await;
+        let client = GoProClient::with_base(server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(dir.path().to_path_buf());
+        cfg.delete_after_verify = true;
+
+        let mut l = Ledger::open_in_memory().unwrap();
+        // Marker for the ORIGINAL recording (size 4096, captured 1000).
+        let imp = l.record("C346", "GX010198.MP4", 4096, 1000, "/d/x", None).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "GX010198.MP4", 4096, 1000, imp).unwrap();
+        l.set_cloud_status(imp, "done").unwrap();
+
+        // The card now has a DIFFERENT file at the same path (different size+captured).
+        let listing = vec![media("GX010198.MP4", 9999, 2000)];
+        let mut events = Vec::new();
+        let mut emit = |e: RunEvent| events.push(e);
+        reap_camera_deletes(&client, &mut l, "C346", &listing, &cfg, &mut emit).await.unwrap();
+
+        // Marker cleared (the original is gone) but NO delete issued and no event.
+        assert!(l.due_camera_deletes("C346").unwrap().is_empty());
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        // `server` drop verifies the `.expect(0)` on the delete mock.
+    }
+
+    #[tokio::test]
+    async fn reap_is_noop_when_delete_after_verify_disabled() {
+        // Disabling delete-after-verify between connects must stop pending reaps
+        // (matching the SD/cloud path's opt-out); markers stay for a later re-enable.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/gopro/media/delete"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server).await;
+        let client = GoProClient::with_base(server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dir.path().to_path_buf()); // delete_after_verify defaults false
+
+        let mut l = Ledger::open_in_memory().unwrap();
+        let imp = l.record("C346", "A.MP4", 1, 1, "/d/A", None).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "A.MP4", 1, 1, imp).unwrap();
+        l.set_cloud_status(imp, "done").unwrap();
+
+        let listing = vec![media("A.MP4", 1, 1)];
+        let mut events = Vec::new();
+        let mut emit = |e: RunEvent| events.push(e);
+        reap_camera_deletes(&client, &mut l, "C346", &listing, &cfg, &mut emit).await.unwrap();
+
+        assert_eq!(l.due_camera_deletes("C346").unwrap().len(), 1, "marker left pending");
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
     }
 
     #[tokio::test]

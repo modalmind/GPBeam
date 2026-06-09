@@ -186,7 +186,11 @@ pub fn get_config(ctx: State<'_, AppCtx>) -> Result<ConfigView, String> {
         Some(cloud) => ctx.creds.has_password(&cloud.destination_id),
         None => false,
     };
-    Ok(config_to_view(&cfg, has_password))
+    let mut view = config_to_view(&cfg, has_password);
+    // M2: surface any plaintext app-passwords still in gpbeam.toml so the Cloud
+    // tab can offer a one-click migration into the keychain.
+    view.plaintext_credential_ids = crate::config_io::plaintext_credential_ids(&ctx.config_path);
+    Ok(view)
 }
 
 /// The most-recently-copied files (capped at `limit`) for the History tab.
@@ -258,6 +262,32 @@ pub fn clear_nextcloud_credentials(
     destination_id: String,
 ) -> Result<(), String> {
     ctx.creds.delete_password(&destination_id)
+}
+
+/// Move a plaintext `[credentials.<id>]` app-password into the OS keychain, then
+/// strip it from the config file. The keychain write happens BEFORE the strip so
+/// a keychain failure never destroys the only copy of the secret (M2).
+pub(crate) fn migrate_plaintext_credentials_impl(
+    creds: &crate::keyring_store::KeyringCredentialStore,
+    config_path: &std::path::Path,
+    destination_id: &str,
+) -> Result<(), String> {
+    let pw = crate::config_io::plaintext_app_password(config_path, destination_id)
+        .ok_or_else(|| format!("no plaintext password for {destination_id:?} in config"))?;
+    creds.set_password(destination_id, &pw)?;
+    // Strip only the plaintext password; the username stays in the file so
+    // credential resolution still has it (the uploader reads secret.username).
+    crate::config_io::strip_credential_password(config_path, destination_id)
+}
+
+/// Migrate a plaintext Nextcloud password for `destination_id` into the keychain
+/// and remove it from `gpbeam.toml` (M2 one-click migrate).
+#[tauri::command]
+pub fn migrate_plaintext_credentials(
+    ctx: State<'_, AppCtx>,
+    destination_id: String,
+) -> Result<(), String> {
+    migrate_plaintext_credentials_impl(&ctx.creds, &ctx.config_path, &destination_id)
 }
 
 /// Pause the cloud drain loop (in-flight uploads finish; no new jobs claimed).
@@ -429,6 +459,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "open_settings",
     "set_nextcloud_credentials",
     "clear_nextcloud_credentials",
+    "migrate_plaintext_credentials",
     "pause_cloud",
     "resume_cloud",
     "retry_failed_cloud",
@@ -448,6 +479,66 @@ mod tests {
     fn module_compiles() {
         // Smoke test: this module and its dependencies resolve.
         assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn migrate_moves_password_to_keychain_then_strips_file() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"a\"\napp_password=\"plain-pw\"\n")
+            .unwrap();
+
+        use crate::keyring_store::KeyringBackend;
+        let backend = Arc::new(crate::keyring_store::MemoryKeyring::new());
+        let store = crate::keyring_store::KeyringCredentialStore::new(
+            "com.gpbeam.test", backend.clone(), None, None, None);
+
+        migrate_plaintext_credentials_impl(&store, &path, "nc1").unwrap();
+
+        // Password landed in the keychain; plaintext entry is gone from the file.
+        assert_eq!(backend.get("com.gpbeam.test", "nc1").unwrap(), Some("plain-pw".into()));
+        assert!(crate::config_io::plaintext_credential_ids(&path).is_empty());
+    }
+
+    #[test]
+    fn migrate_preserves_username_for_resolution_after_restart() {
+        use gpbeam_core::credentials::{CredentialStore, EnvConfigStore};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"alice\"\napp_password=\"plain-pw\"\n")
+            .unwrap();
+        let backend = Arc::new(crate::keyring_store::MemoryKeyring::new());
+        let store = crate::keyring_store::KeyringCredentialStore::new(
+            "svc", backend.clone(), None, None, None);
+
+        migrate_plaintext_credentials_impl(&store, &path, "nc1").unwrap();
+
+        // Simulate an app restart: rebuild the fallback from the now-stripped file.
+        // Resolution must still yield the username (from the file) and the password
+        // (from the keychain) — migrate must NOT destroy the username.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let fallback = EnvConfigStore::from_toml_str(&raw, None, None).unwrap();
+        let restarted = crate::keyring_store::KeyringCredentialStore::new(
+            "svc", backend.clone(), None, None, Some(fallback));
+        let secret = restarted.get("nc1").unwrap().expect("resolvable after migrate");
+        assert_eq!(secret.username, "alice", "username must survive migrate");
+        assert_eq!(secret.app_password, "plain-pw", "password resolves from keychain");
+    }
+
+    #[test]
+    fn migrate_errors_when_no_plaintext_entry() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path, "dest_root = \"/d\"\n").unwrap();
+        let store = crate::keyring_store::KeyringCredentialStore::new(
+            "com.gpbeam.test", Arc::new(crate::keyring_store::MemoryKeyring::new()),
+            None, None, None);
+        assert!(migrate_plaintext_credentials_impl(&store, &path, "nc1").is_err());
     }
 
     #[test]
@@ -611,6 +702,7 @@ mod tests {
             auto_eject: false,
             wired_ingest: true,
             cloud: None,
+            plaintext_credential_ids: Vec::new(),
         }
     }
 
@@ -742,7 +834,7 @@ mod tests {
     /// this fails, update both `COMMAND_NAMES` and the macro list in lib.rs.
     #[test]
     fn command_surface_count_is_pinned() {
-        assert_eq!(COMMAND_NAMES.len(), 18, "command surface changed — sync lib.rs generate_handler!");
+        assert_eq!(COMMAND_NAMES.len(), 19, "command surface changed — sync lib.rs generate_handler!");
     }
 
     #[test]

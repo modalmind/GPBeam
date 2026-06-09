@@ -265,11 +265,11 @@ impl GoProClient {
     }
 
     /// `GET /gopro/media/delete?path={dir}/{name}` — delete a file from the
-    /// camera. 200 -> Ok(()); any other status -> `Http`. The Phase 4 caller
-    /// treats an Err as non-fatal.
-    pub async fn delete(&self, m: &RemoteMedia) -> Result<()> {
+    /// camera by its on-card path. 200 -> Ok(()); any other status -> `Http`.
+    /// The Phase 4 caller treats an Err as non-fatal.
+    pub async fn delete_path(&self, dir: &str, name: &str) -> Result<()> {
         let base = format!("{}/gopro/media/delete", self.base);
-        let path_param = format!("{}/{}", m.dir, m.name);
+        let path_param = format!("{dir}/{name}");
         let url = with_query(&base, &[("path", path_param.as_str())])?;
         let resp = self.http.get(url.clone()).send().await.map_err(transport_err)?;
         let status = resp.status().as_u16();
@@ -281,6 +281,11 @@ impl GoProClient {
                 msg: format!("GET {url} -> {status}"),
             })
         }
+    }
+
+    /// Delete a listed [`RemoteMedia`] from the camera (uses its dir + name only).
+    pub async fn delete(&self, m: &RemoteMedia) -> Result<()> {
+        self.delete_path(&m.dir, &m.name).await
     }
 }
 
@@ -409,6 +414,20 @@ mod tests {
         let c = GoProClient::with_base(server.uri());
         let err = c.version().await.unwrap_err();
         assert!(matches!(err, CoreError::Http { status: Some(404), .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_path_hits_media_delete_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/delete"))
+            .and(query_param("path", "100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = GoProClient::with_base(server.uri());
+        c.delete_path("100GOPRO", "GX010001.MP4").await.unwrap();
     }
 
     #[tokio::test]

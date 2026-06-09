@@ -45,6 +45,10 @@ pub struct ConfigView {
     pub auto_eject: bool,
     pub wired_ingest: bool,
     pub cloud: Option<CloudView>,
+    /// UI-only (M2): destination ids whose app-password sits in plaintext in
+    /// `gpbeam.toml`. Populated by `get_config`; never parsed back into `Config`.
+    #[serde(default)]
+    pub plaintext_credential_ids: Vec<String>,
 }
 
 /// Map a `MirrorMode` to its lowercase serde string.
@@ -71,6 +75,8 @@ pub fn config_to_view(cfg: &Config, has_password: bool) -> ConfigView {
         auto_eject: cfg.auto_eject,
         wired_ingest: cfg.wired_ingest,
         cloud: cfg.cloud.as_ref().map(|c| cloud_to_view(c, has_password)),
+        // Populated by `get_config` (needs the on-disk path); empty here.
+        plaintext_credential_ids: Vec::new(),
     }
 }
 
@@ -241,6 +247,104 @@ pub fn view_to_config(view: &ConfigView) -> Result<Config, String> {
 /// is absent, unparsable, or has no credentials table. Used to carry a
 /// hand-managed `[credentials.*]` table across a GUI save, since `Config`
 /// itself does not model credentials.
+/// Destination ids that carry a non-empty plaintext `app_password` in the file's
+/// `[credentials]` table (finding M2). Empty when the file is
+/// absent/unparseable/has none. Surfaced to the UI so the Cloud tab can offer a
+/// one-click migration into the OS keychain.
+pub fn plaintext_credential_ids(path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else { return Vec::new() };
+    let Some(creds) = doc.get("credentials").and_then(|c| c.as_table()) else {
+        return Vec::new();
+    };
+    creds
+        .iter()
+        .filter(|(_, v)| {
+            v.get("app_password").and_then(|p| p.as_str()).is_some_and(|s| !s.is_empty())
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// The plaintext `app_password` for `id` in the file's `[credentials]` table, if
+/// present. Used by the M2 migrate command to move it into the keychain.
+pub fn plaintext_app_password(path: &Path, id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let doc: toml::Value = toml::from_str(&raw).ok()?;
+    doc.get("credentials")?
+        .get(id)?
+        .get("app_password")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Remove the plaintext `app_password` from `[credentials.<id>]`, preserving the
+/// (non-secret) `username` so credential resolution still has it after the secret
+/// moves to the keychain (finding M2). Only the password is a liability; the
+/// username is not. If removing the password leaves the entry empty (it had no
+/// username), the entry is dropped; dropping the last entry drops the whole
+/// `[credentials]` table. A missing file is a successful no-op. Preserves the
+/// atomic/0600 write discipline.
+pub fn strip_credential_password(path: &Path, id: &str) -> Result<(), String> {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Ok(()) };
+    let mut doc: toml::Value =
+        toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if let Some(table) = doc.as_table_mut() {
+        let mut table_empty = false;
+        if let Some(creds) = table.get_mut("credentials").and_then(|c| c.as_table_mut()) {
+            if let Some(entry) = creds.get_mut(id).and_then(|e| e.as_table_mut()) {
+                entry.remove("app_password");
+                if entry.is_empty() {
+                    creds.remove(id);
+                }
+            }
+            table_empty = creds.is_empty();
+        }
+        if table_empty {
+            table.remove("credentials");
+        }
+    }
+    let body = toml::to_string(&doc).map_err(|e| format!("serialize {}: {e}", path.display()))?;
+    atomic_write_string(path, &body)
+}
+
+/// Atomically write `body` to `path`: `<path>.part` (fsync, 0600 on unix) then
+/// rename over `path`. Creates the parent dir if missing. Shared by
+/// [`write_config_atomic`] and [`strip_credential_entry`].
+fn atomic_write_string(path: &Path, body: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create config dir {}: {e}", parent.display()))?;
+        }
+    }
+    let part = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    };
+    {
+        let mut f = std::fs::File::create(&part)
+            .map_err(|e| format!("create {}: {e}", part.display()))?;
+        f.write_all(body.as_bytes())
+            .map_err(|e| format!("write {}: {e}", part.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", part.display()))?;
+    }
+    // Owner-only (0600) BEFORE the rename, so a secret-bearing config is never
+    // even briefly group/world-readable. Unix only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("set 0600 on {}: {e}", part.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("rename {} -> {}: {e}", part.display(), path.display()));
+    }
+    Ok(())
+}
+
 fn extract_credentials_table(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let doc: toml::Value = toml::from_str(&raw).ok()?;
@@ -279,49 +383,8 @@ pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
         body.push_str(&creds);
     }
 
-    // Ensure the destination directory exists — on a fresh install the config's
-    // parent (e.g. ~/GPBeam) may not have been created yet, and File::create on a
-    // missing directory fails with "No such file or directory".
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create config dir {}: {e}", parent.display()))?;
-        }
-    }
-
-    let part = {
-        let mut p = path.as_os_str().to_os_string();
-        p.push(".part");
-        std::path::PathBuf::from(p)
-    };
-
-    // Write + fsync the temp file.
-    {
-        let mut f = std::fs::File::create(&part)
-            .map_err(|e| format!("create {}: {e}", part.display()))?;
-        f.write_all(body.as_bytes())
-            .map_err(|e| format!("write {}: {e}", part.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("fsync {}: {e}", part.display()))?;
-    }
-
-    // M2: tighten to owner-only (0600) BEFORE the rename, so a secret-bearing
-    // config is never even briefly group/world-readable. Unix only — on Windows
-    // the file inherits the user-profile ACL (no octal-mode equivalent).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set 0600 on {}: {e}", part.display()))?;
-    }
-
-    // Atomic replace. On failure, best-effort remove the temp file so we never
-    // leave a stray `.part` behind.
-    if let Err(e) = std::fs::rename(&part, path) {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("rename {} -> {}: {e}", part.display(), path.display()));
-    }
-    Ok(())
+    // Atomic, fsync'd, 0600 write — shared with `strip_credential_entry`.
+    atomic_write_string(path, &body)
 }
 
 #[cfg(test)]
@@ -429,6 +492,7 @@ mod tests {
             auto_eject: false,
             wired_ingest: true,
             cloud: None,
+            plaintext_credential_ids: Vec::new(),
         }
     }
 
@@ -757,5 +821,93 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let doc: toml::Value = toml::from_str(&raw).unwrap();
         assert!(doc.get("credentials").is_none(), "no credentials table fabricated");
+    }
+
+    // ---- M2: plaintext credential detection / strip / migrate helpers ----
+
+    #[test]
+    fn plaintext_credential_ids_lists_entries_with_app_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n\
+             [credentials.nc1]\nusername=\"a\"\napp_password=\"pw\"\n\
+             [credentials.nc2]\nusername=\"b\"\napp_password=\"\"\n").unwrap();
+        let ids = plaintext_credential_ids(&path);
+        assert_eq!(ids, vec!["nc1".to_string()]); // nc2 has an empty password
+    }
+
+    #[test]
+    fn plaintext_credential_ids_empty_when_absent_or_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path, "dest_root = \"/d\"\n").unwrap();
+        assert!(plaintext_credential_ids(&path).is_empty());
+        assert!(plaintext_credential_ids(&dir.path().join("nope.toml")).is_empty());
+    }
+
+    #[test]
+    fn strip_credential_password_keeps_username_drops_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"alice\"\napp_password=\"pw1\"\n").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
+        // No longer flagged (no plaintext password) but the username is preserved.
+        assert!(plaintext_credential_ids(&path).is_empty());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("alice"), "username preserved for resolution");
+        assert!(!raw.contains("pw1"), "plaintext password removed");
+        assert!(raw.contains("dest_root"), "other config survives");
+    }
+
+    #[test]
+    fn strip_credential_password_leaves_other_entries_and_keeps_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n\
+             [credentials.nc1]\nusername=\"a\"\napp_password=\"pw1\"\n\
+             [credentials.nc2]\nusername=\"b\"\napp_password=\"pw2\"\n").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
+        assert_eq!(plaintext_credential_ids(&path), vec!["nc2".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn strip_credential_password_drops_empty_entry_and_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        // An entry with only a password (no username) becomes empty -> dropped,
+        // and the now-empty [credentials] table is dropped too.
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\napp_password=\"pw\"\n").unwrap();
+        strip_credential_password(&path, "nc1").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("credentials"), "empty entry and table dropped");
+    }
+
+    #[test]
+    fn plaintext_app_password_reads_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpbeam.toml");
+        std::fs::write(&path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"a\"\napp_password=\"sekret\"\n").unwrap();
+        assert_eq!(plaintext_app_password(&path, "nc1").as_deref(), Some("sekret"));
+        assert_eq!(plaintext_app_password(&path, "nope"), None);
+    }
+
+    #[test]
+    fn config_view_serializes_plaintext_ids_camelcase() {
+        let cfg = Config::new(PathBuf::from("/d"));
+        let mut view = config_to_view(&cfg, false);
+        view.plaintext_credential_ids = vec!["nc1".into()];
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["plaintextCredentialIds"][0], "nc1");
     }
 }

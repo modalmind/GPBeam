@@ -1,6 +1,11 @@
 <script lang="ts">
   import type { ConfigView, CloudView } from '../../lib/bindings';
-  import { setNextcloudCredentials, clearNextcloudCredentials } from '../../lib/bindings';
+  import {
+    setNextcloudCredentials,
+    clearNextcloudCredentials,
+    migratePlaintextCredentials,
+  } from '../../lib/bindings';
+  import { isInsecureHttpUrl } from '../../lib/url';
   import Field from '../../lib/Field.svelte';
 
   export let view: ConfigView;
@@ -39,6 +44,14 @@
     view.cloud.hasPassword = true;
     pendingPassword = '';
   }
+
+  async function migrateToKeychain() {
+    if (!view.cloud) return;
+    const id = view.cloud.destinationId;
+    await migratePlaintextCredentials(id);
+    view.plaintextCredentialIds = (view.plaintextCredentialIds ?? []).filter((x) => x !== id);
+    view.cloud.hasPassword = true;
+  }
 </script>
 
 <section>
@@ -57,9 +70,23 @@
   </Field>
 
   {#if view.cloud}
+    {#if (view.plaintextCredentialIds ?? []).includes(view.cloud.destinationId)}
+      <div class="warn" role="alert">
+        ⚠ Your Nextcloud password is stored in plain text in <code>gpbeam.toml</code>.
+        Anyone who can read that file — or a synced/removable copy of it — can see it.
+        <button type="button" on:click={migrateToKeychain}>Move to keychain</button>
+      </div>
+    {/if}
+
     <Field label="Base URL" htmlFor="nc-url" help="e.g. https://cloud.example.com">
       <input id="nc-url" aria-label="Base URL" type="text" bind:value={view.cloud.baseUrl} />
     </Field>
+    {#if isInsecureHttpUrl(view.cloud.baseUrl)}
+      <p class="warn-inline" role="alert">
+        ⚠ Plain http sends your password and footage unencrypted. Use https:// —
+        http is allowed only for localhost.
+      </p>
+    {/if}
 
     <Field label="Username" htmlFor="nc-user">
       <input id="nc-user" aria-label="Username" type="text" bind:value={view.cloud.username} />
@@ -104,6 +131,10 @@
   h2 { font-size: 15px; margin: 0 0 8px; }
   .check { display: flex; align-items: center; gap: 6px; font-weight: 400; }
   .saved { color: #2e9e54; font-size: 12px; }
+  .warn { background: #fff4e5; border: 1px solid #e0a96d; border-radius: 6px;
+          padding: 8px 10px; margin: 8px 0; font-size: 12px; }
+  .warn button { margin-left: 6px; }
+  .warn-inline { color: #b15c00; font-size: 12px; margin: 4px 0 0; }
   .advanced { margin-top: 10px; }
   input[type='text'], input[type='password'] { flex: 1; min-width: 220px; }
   input[type='number'] { width: 140px; }
