@@ -4,9 +4,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../../lib/bindings', () => ({
   setNextcloudCredentials: vi.fn().mockResolvedValue(undefined),
   clearNextcloudCredentials: vi.fn().mockResolvedValue(undefined),
+  migratePlaintextCredentials: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { setNextcloudCredentials, clearNextcloudCredentials } from '../../lib/bindings';
+import {
+  setNextcloudCredentials,
+  clearNextcloudCredentials,
+  migratePlaintextCredentials,
+} from '../../lib/bindings';
 import CloudTab from './CloudTab.svelte';
 
 function makeView(cloud: any = null) {
@@ -21,6 +26,7 @@ function makeView(cloud: any = null) {
     autoEject: false,
     wiredIngest: true,
     cloud,
+    plaintextCredentialIds: [],
   };
 }
 
@@ -92,5 +98,38 @@ describe('CloudTab', () => {
     const sel = screen.getByLabelText('Mirror mode') as HTMLSelectElement;
     await fireEvent.change(sel, { target: { value: 'manual' } });
     expect(view.cloud.mirrorMode).toBe('manual');
+  });
+
+  it('shows the plaintext warning and migrates on click', async () => {
+    const view: any = makeView(makeCloud());
+    view.plaintextCredentialIds = ['nc1'];
+    render(CloudTab, { props: { view } });
+    expect(screen.getByText(/plain text/i)).toBeTruthy();
+    await fireEvent.click(screen.getByText('Move to keychain'));
+    await Promise.resolve();
+    expect(migratePlaintextCredentials).toHaveBeenCalledWith('nc1');
+    expect(view.plaintextCredentialIds).not.toContain('nc1');
+    expect(view.cloud.hasPassword).toBe(true);
+  });
+
+  it('hides the plaintext warning when the id is not flagged', () => {
+    const view: any = makeView(makeCloud());
+    view.plaintextCredentialIds = [];
+    render(CloudTab, { props: { view } });
+    expect(screen.queryByText(/plain text/i)).toBeNull();
+  });
+
+  it('warns under Base URL for http to a remote host', () => {
+    const view: any = makeView(makeCloud());
+    view.cloud.baseUrl = 'http://cloud.example.com';
+    render(CloudTab, { props: { view } });
+    expect(screen.getByText(/unencrypted/i)).toBeTruthy();
+  });
+
+  it('no http warning for https', () => {
+    const view: any = makeView(makeCloud());
+    view.cloud.baseUrl = 'https://cloud.example.com';
+    render(CloudTab, { props: { view } });
+    expect(screen.queryByText(/unencrypted/i)).toBeNull();
   });
 });

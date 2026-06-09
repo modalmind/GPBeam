@@ -72,6 +72,8 @@ export interface ConfigView {
   autoEject: boolean;
   wiredIngest: boolean;
   cloud: CloudView | null;
+  /** UI-only (M2): destination ids whose app-password is in plaintext in gpbeam.toml. */
+  plaintextCredentialIds?: string[];
 }
 
 export interface HistoryRow {
@@ -122,6 +124,12 @@ export function setNextcloudCredentials(
 
 export function clearNextcloudCredentials(destinationId: string): Promise<void> {
   return invoke<void>("clear_nextcloud_credentials", { destinationId });
+}
+
+/** Move a plaintext Nextcloud password into the OS keychain and strip it from
+ *  gpbeam.toml (M2 one-click migrate). */
+export function migratePlaintextCredentials(destinationId: string): Promise<void> {
+  return invoke<void>("migrate_plaintext_credentials", { destinationId });
 }
 
 export function pauseCloud(): Promise<AppState> {
