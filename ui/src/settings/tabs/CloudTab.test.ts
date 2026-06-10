@@ -66,12 +66,28 @@ describe('CloudTab', () => {
     expect(view.cloud.hasPassword).toBe(false);
   });
 
-  it('clears cloud and keychain when disabled', async () => {
+  it('disabling is purely local: cloud goes null but the keychain is untouched', async () => {
     const view = makeView(makeCloud());
     render(CloudTab, { props: { view } });
     await fireEvent.click(screen.getByLabelText('Enable Nextcloud mirroring'));
-    expect(clearNextcloudCredentials).toHaveBeenCalledWith('nc1');
     expect(view.cloud).toBeNull();
+    // Clearing the unrecoverable app-password is deferred to an actual Save
+    // with cloud removed (Settings.onSave), never done from the toggle.
+    expect(clearNextcloudCredentials).not.toHaveBeenCalled();
+  });
+
+  it('toggling off then on restores the previous cloud values', async () => {
+    const view = makeView(makeCloud());
+    render(CloudTab, { props: { view } });
+    const toggle = screen.getByLabelText('Enable Nextcloud mirroring');
+    await fireEvent.click(toggle); // off
+    expect(view.cloud).toBeNull();
+    await fireEvent.click(toggle); // back on
+    expect(view.cloud).not.toBeNull();
+    expect(view.cloud.baseUrl).toBe('https://cloud.example.com');
+    expect(view.cloud.username).toBe('alice');
+    expect(view.cloud.mirrorMode).toBe('auto');
+    expect(clearNextcloudCredentials).not.toHaveBeenCalled();
   });
 
   it('shows Saved when a password is already stored', () => {
@@ -117,6 +133,54 @@ describe('CloudTab', () => {
     view.plaintextCredentialIds = [];
     render(CloudTab, { props: { view } });
     expect(screen.queryByText(/plain text/i)).toBeNull();
+  });
+
+  it('warns about orphaned plaintext ids even when mirroring is disabled', async () => {
+    const view: any = makeView(null);
+    view.plaintextCredentialIds = ['old-dest'];
+    render(CloudTab, { props: { view } });
+    expect(screen.getByText(/plain text/i)).toBeTruthy();
+    expect(screen.getByText('old-dest')).toBeTruthy();
+    await fireEvent.click(screen.getByText('Move to keychain'));
+    await Promise.resolve();
+    expect(migratePlaintextCredentials).toHaveBeenCalledWith('old-dest');
+    expect(view.plaintextCredentialIds).not.toContain('old-dest');
+  });
+
+  it('lists every flagged id with its own migrate button, not just the active one', async () => {
+    const view: any = makeView(makeCloud());
+    view.plaintextCredentialIds = ['nc1', 'other-id'];
+    render(CloudTab, { props: { view } });
+    expect(screen.getByText('other-id')).toBeTruthy();
+    const buttons = screen.getAllByText('Move to keychain');
+    expect(buttons.length).toBe(2);
+    await fireEvent.click(buttons[1]);
+    await Promise.resolve();
+    expect(migratePlaintextCredentials).toHaveBeenCalledWith('other-id');
+    expect(view.plaintextCredentialIds).toEqual(['nc1']);
+  });
+
+  it('shows an inline error when storing the password fails', async () => {
+    (setNextcloudCredentials as any).mockRejectedValue('keychain locked');
+    const cloud = makeCloud();
+    cloud.hasPassword = false;
+    const view = makeView(cloud);
+    render(CloudTab, { props: { view } });
+    await fireEvent.input(screen.getByLabelText('App password'), { target: { value: 'tok' } });
+    await fireEvent.click(screen.getByText('Save password'));
+    expect(await screen.findByText(/keychain locked/)).toBeTruthy();
+    expect(view.cloud.hasPassword).toBe(false);
+  });
+
+  it('shows an inline error when migration fails and keeps the id flagged', async () => {
+    (migratePlaintextCredentials as any).mockRejectedValue('keychain locked');
+    const view: any = makeView(makeCloud());
+    view.plaintextCredentialIds = ['nc1'];
+    render(CloudTab, { props: { view } });
+    await fireEvent.click(screen.getByText('Move to keychain'));
+    expect(await screen.findByText(/keychain locked/)).toBeTruthy();
+    expect(view.plaintextCredentialIds).toContain('nc1');
+    expect(view.cloud.hasPassword).toBe(true); // unchanged from makeCloud()
   });
 
   it('warns under Base URL for http to a remote host', () => {

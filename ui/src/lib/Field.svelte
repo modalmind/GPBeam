@@ -5,7 +5,13 @@
 </script>
 
 <div class="field">
-  <label class="field-label" for={htmlFor}>{label}</label>
+  {#if htmlFor}
+    <label class="field-label" for={htmlFor}>{label}</label>
+  {:else}
+    <!-- No control id to point at: a <label> here would be an orphan that screen
+         readers announce as unassociated. Render a plain span with the same styling. -->
+    <span class="field-label">{label}</span>
+  {/if}
   <div class="field-control">
     <slot />
   </div>

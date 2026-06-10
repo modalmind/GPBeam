@@ -97,19 +97,51 @@ describe("Popover (working state)", () => {
     expect(subscribeStateMock).toHaveBeenCalledOnce();
   });
 
-  it("shows the run card with file count, bytes, ETA and device chip", () => {
+  it("attaches the state listener BEFORE hydrating (event snapshots must win the race)", () => {
     appStateStore.set(WORKING);
-    const { getByTestId } = render(Popover);
+    render(Popover);
+    expect(subscribeStateMock.mock.invocationCallOrder[0]).toBeLessThan(
+      hydrateMock.mock.invocationCallOrder[0],
+    );
+  });
 
-    expect(getByTestId("status-word").textContent).toContain("working");
-    expect(getByTestId("current-file").textContent).toContain("GX010099.MP4");
-    // filesDone=2 -> "file 3 of 5"
-    expect(getByTestId("file-count").textContent).toContain("file 3 of 5");
-    expect(getByTestId("bytes").textContent).toContain("50.0 MiB / 100.0 MiB");
-    // 50 MiB of 100 MiB at 0.5 MiB/s over 100s elapsed -> remaining 50 MiB -> 100s -> 1:40
-    expect(getByTestId("eta").textContent).toContain("1:40");
-    expect(getByTestId("device-chip").textContent).toContain("HERO12");
-    expect(getByTestId("device-chip").textContent).toContain("C3401");
+  it("names both progress bars for assistive tech", () => {
+    appStateStore.set({
+      ...WORKING,
+      cloud: {
+        ...WORKING.cloud,
+        uploading: { file: "GX010099.MP4", uploaded: 25, total: 100 },
+      },
+    });
+    const { getByRole } = render(Popover);
+    expect(getByRole("progressbar", { name: "Offload progress" })).toBeTruthy();
+    expect(getByRole("progressbar", { name: "Upload progress" })).toBeTruthy();
+  });
+
+  it("shows the run card with file count, bytes, ETA and device chip", () => {
+    // Freeze the clock: startedAtUnix is computed here and nowUnix at component
+    // init — a real-time seconds tick in between makes elapsed 101s and flakes
+    // the ETA to "1:41". Fake timers pin Date.now so elapsed is exactly 100s.
+    vi.useFakeTimers();
+    try {
+      appStateStore.set({
+        ...WORKING,
+        run: { ...WORKING.run!, startedAtUnix: Math.floor(Date.now() / 1000) - 100 },
+      });
+      const { getByTestId } = render(Popover);
+
+      expect(getByTestId("status-word").textContent).toContain("working");
+      expect(getByTestId("current-file").textContent).toContain("GX010099.MP4");
+      // filesDone=2 -> "file 3 of 5"
+      expect(getByTestId("file-count").textContent).toContain("file 3 of 5");
+      expect(getByTestId("bytes").textContent).toContain("50.0 MiB / 100.0 MiB");
+      // 50 MiB of 100 MiB at 0.5 MiB/s over 100s elapsed -> remaining 50 MiB -> 100s -> 1:40
+      expect(getByTestId("eta").textContent).toContain("1:40");
+      expect(getByTestId("device-chip").textContent).toContain("HERO12");
+      expect(getByTestId("device-chip").textContent).toContain("C3401");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders the cloud card counts and toggles pause via the binding", async () => {

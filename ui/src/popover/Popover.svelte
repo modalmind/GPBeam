@@ -73,8 +73,11 @@
   }
 
   onMount(() => {
-    void hydrate();
+    // Listener first, then hydrate: an event snapshot arriving while get_state
+    // is in flight must not be clobbered by the (staler) hydrate result. The
+    // store also guards this ordering (hydrate drops its result after an event).
     const unsub = subscribeState();
+    void hydrate();
     const timer = setInterval(() => {
       nowUnix = Math.floor(Date.now() / 1000);
     }, 1000);
@@ -99,7 +102,7 @@
         <span class="chip" data-testid="device-chip">{run.model ?? "GoPro"}{run.serial ? ` · ${run.serial}` : ""}</span>
       {/if}
     </div>
-    <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(run.bytesDone, run.bytesTotal)}>
+    <div class="bar" role="progressbar" aria-label="Offload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(run.bytesDone, run.bytesTotal)}>
       <div class="bar-fill" style={`width:${percent(run.bytesDone, run.bytesTotal)}%`}></div>
     </div>
     <div class="run-meta">
@@ -129,7 +132,7 @@
     </div>
     {#if cloud.uploading}
       <div class="cloud-file" data-testid="cloud-file">{cloud.uploading.file}</div>
-      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(cloud.uploading.uploaded, cloud.uploading.total)}>
+      <div class="bar" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(cloud.uploading.uploaded, cloud.uploading.total)}>
         <div class="bar-fill cloud" style={`width:${percent(cloud.uploading.uploaded, cloud.uploading.total)}%`}></div>
       </div>
     {/if}

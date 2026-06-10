@@ -42,28 +42,44 @@ export interface CloudFields {
   mirrorMode: "off" | "auto" | "manual";
 }
 
-const DEFAULT_CHUNK_THRESHOLD = 10485760; // 10 MiB
-const DEFAULT_MAX_CONCURRENCY = 2;
-const DEFAULT_MAX_ATTEMPTS = 5;
+/**
+ * The single shared initial CloudView, mirroring the Rust serde defaults
+ * (`default_chunk_threshold` 50 MiB, `default_max_concurrency` 2,
+ * `default_max_attempts` 8) and the canonical `nc1`/`GoPro` ids used across the
+ * backend. Both the wizard and the Cloud tab MUST build from this so keychain
+ * entries (keyed by destination_id) land under the same id regardless of which
+ * path enabled mirroring. Returned fresh each call so callers can mutate freely.
+ */
+export function defaultCloudView(): CloudView {
+  return {
+    destinationId: "nc1",
+    baseUrl: "",
+    username: "",
+    remoteRoot: "GoPro",
+    mirrorMode: "off",
+    chunkThreshold: 52428800, // 50 MiB
+    maxConcurrency: 2,
+    maxAttempts: 8,
+    hasPassword: false,
+  };
+}
 
 /**
  * Turn the wizard's Nextcloud fields into a CloudView, or `null` when the user
  * left the base URL blank (i.e. skipped cloud). `hasPassword` reflects whether a
  * non-blank app-password was entered; the password itself is stored separately
- * via `setNextcloudCredentials` and never placed on the view.
+ * via `setNextcloudCredentials` and never placed on the view. Everything not
+ * collected by the wizard comes from `defaultCloudView()`.
  */
 export function buildCloudView(fields: CloudFields): CloudView | null {
   const baseUrl = fields.baseUrl.trim();
   if (baseUrl === "") return null;
   return {
-    destinationId: "nextcloud",
+    ...defaultCloudView(),
     baseUrl,
     username: fields.username.trim(),
     remoteRoot: fields.remoteRoot.trim(),
     mirrorMode: fields.mirrorMode,
-    chunkThreshold: DEFAULT_CHUNK_THRESHOLD,
-    maxConcurrency: DEFAULT_MAX_CONCURRENCY,
-    maxAttempts: DEFAULT_MAX_ATTEMPTS,
     hasPassword: fields.appPassword.trim() !== "",
   };
 }

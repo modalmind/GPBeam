@@ -58,6 +58,12 @@ describe("percent", () => {
     expect(percent(-5, 100)).toBe(0);
     expect(percent(150, 100)).toBe(100);
   });
+
+  it("returns 0 for non-finite done (no NaN/Infinity leaking into width/aria)", () => {
+    expect(percent(Number.NaN, 100)).toBe(0);
+    expect(percent(Number.POSITIVE_INFINITY, 100)).toBe(0);
+    expect(percent(Number.NEGATIVE_INFINITY, 100)).toBe(0);
+  });
 });
 
 describe("bytesToGiB / giBToBytes", () => {

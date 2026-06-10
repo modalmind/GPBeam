@@ -148,6 +148,11 @@ export function getHistory(limit: number): Promise<HistoryRow[]> {
   return invoke<HistoryRow[]>("get_history", { limit });
 }
 
+/** Resolved absolute path of gpbeam.toml (shown on the Advanced tab). */
+export function getConfigPath(): Promise<string> {
+  return invoke<string>("get_config_path");
+}
+
 export function getAutostart(): Promise<boolean> {
   return invoke<boolean>("get_autostart");
 }

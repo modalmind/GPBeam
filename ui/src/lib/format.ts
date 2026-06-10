@@ -42,8 +42,10 @@ export function etaHuman(secs: number | null | undefined): string {
   return `${m}:${ss}`;
 }
 
-/** Integer percent in 0..100; 0 when total <= 0 (no divide-by-zero). */
+/** Integer percent in 0..100; 0 when total <= 0 (no divide-by-zero) or when
+ *  either input is non-finite (no NaN leaking into width/aria-valuenow). */
 export function percent(done: number, total: number): number {
+  if (!Number.isFinite(done)) return 0;
   if (!Number.isFinite(total) || total <= 0) return 0;
   const p = Math.round((done / total) * 100);
   return Math.max(0, Math.min(100, p));

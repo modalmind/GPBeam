@@ -50,6 +50,13 @@ describe("bindings", () => {
     expect(invokeMock).toHaveBeenCalledWith("get_history", { limit: 25 });
   });
 
+  it("getConfigPath invokes get_config_path and returns the resolved path", async () => {
+    invokeMock.mockResolvedValue("/Users/me/Library/Application Support/GPBeam/gpbeam.toml");
+    const path = await bindings.getConfigPath();
+    expect(invokeMock).toHaveBeenCalledWith("get_config_path");
+    expect(path).toBe("/Users/me/Library/Application Support/GPBeam/gpbeam.toml");
+  });
+
   it("onState subscribes to the gpbeam://state channel and forwards payloads", async () => {
     const unlisten = vi.fn();
     let handler: ((e: { payload: unknown }) => void) | undefined;

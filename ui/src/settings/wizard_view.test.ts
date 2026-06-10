@@ -1,6 +1,27 @@
 import { describe, it, expect } from "vitest";
-import { defaultConfigView, withCloud, buildCloudView } from "./wizard_view";
+import { defaultConfigView, defaultCloudView, withCloud, buildCloudView } from "./wizard_view";
 import type { CloudView } from "../lib/bindings";
+
+describe("defaultCloudView", () => {
+  it("matches the Rust serde defaults (nc1, 50 MiB, concurrency 2, attempts 8, GoPro)", () => {
+    const c = defaultCloudView();
+    expect(c.destinationId).toBe("nc1");
+    expect(c.baseUrl).toBe("");
+    expect(c.username).toBe("");
+    expect(c.remoteRoot).toBe("GoPro");
+    expect(c.mirrorMode).toBe("off");
+    expect(c.chunkThreshold).toBe(52428800);
+    expect(c.maxConcurrency).toBe(2);
+    expect(c.maxAttempts).toBe(8);
+    expect(c.hasPassword).toBe(false);
+  });
+
+  it("returns a fresh object each call (no shared mutation)", () => {
+    const a = defaultCloudView();
+    a.destinationId = "mutated";
+    expect(defaultCloudView().destinationId).toBe("nc1");
+  });
+});
 
 describe("defaultConfigView", () => {
   it("mirrors the Rust M1 defaults with the given destination", () => {
@@ -36,14 +57,14 @@ describe("withCloud", () => {
 
   it("attaches a CloudView built from wizard cloud fields", () => {
     const cloud: CloudView = {
-      destinationId: "nextcloud",
+      destinationId: "nc1",
       baseUrl: "https://cloud.example.com",
       username: "alice",
       remoteRoot: "/GoPro",
       mirrorMode: "auto",
-      chunkThreshold: 10485760,
+      chunkThreshold: 52428800,
       maxConcurrency: 2,
-      maxAttempts: 5,
+      maxAttempts: 8,
       hasPassword: true,
     };
     const v = withCloud(base, cloud);
@@ -67,17 +88,19 @@ describe("buildCloudView", () => {
     mirrorMode: "auto" as const,
   };
 
-  it("builds a CloudView with M3 advanced defaults and hasPassword=true", () => {
+  it("builds a CloudView on the shared Rust-default advanced values and hasPassword=true", () => {
     const cv = buildCloudView(fields);
     expect(cv).not.toBeNull();
-    expect(cv!.destinationId).toBe("nextcloud");
+    // destinationId/advanced values come from defaultCloudView so the wizard and
+    // CloudTab key the keychain entry identically and match the Rust serde defaults.
+    expect(cv!.destinationId).toBe("nc1");
     expect(cv!.baseUrl).toBe("https://cloud.example.com");
     expect(cv!.username).toBe("alice");
     expect(cv!.remoteRoot).toBe("/GoPro");
     expect(cv!.mirrorMode).toBe("auto");
-    expect(cv!.chunkThreshold).toBe(10485760);
+    expect(cv!.chunkThreshold).toBe(52428800);
     expect(cv!.maxConcurrency).toBe(2);
-    expect(cv!.maxAttempts).toBe(5);
+    expect(cv!.maxAttempts).toBe(8);
     expect(cv!.hasPassword).toBe(true);
   });
 
