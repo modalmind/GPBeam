@@ -235,19 +235,24 @@ fn hex_upper(nibble: u8) -> char {
     }
 }
 
-/// `<base>/remote.php/dav/files/<user>/<encoded rel>`.
+/// `<base>/remote.php/dav/files/<user>/<encoded rel>`. The username is a path
+/// segment too — encode it like the file path so a space/`#`/`?`/`/` in it
+/// cannot break or redirect the DAV root.
 pub fn files_url(base_url: &str, username: &str, remote_rel: &str) -> String {
     let base = base_url.trim_end_matches('/');
+    let user = encode_segment(username);
     let enc = encode_path_segments(remote_rel);
-    format!("{base}/remote.php/dav/files/{username}/{enc}")
+    format!("{base}/remote.php/dav/files/{user}/{enc}")
 }
 
-/// `<base>/remote.php/dav/uploads/<user>/<upload_id>[/<part>]`.
+/// `<base>/remote.php/dav/uploads/<user>/<upload_id>[/<part>]`. Username is
+/// segment-encoded, matching [`files_url`].
 pub fn uploads_url(base_url: &str, username: &str, upload_id: &str, part: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
+    let user = encode_segment(username);
     match part {
-        Some(p) => format!("{base}/remote.php/dav/uploads/{username}/{upload_id}/{p}"),
-        None => format!("{base}/remote.php/dav/uploads/{username}/{upload_id}"),
+        Some(p) => format!("{base}/remote.php/dav/uploads/{user}/{upload_id}/{p}"),
+        None => format!("{base}/remote.php/dav/uploads/{user}/{upload_id}"),
     }
 }
 
@@ -256,7 +261,6 @@ pub fn uploads_url(base_url: &str, username: &str, upload_id: &str, part: Option
 /// `client` and `app_password` are wired here but first consumed by the
 /// authenticated WebDAV requests added in Phase 2 Tasks 2.4–2.9; the
 /// `allow(dead_code)` keeps the incremental build warning-clean until then.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub struct NextcloudUploader {
     pub(crate) client: Client,
@@ -265,6 +269,20 @@ pub struct NextcloudUploader {
     pub(crate) app_password: String,
     pub(crate) remote_root: String,
     pub(crate) chunk_threshold: u64,
+}
+
+/// Manual `Debug` so a `{:?}` (logs, error context, `dbg!`) can never leak the
+/// cleartext app password — companion to the zeroize-on-drop hygiene below.
+impl std::fmt::Debug for NextcloudUploader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NextcloudUploader")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("app_password", &"[redacted]")
+            .field("remote_root", &self.remote_root)
+            .field("chunk_threshold", &self.chunk_threshold)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for NextcloudUploader {
@@ -292,10 +310,7 @@ impl NextcloudUploader {
                 ))
             })?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                CoreError::Config(format!(
-                    "invalid CA PEM at {}: {e}",
-                    ca_path.display()
-                ))
+                CoreError::Config(format!("invalid CA PEM at {}: {e}", ca_path.display()))
             })?;
             builder = builder.tls_certs_merge(std::iter::once(cert));
         }
@@ -328,9 +343,11 @@ impl NextcloudUploader {
 }
 
 impl NextcloudUploader {
-    /// PROPFIND Depth:0 the file URL. 207 with a content-length present => exists;
+    /// PROPFIND Depth:0 the file URL. 207 with a content-length EQUAL to `size`
+    /// => exists (trait contract: "exists with byte size `size`" — a mismatched
+    /// remote must fall through to upload/overwrite, never count as mirrored);
     /// 404 => missing; 401 => CloudAuth; other => Http.
-    pub(crate) async fn propfind_present(&self, remote: &str, _size: u64) -> Result<bool> {
+    pub(crate) async fn propfind_present(&self, remote: &str, size: u64) -> Result<bool> {
         let rel = self.remote_rel(remote);
         let url = files_url(&self.base_url, &self.username, &rel);
         let method = Method::from_bytes(b"PROPFIND").expect("valid method");
@@ -339,7 +356,10 @@ impl NextcloudUploader {
             .request(method, &url)
             .basic_auth(&self.username, Some(&self.app_password))
             .header("Depth", "0")
-            .header(reqwest::header::CONTENT_TYPE, "application/xml; charset=utf-8")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/xml; charset=utf-8",
+            )
             .body(PROPFIND_BODY)
             .send()
             .await
@@ -348,7 +368,7 @@ impl NextcloudUploader {
         match resp.status().as_u16() {
             207 => {
                 let body = resp.text().await.map_err(transport_err)?;
-                Ok(parse_first_contentlength(&body).is_some())
+                Ok(parse_first_contentlength(&body) == Some(size))
             }
             404 => Ok(false),
             401 => Err(CoreError::CloudAuth(
@@ -502,29 +522,24 @@ impl NextcloudUploader {
     ) -> Result<UploadOutcome> {
         let dest = files_url(&self.base_url, &self.username, remote_rel);
 
-        // Determine upload id (reuse on resume; fresh otherwise).
-        let resumed_id = resume.as_ref().and_then(|r| r.upload_id.clone());
-        let upload_id = resumed_id
-            .clone()
+        // Determine upload id (reuse the caller-supplied resume id; fresh
+        // otherwise). The worker derives a DETERMINISTIC id ("gpbeam-{job_id}")
+        // and persists it in every checkpoint, so we must keep using that exact
+        // id even when the dir doesn't exist yet — switching to a fresh uuid
+        // here would create a dir the next attempt's PROPFIND can never find,
+        // restarting every retry from byte 0 and leaking orphaned chunk dirs.
+        let upload_id = resume
+            .as_ref()
+            .and_then(|r| r.upload_id.clone())
             .unwrap_or_else(|| format!("gpbeam-{}", uuid::Uuid::new_v4()));
         let dir = uploads_url(&self.base_url, &self.username, &upload_id, None);
 
         // Probe existing chunks (empty unless resuming).
-        let mut present = self.resume_present_chunks(&dir, resume.as_ref()).await?;
+        let present = self.resume_present_chunks(&dir, resume.as_ref()).await?;
 
-        // Resume requested but the dir was gone (404 => empty map) => start over
-        // with a fresh id + MKCOL.
-        let (upload_id, dir) = if resumed_id.is_some() && present.is_empty() {
-            let fresh = format!("gpbeam-{}", uuid::Uuid::new_v4());
-            let fresh_dir = uploads_url(&self.base_url, &self.username, &fresh, None);
-            present = std::collections::HashMap::new();
-            (fresh, fresh_dir)
-        } else {
-            (upload_id, dir)
-        };
-        let _ = &upload_id; // id retained for ResumeState persistence by the worker
-
-        // MKCOL the upload dir unless we're continuing an existing one.
+        // MKCOL the upload dir unless we're continuing an existing one. A
+        // resume whose dir was missing/expired (404 => empty map) lands here
+        // too and recreates the SAME deterministic dir.
         if present.is_empty() {
             self.mkcol_upload_dir(&dir, &dest).await?;
         }
@@ -667,8 +682,9 @@ impl NextcloudUploader {
     }
 
     /// On resume, PROPFIND Depth:1 the upload dir and return present chunk sizes.
-    /// A 404 means the upload expired -> return empty (caller MKCOLs a fresh dir;
-    /// the upload_id was already regenerated when resume.upload_id was None).
+    /// A 404 means the dir doesn't exist yet (first attempt) or the upload
+    /// expired -> return empty; the caller then MKCOLs the SAME dir so the id
+    /// stays valid for the worker's persisted ResumeState.
     async fn resume_present_chunks(
         &self,
         dir: &str,
@@ -695,7 +711,9 @@ impl NextcloudUploader {
                 Ok(parse_chunk_listing(&body))
             }
             404 => Ok(std::collections::HashMap::new()),
-            401 => Err(CoreError::CloudAuth("PROPFIND upload dir rejected (401)".into())),
+            401 => Err(CoreError::CloudAuth(
+                "PROPFIND upload dir rejected (401)".into(),
+            )),
             s => Err(CoreError::Http {
                 status: Some(s),
                 msg: format!("PROPFIND {dir} -> {s}"),
@@ -706,7 +724,10 @@ impl NextcloudUploader {
 
 /// Map a reqwest transport error to a retryable `Http { status: None, .. }`.
 pub(crate) fn transport_err(e: reqwest::Error) -> CoreError {
-    CoreError::Http { status: None, msg: e.to_string() }
+    CoreError::Http {
+        status: None,
+        msg: e.to_string(),
+    }
 }
 
 #[async_trait]
@@ -759,7 +780,10 @@ mod tests {
     }
 
     fn test_secret() -> Secret {
-        Secret { username: "alice".into(), app_password: "app-pw-1234".into() }
+        Secret {
+            username: "alice".into(),
+            app_password: "app-pw-1234".into(),
+        }
     }
 
     #[test]
@@ -874,6 +898,37 @@ mod tests {
 
         let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
         assert!(up.already_present("clip.mp4", 2048).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_present_false_on_207_with_mismatched_size() {
+        // The trait contract is "exists with byte size `size`". A remote file
+        // of a DIFFERENT size must NOT count as present — the worker's
+        // idempotent skip marks the job Done on Ok(true), which can trigger
+        // delete_after_verify card deletion against a non-matching remote.
+        let server = MockServer::start().await;
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/GoPro/clip.mp4</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength>2048</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path("/remote.php/dav/files/alice/GoPro/clip.mp4"))
+            .respond_with(ResponseTemplate::new(207).set_body_raw(xml, "application/xml"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        assert!(
+            !up.already_present("clip.mp4", 1024).await.unwrap(),
+            "remote is 2048 bytes, local is 1024 — must fall through to upload"
+        );
     }
 
     #[test]
@@ -1075,7 +1130,10 @@ mod tests {
         // The MOVE only matches if it carries the exact OC-Checksum; otherwise
         // there is no mock and move_assemble sees a 404 -> the call errors.
         Mock::given(wm_method("MOVE"))
-            .and(header("OC-Checksum", format!("md5:{expected_md5}").as_str()))
+            .and(header(
+                "OC-Checksum",
+                format!("md5:{expected_md5}").as_str(),
+            ))
             .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"e\""))
             .expect(1)
             .mount(&server)
@@ -1187,21 +1245,27 @@ mod tests {
 
         // Only part 00002 should be PUT (00001 is skipped). No MKCOL expected.
         Mock::given(wm_method("PUT"))
-            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/00002"))
+            .and(wm_path(
+                "/remote.php/dav/uploads/alice/gpbeam-resume-1/00002",
+            ))
             .respond_with(ResponseTemplate::new(201))
             .expect(1)
             .mount(&server)
             .await;
         // Guard against part 1 being re-uploaded.
         Mock::given(wm_method("PUT"))
-            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/00001"))
+            .and(wm_path(
+                "/remote.php/dav/uploads/alice/gpbeam-resume-1/00001",
+            ))
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(&server)
             .await;
 
         Mock::given(wm_method("MOVE"))
-            .and(wm_path("/remote.php/dav/uploads/alice/gpbeam-resume-1/.file"))
+            .and(wm_path(
+                "/remote.php/dav/uploads/alice/gpbeam-resume-1/.file",
+            ))
             .respond_with(ResponseTemplate::new(201))
             .expect(1)
             .mount(&server)
@@ -1222,6 +1286,168 @@ mod tests {
             .unwrap();
         assert_eq!(out.bytes, total);
         assert_eq!(last, total);
+    }
+
+    #[tokio::test]
+    async fn put_chunked_retry_reuses_deterministic_resume_dir() {
+        // G1 regression: the worker always supplies the deterministic resume id
+        // ("gpbeam-{job_id}") and persists THAT id in every checkpoint. When the
+        // dir doesn't exist yet (first attempt -> PROPFIND 404), put_chunked
+        // must MKCOL the SAME deterministic dir — never switch to a fresh
+        // gpbeam-{uuid} the worker doesn't know about — so a retry's PROPFIND
+        // finds the chunks already uploaded and skips them.
+        let server = MockServer::start().await;
+        let total: u64 = 10 * 1024 * 1024; // 2 chunks @ 5 MiB
+        let chunk = 5u64 * 1024 * 1024;
+        let dir_path = "/remote.php/dav/uploads/alice/gpbeam-77";
+
+        // Attempt 1: the deterministic dir does not exist yet.
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path(dir_path))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Attempt 2: the SAME dir now lists chunk 00001 fully stored.
+        let listing = format!(
+            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{dir_path}/00001</d:href>
+    <d:propstat><d:prop><d:getcontentlength>{chunk}</d:getcontentlength></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"#
+        );
+        Mock::given(wm_method("PROPFIND"))
+            .and(wm_path(dir_path))
+            .respond_with(ResponseTemplate::new(207).set_body_raw(listing, "application/xml"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The dir is MKCOLed exactly once, under the DETERMINISTIC id.
+        Mock::given(wm_method("MKCOL"))
+            .and(wm_path(dir_path))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Attempt 1 stores chunk 1, then fails chunk 2 with a retryable 500.
+        Mock::given(wm_method("PUT"))
+            .and(wm_path(format!("{dir_path}/00001")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("PUT"))
+            .and(wm_path(format!("{dir_path}/00002")))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Attempt 2 re-PUTs ONLY chunk 2 (00001 expect(1) above guards a re-upload).
+        Mock::given(wm_method("PUT"))
+            .and(wm_path(format!("{dir_path}/00002")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("MOVE"))
+            .and(wm_path(format!("{dir_path}/.file")))
+            .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"r\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let up = NextcloudUploader::new(&cfg_for(&server.uri()), &test_secret()).unwrap();
+        let f = tmp_file(&vec![9u8; total as usize]);
+        let resume = ResumeState {
+            upload_id: Some("gpbeam-77".into()),
+            uploaded_bytes: 0,
+        };
+
+        // Attempt 1: dir missing -> created under the SAME id; chunk 2 fails.
+        let mut cb = |_n: u64| {};
+        let err = up
+            .put_chunked(
+                f.path(),
+                "GoPro/big.mp4",
+                total,
+                Some(resume.clone()),
+                &mut cb,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Http {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "attempt 1 must fail on the chunk-2 500 (NOT on a fresh-uuid dir): {err:?}"
+        );
+
+        // Attempt 2 with the SAME resume id resumes from chunk 2.
+        let mut last = 0u64;
+        let mut cb2 = |n: u64| last = n;
+        let out = up
+            .put_chunked(f.path(), "GoPro/big.mp4", total, Some(resume), &mut cb2)
+            .await
+            .unwrap();
+        assert_eq!(out.bytes, total);
+        assert_eq!(out.etag.as_deref(), Some("\"r\""));
+        assert_eq!(last, total, "skipped chunk 1 still counted in progress");
+    }
+
+    #[test]
+    fn files_url_encodes_username() {
+        // Usernames with reserved bytes must not break or redirect the DAV root.
+        assert_eq!(
+            files_url("https://c.example.com", "al ice", "x.mp4"),
+            "https://c.example.com/remote.php/dav/files/al%20ice/x.mp4"
+        );
+        assert_eq!(
+            files_url("https://c.example.com", "a/b#c?d", "x.mp4"),
+            "https://c.example.com/remote.php/dav/files/a%2Fb%23c%3Fd/x.mp4"
+        );
+    }
+
+    #[test]
+    fn uploads_url_encodes_username() {
+        assert_eq!(
+            uploads_url("https://c.example.com", "b ob", "gpbeam-1", None),
+            "https://c.example.com/remote.php/dav/uploads/b%20ob/gpbeam-1"
+        );
+        assert_eq!(
+            uploads_url("https://c.example.com", "b?ob", "gpbeam-1", Some("00001")),
+            "https://c.example.com/remote.php/dav/uploads/b%3Fob/gpbeam-1/00001"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_app_password() {
+        // Any future `{:?}` (logs, error context) must not leak the cleartext
+        // app password despite it living in a plain String field.
+        let up = NextcloudUploader::new(&test_cfg(None), &test_secret()).unwrap();
+        let dbg = format!("{up:?}");
+        assert!(
+            !dbg.contains("app-pw-1234"),
+            "Debug leaked the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("[redacted]"),
+            "Debug should mark the redaction: {dbg}"
+        );
+        assert!(
+            dbg.contains("alice"),
+            "non-secret fields stay visible: {dbg}"
+        );
     }
 
     #[tokio::test]

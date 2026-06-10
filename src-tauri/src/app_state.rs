@@ -79,6 +79,14 @@ pub struct AppState {
     pub last_run: Option<RunSummaryView>,
     pub cloud: CloudState,
     pub message: Option<String>,
+    /// Monotonic emit sequence. Bumped via [`AppState::bump_seq`] UNDER the
+    /// state lock by every path that emits a snapshot (the lib.rs fold helpers
+    /// and the mutating commands) — never by the reducers themselves, so the
+    /// pure reducer tests stay seq-agnostic. `emit_state` drops frames whose
+    /// seq is <= the last emitted one, so two threads that fold under the lock
+    /// but emit after releasing it can no longer deliver an older frame after
+    /// a newer (possibly terminal) one. Additive field; the TS side ignores it.
+    pub seq: u64,
 }
 
 impl RunProgress {
@@ -122,12 +130,24 @@ impl RunProgress {
 }
 
 impl AppState {
+    /// Bump the emit-ordering sequence (see the `seq` field doc). Called under
+    /// the state lock by every snapshot-emitting path; reducers never call it.
+    pub fn bump_seq(&mut self) {
+        self.seq += 1;
+    }
+
     /// Fold one core [`RunEvent`] into the snapshot. `now_unix` stamps run start
     /// (used later by [`RunProgress::eta_secs`]). Pure; no I/O.
     pub fn apply_run_event(&mut self, ev: &RunEvent, now_unix: i64) {
         match ev {
-            RunEvent::Scanned { new_files, total_bytes } => {
-                let mut run = self.run.take().unwrap_or_else(|| RunProgress::started(now_unix));
+            RunEvent::Scanned {
+                new_files,
+                total_bytes,
+            } => {
+                let mut run = self
+                    .run
+                    .take()
+                    .unwrap_or_else(|| RunProgress::started(now_unix));
                 run.files_total = *new_files;
                 run.bytes_total = *total_bytes;
                 run.files_done = 0;
@@ -177,7 +197,12 @@ impl AppState {
                     "insufficient space: need {need} bytes, have {have}"
                 ));
             }
-            RunEvent::RunComplete { copied, skipped, failed, bytes } => {
+            RunEvent::RunComplete {
+                copied,
+                skipped,
+                failed,
+                bytes,
+            } => {
                 self.last_run = Some(RunSummaryView {
                     copied: *copied,
                     skipped: *skipped,
@@ -185,11 +210,21 @@ impl AppState {
                     bytes: *bytes,
                 });
                 self.run = None;
-                self.status = if *failed > 0 { Status::Error } else { Status::Idle };
+                self.status = if *failed > 0 {
+                    Status::Error
+                } else {
+                    Status::Idle
+                };
             }
             RunEvent::CloudQueued { .. } => {
                 self.cloud.pending += 1;
                 self.cloud.configured = true;
+            }
+            RunEvent::CardDeleteFailed { file, error } => {
+                // Non-fatal: the file was copied + verified + recorded; only the
+                // card-side cleanup failed. Surface a message (like
+                // CloudEvent::Deleted does) WITHOUT flipping the run to Error.
+                self.message = Some(format!("{file}: card delete-after-verify failed: {error}"));
             }
             // Informational / no snapshot change: surfaced via tray/notifications
             // (lib.rs), not part of the UI state machine.
@@ -200,22 +235,56 @@ impl AppState {
         }
     }
 
+    /// Fold a HARD offload error into the snapshot: destination-dir creation or
+    /// ledger open failing, or the run itself returning `Err` (no `RunComplete`
+    /// will ever arrive). The in-flight run is over, so `run` is cleared — the
+    /// popover must not keep a phantom frozen progress bar — status flips to
+    /// `Error`, and `message` carries the cause. Pure; no I/O. Shared by the SD
+    /// and wired drivers' hard-error paths in lib.rs.
+    pub fn apply_run_error(&mut self, msg: &str) {
+        self.run = None;
+        self.status = Status::Error;
+        self.message = Some(msg.to_string());
+    }
+
     /// Fold one core [`CloudEvent`] into the snapshot. Pure; no I/O.
     pub fn apply_cloud_event(&mut self, ev: &CloudEvent) {
         match ev {
-            CloudEvent::Uploading { file, uploaded, total } => {
+            CloudEvent::Uploading {
+                file,
+                uploaded,
+                total,
+            } => {
                 self.cloud.uploading = Some(UploadProgress {
                     file: file.clone(),
                     uploaded: *uploaded,
                     total: *total,
                 });
             }
-            CloudEvent::Mirrored { .. } => {
-                self.cloud.uploading = None;
+            CloudEvent::Mirrored { file } => {
+                // With max_concurrency > 1, a Mirrored for job A can arrive
+                // while the slot shows job B mid-flight — only clear the slot
+                // when it belongs to THIS file, or B's upload would render as
+                // inactive for its whole remaining transfer.
+                if self
+                    .cloud
+                    .uploading
+                    .as_ref()
+                    .is_some_and(|u| u.file == *file)
+                {
+                    self.cloud.uploading = None;
+                }
                 self.cloud.pending = self.cloud.pending.saturating_sub(1);
             }
             CloudEvent::CloudFailed { file, error } => {
-                self.cloud.uploading = None;
+                if self
+                    .cloud
+                    .uploading
+                    .as_ref()
+                    .is_some_and(|u| u.file == *file)
+                {
+                    self.cloud.uploading = None;
+                }
                 self.cloud.failed += 1;
                 self.cloud.pending = self.cloud.pending.saturating_sub(1);
                 self.status = Status::Error;
@@ -223,6 +292,13 @@ impl AppState {
             }
             CloudEvent::Deleted { file } => {
                 self.message = Some(format!("freed card space: {file}"));
+            }
+            CloudEvent::DeleteFailed { file, error } => {
+                // NON-FATAL (same contract as RunEvent::CardDeleteFailed): the
+                // upload succeeded and the job is Done; only the post-upload
+                // card cleanup failed. Surface a message without touching the
+                // failed counter or flipping status to Error.
+                self.message = Some(format!("{file}: card delete-after-verify failed: {error}"));
             }
         }
     }
@@ -260,8 +336,17 @@ mod tests {
             started_at_unix: 1_000,
             completed_bytes: 0,
         };
-        let up = UploadProgress { file: "clip.mp4".into(), uploaded: 5, total: 10 };
-        let summary = RunSummaryView { copied: 3, skipped: 1, failed: 0, bytes: 4096 };
+        let up = UploadProgress {
+            file: "clip.mp4".into(),
+            uploaded: 5,
+            total: 10,
+        };
+        let summary = RunSummaryView {
+            copied: 3,
+            skipped: 1,
+            failed: 0,
+            bytes: 4096,
+        };
         let cloud = CloudState {
             configured: true,
             pending: 2,
@@ -275,6 +360,7 @@ mod tests {
             last_run: Some(summary.clone()),
             cloud: cloud.clone(),
             message: Some("copying".into()),
+            seq: 0,
         };
         // PartialEq + Clone round-trip.
         assert_eq!(state.clone(), state);
@@ -289,7 +375,13 @@ mod tests {
         let mut s = AppState::default();
 
         // Scanned: 2 files, 1000 bytes total. status -> Working, run created.
-        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, now);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 2,
+                total_bytes: 1000,
+            },
+            now,
+        );
         assert_eq!(s.status, Status::Working);
         let run = s.run.as_ref().expect("run created on Scanned");
         assert_eq!(run.files_total, 2);
@@ -313,7 +405,11 @@ mod tests {
 
         // File 1: Copying{index:1} -> current_file set, files_done = 0.
         s.apply_run_event(
-            &RunEvent::Copying { file: "A.MP4".into(), index: 1, total: 2 },
+            &RunEvent::Copying {
+                file: "A.MP4".into(),
+                index: 1,
+                total: 2,
+            },
             now,
         );
         let run = s.run.as_ref().unwrap();
@@ -322,18 +418,31 @@ mod tests {
 
         // Progress: bytes_done += copied.
         s.apply_run_event(
-            &RunEvent::Progress { file: "A.MP4".into(), copied: 400, total: 400 },
+            &RunEvent::Progress {
+                file: "A.MP4".into(),
+                copied: 400,
+                total: 400,
+            },
             now,
         );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 400);
 
         // Verified: files_done -> 1.
-        s.apply_run_event(&RunEvent::Verified { file: "A.MP4".into() }, now);
+        s.apply_run_event(
+            &RunEvent::Verified {
+                file: "A.MP4".into(),
+            },
+            now,
+        );
         assert_eq!(s.run.as_ref().unwrap().files_done, 1);
 
         // File 2.
         s.apply_run_event(
-            &RunEvent::Copying { file: "B.MP4".into(), index: 2, total: 2 },
+            &RunEvent::Copying {
+                file: "B.MP4".into(),
+                index: 2,
+                total: 2,
+            },
             now,
         );
         let run = s.run.as_ref().unwrap();
@@ -341,23 +450,45 @@ mod tests {
         assert_eq!(run.files_done, 1); // index - 1
 
         s.apply_run_event(
-            &RunEvent::Progress { file: "B.MP4".into(), copied: 600, total: 600 },
+            &RunEvent::Progress {
+                file: "B.MP4".into(),
+                copied: 600,
+                total: 600,
+            },
             now,
         );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
 
-        s.apply_run_event(&RunEvent::Verified { file: "B.MP4".into() }, now);
+        s.apply_run_event(
+            &RunEvent::Verified {
+                file: "B.MP4".into(),
+            },
+            now,
+        );
         assert_eq!(s.run.as_ref().unwrap().files_done, 2);
 
         // RunComplete: run -> last_run, status Idle (no failures).
         s.apply_run_event(
-            &RunEvent::RunComplete { copied: 2, skipped: 0, failed: 0, bytes: 1000 },
+            &RunEvent::RunComplete {
+                copied: 2,
+                skipped: 0,
+                failed: 0,
+                bytes: 1000,
+            },
             now,
         );
         assert!(s.run.is_none(), "run cleared on completion");
         assert_eq!(s.status, Status::Idle);
         let last = s.last_run.as_ref().expect("last_run set");
-        assert_eq!(*last, RunSummaryView { copied: 2, skipped: 0, failed: 0, bytes: 1000 });
+        assert_eq!(
+            *last,
+            RunSummaryView {
+                copied: 2,
+                skipped: 0,
+                failed: 0,
+                bytes: 1000
+            }
+        );
     }
 
     #[test]
@@ -365,10 +496,16 @@ mod tests {
         // CardDetected may arrive first (orchestrator emits it before Scanned).
         let mut s = AppState::default();
         s.apply_run_event(
-            &RunEvent::CardDetected { model: Some("HERO12".into()), serial: None },
+            &RunEvent::CardDetected {
+                model: Some("HERO12".into()),
+                serial: None,
+            },
             42,
         );
-        let run = s.run.as_ref().expect("run created by CardDetected when absent");
+        let run = s
+            .run
+            .as_ref()
+            .expect("run created by CardDetected when absent");
         assert_eq!(run.model.as_deref(), Some("HERO12"));
         assert_eq!(run.serial, None);
         assert_eq!(run.files_total, 0);
@@ -378,7 +515,13 @@ mod tests {
     #[test]
     fn verified_caps_files_done_at_total() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 10 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 10,
+            },
+            0,
+        );
         s.apply_run_event(&RunEvent::Verified { file: "x".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().files_done, 1);
         // A spurious extra Verified must not exceed files_total.
@@ -389,10 +532,19 @@ mod tests {
     #[test]
     fn failed_event_sets_error_and_message() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 10 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 10,
+            },
+            0,
+        );
         assert_eq!(s.status, Status::Working);
         s.apply_run_event(
-            &RunEvent::Failed { file: "A.MP4".into(), error: "disk read error".into() },
+            &RunEvent::Failed {
+                file: "A.MP4".into(),
+                error: "disk read error".into(),
+            },
             0,
         );
         assert_eq!(s.status, Status::Error);
@@ -402,7 +554,13 @@ mod tests {
     #[test]
     fn insufficient_space_sets_error_and_message() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::InsufficientSpace { need: 500, have: 100 }, 0);
+        s.apply_run_event(
+            &RunEvent::InsufficientSpace {
+                need: 500,
+                have: 100,
+            },
+            0,
+        );
         assert_eq!(s.status, Status::Error);
         assert_eq!(
             s.message.as_deref(),
@@ -413,16 +571,32 @@ mod tests {
     #[test]
     fn run_complete_with_failures_is_error_status() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 3, total_bytes: 30 }, 0);
         s.apply_run_event(
-            &RunEvent::RunComplete { copied: 2, skipped: 0, failed: 1, bytes: 20 },
+            &RunEvent::Scanned {
+                new_files: 3,
+                total_bytes: 30,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::RunComplete {
+                copied: 2,
+                skipped: 0,
+                failed: 1,
+                bytes: 20,
+            },
             0,
         );
         assert_eq!(s.status, Status::Error);
         assert!(s.run.is_none());
         assert_eq!(
             s.last_run.as_ref().unwrap(),
-            &RunSummaryView { copied: 2, skipped: 0, failed: 1, bytes: 20 }
+            &RunSummaryView {
+                copied: 2,
+                skipped: 0,
+                failed: 1,
+                bytes: 20
+            }
         );
     }
 
@@ -430,11 +604,116 @@ mod tests {
     fn scanned_clears_a_stale_error_message() {
         // A new run starting should clear a leftover error from a prior run.
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Failed { file: "x".into(), error: "boom".into() }, 0);
+        s.apply_run_event(
+            &RunEvent::Failed {
+                file: "x".into(),
+                error: "boom".into(),
+            },
+            0,
+        );
         assert_eq!(s.status, Status::Error);
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 5 }, 10);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 5,
+            },
+            10,
+        );
         assert_eq!(s.status, Status::Working);
-        assert!(s.message.is_none(), "Scanned resets the message for the new run");
+        assert!(
+            s.message.is_none(),
+            "Scanned resets the message for the new run"
+        );
+    }
+
+    #[test]
+    fn card_delete_failed_is_a_warning_not_an_error() {
+        // The file behind a CardDeleteFailed was copied + verified + recorded:
+        // the reducer must surface a message but never mark the run failed.
+        let mut s = AppState::default();
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 10,
+            },
+            0,
+        );
+        assert_eq!(s.status, Status::Working);
+        let run_before = s.run.clone();
+
+        s.apply_run_event(
+            &RunEvent::CardDeleteFailed {
+                file: "A.MP4".into(),
+                error: "permission denied".into(),
+            },
+            0,
+        );
+        assert_eq!(s.status, Status::Working, "status must NOT flip to Error");
+        assert_eq!(
+            s.message.as_deref(),
+            Some("A.MP4: card delete-after-verify failed: permission denied")
+        );
+        assert_eq!(s.run, run_before, "run progress untouched");
+    }
+
+    #[test]
+    fn apply_run_error_clears_run_and_sets_error() {
+        // A hard offload error (mkdir/ledger/run Err) ends the run: the phantom
+        // in-flight progress bar must be cleared, not frozen until the next run.
+        let mut s = AppState::default();
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 2,
+                total_bytes: 100,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 2,
+            },
+            0,
+        );
+        assert!(s.run.is_some());
+
+        s.apply_run_error("cannot create destination: permission denied");
+        assert!(s.run.is_none(), "in-flight run cleared on a hard error");
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("cannot create destination: permission denied")
+        );
+    }
+
+    #[test]
+    fn apply_run_error_without_a_run_still_reports() {
+        // Pre-run failures (ledger open) arrive with no run in flight.
+        let mut s = AppState::default();
+        s.apply_run_error("ledger open failed");
+        assert!(s.run.is_none());
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(s.message.as_deref(), Some("ledger open failed"));
+        // Cloud state is untouched by a local run error.
+        assert_eq!(s.cloud, CloudState::default());
+    }
+
+    #[test]
+    fn scanned_after_run_error_starts_a_clean_run() {
+        // The next run must recover from the error state exactly like after
+        // RunEvent::Failed: Scanned resets status + message.
+        let mut s = AppState::default();
+        s.apply_run_error("boom");
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 5,
+            },
+            10,
+        );
+        assert_eq!(s.status, Status::Working);
+        assert!(s.message.is_none());
     }
 
     #[test]
@@ -443,11 +722,21 @@ mod tests {
         assert!(!s.cloud.configured);
         assert_eq!(s.cloud.pending, 0);
 
-        s.apply_run_event(&RunEvent::CloudQueued { file: "A.MP4".into() }, 0);
+        s.apply_run_event(
+            &RunEvent::CloudQueued {
+                file: "A.MP4".into(),
+            },
+            0,
+        );
         assert!(s.cloud.configured);
         assert_eq!(s.cloud.pending, 1);
 
-        s.apply_run_event(&RunEvent::CloudQueued { file: "B.MP4".into() }, 0);
+        s.apply_run_event(
+            &RunEvent::CloudQueued {
+                file: "B.MP4".into(),
+            },
+            0,
+        );
         assert_eq!(s.cloud.pending, 2);
         assert!(s.cloud.configured);
     }
@@ -457,19 +746,46 @@ mod tests {
         // files_done tracks the 1-based Copying index minus one, then Verified
         // bumps it; the two paths must stay consistent across several files.
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 3, total_bytes: 300 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 3,
+                total_bytes: 300,
+            },
+            0,
+        );
 
-        s.apply_run_event(&RunEvent::Copying { file: "1".into(), index: 1, total: 3 }, 0);
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "1".into(),
+                index: 1,
+                total: 3,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().files_done, 0);
         s.apply_run_event(&RunEvent::Verified { file: "1".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().files_done, 1);
 
-        s.apply_run_event(&RunEvent::Copying { file: "2".into(), index: 2, total: 3 }, 0);
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "2".into(),
+                index: 2,
+                total: 3,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().files_done, 1); // index-1 keeps it at 1
         s.apply_run_event(&RunEvent::Verified { file: "2".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().files_done, 2);
 
-        s.apply_run_event(&RunEvent::Copying { file: "3".into(), index: 3, total: 3 }, 0);
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "3".into(),
+                index: 3,
+                total: 3,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().files_done, 2);
         s.apply_run_event(&RunEvent::Verified { file: "3".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().files_done, 3);
@@ -481,18 +797,60 @@ mod tests {
         // Live progress sends several cumulative values for ONE file; bytes_done must
         // track the cumulative value, NOT sum the deltas (the old additive bug).
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 1000 }, 0);
-        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 1,
+            },
+            0,
+        );
 
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 200, total: 1000 }, 0);
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 200,
+                total: 1000,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 200);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 1000 }, 0);
-        assert_eq!(s.run.as_ref().unwrap().bytes_done, 500, "cumulative, not 200+500");
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 1000, total: 1000 }, 0);
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 500,
+                total: 1000,
+            },
+            0,
+        );
+        assert_eq!(
+            s.run.as_ref().unwrap().bytes_done,
+            500,
+            "cumulative, not 200+500"
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 1000,
+                total: 1000,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
 
         s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
-        assert_eq!(s.run.as_ref().unwrap().completed_bytes, 1000, "verified file rolled into base");
+        assert_eq!(
+            s.run.as_ref().unwrap().completed_bytes,
+            1000,
+            "verified file rolled into base"
+        );
     }
 
     #[test]
@@ -501,11 +859,42 @@ mod tests {
         // Progress carry copied == file size. Under the cumulative reducer the second
         // one is an idempotent assignment, NOT a second add — bytes_done stays == size.
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 500 }, 0);
-        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 500 }, 0); // throttle terminal tick
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 500, total: 500 }, 0); // post-completion emit
-        assert_eq!(s.run.as_ref().unwrap().bytes_done, 500, "idempotent, not 1000");
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 500,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 1,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 500,
+                total: 500,
+            },
+            0,
+        ); // throttle terminal tick
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 500,
+                total: 500,
+            },
+            0,
+        ); // post-completion emit
+        assert_eq!(
+            s.run.as_ref().unwrap().bytes_done,
+            500,
+            "idempotent, not 1000"
+        );
         s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
         assert_eq!(s.run.as_ref().unwrap().completed_bytes, 500);
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 500);
@@ -514,16 +903,58 @@ mod tests {
     #[test]
     fn second_file_progress_adds_to_completed_base() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, 0);
-        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 2 }, 0);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 400, total: 400 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 2,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 2,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 400,
+                total: 400,
+            },
+            0,
+        );
         s.apply_run_event(&RunEvent::Verified { file: "a".into() }, 0);
 
         // File 2 starts: bytes_done resets to the completed base (400), not 0.
-        s.apply_run_event(&RunEvent::Copying { file: "b".into(), index: 2, total: 2 }, 0);
-        assert_eq!(s.run.as_ref().unwrap().bytes_done, 400, "in-flight file starts from the base");
-        s.apply_run_event(&RunEvent::Progress { file: "b".into(), copied: 250, total: 600 }, 0);
-        assert_eq!(s.run.as_ref().unwrap().bytes_done, 650, "base 400 + current 250");
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "b".into(),
+                index: 2,
+                total: 2,
+            },
+            0,
+        );
+        assert_eq!(
+            s.run.as_ref().unwrap().bytes_done,
+            400,
+            "in-flight file starts from the base"
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "b".into(),
+                copied: 250,
+                total: 600,
+            },
+            0,
+        );
+        assert_eq!(
+            s.run.as_ref().unwrap().bytes_done,
+            650,
+            "base 400 + current 250"
+        );
     }
 
     #[test]
@@ -531,13 +962,44 @@ mod tests {
         // A file that streams partway then fails emits no Verified; its partial bytes
         // must not leak into the base, so the next file starts from the real base.
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 1000 }, 0);
-        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 2 }, 0);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 300, total: 1000 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 2,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 2,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 300,
+                total: 1000,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 300);
         // No Verified for "a" (it failed). Next file's Copying drops the partial.
-        s.apply_run_event(&RunEvent::Copying { file: "b".into(), index: 2, total: 2 }, 0);
-        assert_eq!(s.run.as_ref().unwrap().bytes_done, 0, "failed partial dropped");
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "b".into(),
+                index: 2,
+                total: 2,
+            },
+            0,
+        );
+        assert_eq!(
+            s.run.as_ref().unwrap().bytes_done,
+            0,
+            "failed partial dropped"
+        );
         assert_eq!(s.run.as_ref().unwrap().completed_bytes, 0);
     }
 
@@ -546,30 +1008,84 @@ mod tests {
         // Cross-run resume: the first cumulative value for a file is large (the .part
         // prefix already on disk). bytes_done jumps to it, then continues.
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 1, total_bytes: 1000 }, 0);
-        s.apply_run_event(&RunEvent::Copying { file: "a".into(), index: 1, total: 1 }, 0);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 800, total: 1000 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 1000,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Copying {
+                file: "a".into(),
+                index: 1,
+                total: 1,
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 800,
+                total: 1000,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 800);
-        s.apply_run_event(&RunEvent::Progress { file: "a".into(), copied: 1000, total: 1000 }, 0);
+        s.apply_run_event(
+            &RunEvent::Progress {
+                file: "a".into(),
+                copied: 1000,
+                total: 1000,
+            },
+            0,
+        );
         assert_eq!(s.run.as_ref().unwrap().bytes_done, 1000);
     }
 
     #[test]
     fn completed_bytes_is_not_serialized() {
-        let run = RunProgress { completed_bytes: 123, ..RunProgress::started(0) };
+        let run = RunProgress {
+            completed_bytes: 123,
+            ..RunProgress::started(0)
+        };
         let v = serde_json::to_value(&run).unwrap();
-        assert!(v.get("completedBytes").is_none(), "internal base must not leak to UI");
+        assert!(
+            v.get("completedBytes").is_none(),
+            "internal base must not leak to UI"
+        );
         assert!(v.get("completed_bytes").is_none());
     }
 
     #[test]
     fn skipped_and_other_noop_events_do_not_change_run() {
         let mut s = AppState::default();
-        s.apply_run_event(&RunEvent::Scanned { new_files: 2, total_bytes: 20 }, 0);
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 2,
+                total_bytes: 20,
+            },
+            0,
+        );
         let before = s.run.clone();
-        s.apply_run_event(&RunEvent::Skipped { file: "dup.MP4".into() }, 0);
-        s.apply_run_event(&RunEvent::CardFileDeleted { file: "dup.MP4".into() }, 0);
-        s.apply_run_event(&RunEvent::Ejected { mount: "/Volumes/GoPro".into() }, 0);
+        s.apply_run_event(
+            &RunEvent::Skipped {
+                file: "dup.MP4".into(),
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::CardFileDeleted {
+                file: "dup.MP4".into(),
+            },
+            0,
+        );
+        s.apply_run_event(
+            &RunEvent::Ejected {
+                mount: "/Volumes/GoPro".into(),
+            },
+            0,
+        );
         s.apply_run_event(
             &RunEvent::NotGoPro(std::path::PathBuf::from("/Volumes/USB")),
             0,
@@ -588,7 +1104,11 @@ mod tests {
         });
         assert_eq!(
             s.cloud.uploading,
-            Some(UploadProgress { file: "clip.mp4".into(), uploaded: 30, total: 100 })
+            Some(UploadProgress {
+                file: "clip.mp4".into(),
+                uploaded: 30,
+                total: 100
+            })
         );
     }
 
@@ -602,7 +1122,9 @@ mod tests {
             total: 100,
         });
         assert!(s.cloud.uploading.is_some());
-        s.apply_cloud_event(&CloudEvent::Mirrored { file: "clip.mp4".into() });
+        s.apply_cloud_event(&CloudEvent::Mirrored {
+            file: "clip.mp4".into(),
+        });
         assert!(s.cloud.uploading.is_none());
         assert_eq!(s.cloud.pending, 1);
     }
@@ -611,7 +1133,9 @@ mod tests {
     fn cloud_mirrored_pending_saturates_at_zero() {
         let mut s = AppState::default();
         // pending already 0 -> Mirrored must not underflow.
-        s.apply_cloud_event(&CloudEvent::Mirrored { file: "clip.mp4".into() });
+        s.apply_cloud_event(&CloudEvent::Mirrored {
+            file: "clip.mp4".into(),
+        });
         assert_eq!(s.cloud.pending, 0);
     }
 
@@ -650,7 +1174,9 @@ mod tests {
     fn cloud_deleted_sets_message_only() {
         let mut s = AppState::default();
         s.cloud.pending = 3;
-        s.apply_cloud_event(&CloudEvent::Deleted { file: "clip.mp4".into() });
+        s.apply_cloud_event(&CloudEvent::Deleted {
+            file: "clip.mp4".into(),
+        });
         // No counter movement; status unchanged; an informational message is fine.
         assert_eq!(s.cloud.pending, 3);
         assert_eq!(s.cloud.failed, 0);
@@ -719,7 +1245,12 @@ mod tests {
                 started_at_unix: 1_700_000_000,
                 completed_bytes: 0,
             }),
-            last_run: Some(RunSummaryView { copied: 3, skipped: 1, failed: 0, bytes: 4096 }),
+            last_run: Some(RunSummaryView {
+                copied: 3,
+                skipped: 1,
+                failed: 0,
+                bytes: 4096,
+            }),
             cloud: CloudState {
                 configured: true,
                 pending: 2,
@@ -732,6 +1263,7 @@ mod tests {
                 }),
             },
             message: Some("copying".into()),
+            seq: 42,
         };
 
         let v = serde_json::to_value(&state).expect("AppState serializes");
@@ -759,7 +1291,38 @@ mod tests {
         assert_eq!(cloud["uploading"]["total"], serde_json::json!(10));
 
         assert_eq!(v["message"], serde_json::json!("copying"));
-        assert!(v.get("last_run").is_none(), "top-level key is camelCase lastRun");
+        assert_eq!(
+            v["seq"],
+            serde_json::json!(42),
+            "seq is serialized additively"
+        );
+        assert!(
+            v.get("last_run").is_none(),
+            "top-level key is camelCase lastRun"
+        );
+    }
+
+    #[test]
+    fn bump_seq_is_monotonic_and_reducers_never_touch_seq() {
+        let mut s = AppState::default();
+        assert_eq!(s.seq, 0, "fresh state starts at seq 0");
+        // Reducers (run + cloud) must NOT bump: ordering is owned by the
+        // fold/command paths under the lock, so reducer tests stay unchanged.
+        s.apply_run_event(
+            &RunEvent::Scanned {
+                new_files: 1,
+                total_bytes: 1,
+            },
+            0,
+        );
+        s.apply_cloud_event(&CloudEvent::Mirrored { file: "a".into() });
+        s.apply_run_error("boom");
+        assert_eq!(s.seq, 0, "reducers leave seq alone");
+
+        s.bump_seq();
+        assert_eq!(s.seq, 1);
+        s.bump_seq();
+        assert_eq!(s.seq, 2);
     }
 
     #[test]

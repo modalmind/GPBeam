@@ -1,6 +1,6 @@
-use crate::backoff::backoff_delay;
+use crate::backoff::backoff_delay_secs;
 use crate::cloud::{CloudEvent, CloudUploader, ResumeState, UploadOutcome};
-use crate::error::{is_retryable, Result};
+use crate::error::{io_at, is_retryable, Result};
 use crate::ledger::{CloudJob, JobState, Ledger};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +10,23 @@ use tokio::task::JoinSet;
 /// state where jobs are pending but none are claimable and no retry is
 /// scheduled. Bounds CPU so a future regression can never hot-spin.
 const IDLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Deterministic per-job chunked-upload session id.
+///
+/// Salted with a short hash of the remote path + size, NOT just the SQLite
+/// rowid: job ids are small sequential integers, so two ledgers mirroring to
+/// the same Nextcloud account (two machines, or a deleted-and-recreated
+/// ledger) would otherwise both use `…/uploads/<user>/gpbeam-1` and could
+/// silently merge each other's chunks. Same job + same target ⇒ same id
+/// (resume still works across restarts); different content destinations ⇒
+/// different ids.
+pub(crate) fn derive_upload_id(job_id: i64, remote_path: &str, total: u64) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(remote_path.as_bytes());
+    h.update(&total.to_le_bytes());
+    let hex = h.finalize().to_hex();
+    format!("gpbeam-{job_id}-{}", &hex.as_str()[..8])
+}
 
 /// Drives the persisted `cloud_jobs` queue: claims due jobs, uploads each via
 /// the injected `CloudUploader`, and records terminal state. Opens its OWN
@@ -63,6 +80,11 @@ impl CloudWorker {
         now_unix: i64,
         emit: &mut (dyn FnMut(CloudEvent) + Send),
     ) -> Result<usize> {
+        // Anchor for failure-time scheduling: `now_unix` describes the START of
+        // this pass, but a retry computed after a multi-minute upload must be
+        // based on the clock at failure time (now_unix + elapsed), or
+        // next_retry_at can land in the past.
+        let pass_start = std::time::Instant::now();
         // Claim due jobs under our OWN connection, then release the lock before I/O.
         let claimed = {
             let mut ledger = Ledger::open(&self.ledger_path)?;
@@ -72,30 +94,53 @@ impl CloudWorker {
             return Ok(0);
         }
 
+        // Start-of-upload events flow out of the spawned tasks through this
+        // channel: `emit` is a &mut closure the tasks cannot share, and the
+        // Uploading event must fire when a transfer genuinely BEGINS, not after
+        // it completed (the join loop only sees finished tasks).
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<CloudEvent>();
+
         let mut set: JoinSet<JobResult> = JoinSet::new();
         for job in claimed {
             let uploader = Arc::clone(&self.uploader);
             let ledger_path_for_task = self.ledger_path.clone();
+            let event_tx = event_tx.clone();
             set.spawn(async move {
                 let local = PathBuf::from(&job.local_path);
                 let total = job.total_bytes;
                 let job_id = job.id;
                 // G1: a deterministic upload id derived from the job id so a
                 // chunked upload resumes the SAME remote session across restarts.
-                let upload_id = format!("gpbeam-{job_id}");
+                let upload_id = derive_upload_id(job_id, &job.remote_path, total);
                 let progress_ledger_path = ledger_path_for_task.clone();
 
                 // G2 idempotent skip: if the remote object already exists, do
                 // NOT upload — signal a skip and let the drain loop mark Done.
                 match uploader.already_present(&job.remote_path, total).await {
                     Ok(true) => {
-                        return JobResult { job, result: Ok(None) };
+                        return JobResult {
+                            job,
+                            result: Ok(None),
+                        };
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        return JobResult { job, result: Err(e) };
+                        return JobResult {
+                            job,
+                            result: Err(e),
+                        };
                     }
                 }
+
+                // The pre-flight check passed and an upload is genuinely about
+                // to start: announce it now (with the resume offset), not after
+                // the transfer finished. Skip/error paths above never get here,
+                // so they emit no Uploading event.
+                let _ = event_tx.send(CloudEvent::Uploading {
+                    file: job.remote_path.clone(),
+                    uploaded: job.uploaded_bytes,
+                    total,
+                });
 
                 // G1: carry the deterministic id + persisted byte count into
                 // every attempt so `put_chunked` continues the same session.
@@ -144,7 +189,39 @@ impl CloudWorker {
         // tasks persist progress through their OWN connections, with WAL +
         // busy_timeout serializing the concurrent writers.
         let mut ledger = Ledger::open(&self.ledger_path)?;
-        while let Some(joined) = set.join_next().await {
+        drop(event_tx); // tasks hold the only remaining senders
+        let mut events_closed = false;
+        loop {
+            // Deliver start-of-upload events LIVE (as the channel receives
+            // them), not batched at the next join: with a single in-flight job
+            // a try_recv-at-join-only loop would deliver Uploading milliseconds
+            // before Mirrored — after the transfer already finished, defeating
+            // the event's purpose. The biased order prefers pending events so a
+            // task's Uploading (sent before its transfer runs) always precedes
+            // its own Mirrored/CloudFailed below.
+            let joined = tokio::select! {
+                biased;
+                ev = event_rx.recv(), if !events_closed => {
+                    match ev {
+                        Some(ev) => {
+                            emit(ev);
+                            continue;
+                        }
+                        None => {
+                            events_closed = true;
+                            continue;
+                        }
+                    }
+                }
+                joined = set.join_next() => joined,
+            };
+            let Some(joined) = joined else { break };
+            // Drain any event that raced this join (same-task Uploading is
+            // sent happens-before its JobResult, so it is already queued).
+            while let Ok(ev) = event_rx.try_recv() {
+                emit(ev);
+            }
+
             // A spawned task panicking is a bug; surface it.
             let JobResult { job, result } = joined.expect("upload task panicked");
 
@@ -154,16 +231,12 @@ impl CloudWorker {
             if matches!(result, Ok(None)) {
                 ledger.mark_job_done(job.id)?;
                 ledger.set_cloud_status(job.imported_id, "done")?;
-                emit(CloudEvent::Mirrored { file: job.remote_path.clone() });
+                emit(CloudEvent::Mirrored {
+                    file: job.remote_path.clone(),
+                });
                 terminal += 1;
                 continue;
             }
-
-            emit(CloudEvent::Uploading {
-                file: job.remote_path.clone(),
-                uploaded: 0,
-                total: job.total_bytes,
-            });
 
             match result {
                 Ok(outcome) => {
@@ -171,25 +244,34 @@ impl CloudWorker {
                     // verified upload means the whole file landed; persist the
                     // deterministic upload_id so a later resume can reuse it.
                     let resume = ResumeState {
-                        upload_id: Some(format!("gpbeam-{}", job.id)),
+                        upload_id: Some(derive_upload_id(
+                            job.id,
+                            &job.remote_path,
+                            job.total_bytes,
+                        )),
                         uploaded_bytes: job.total_bytes,
                     };
                     ledger.save_job_progress(job.id, job.total_bytes, &resume)?;
                     ledger.mark_job_done(job.id)?;
                     ledger.set_cloud_status(job.imported_id, "done")?;
-                    emit(CloudEvent::Mirrored { file: job.remote_path.clone() });
+                    emit(CloudEvent::Mirrored {
+                        file: job.remote_path.clone(),
+                    });
                     let _ = outcome; // remote_ref/etag retained for future use
 
                     // Auto-mirror delete-after-verify: now that the cloud copy is
                     // Done, the on-card source may be removed. A post-upload delete
-                    // failure must NOT regress the successful upload — surface it via
-                    // CloudFailed (logged) per Corrections #Minor, but the Mirrored
-                    // success already stands.
+                    // failure must NOT regress the successful upload — it is a
+                    // non-fatal cleanup problem, so it gets its own DeleteFailed
+                    // event (NOT CloudFailed, which UIs and the CLI exit code
+                    // treat as a lost upload). The Mirrored success stands.
                     if self.delete_after_verify {
                         if let Some(src) = job.card_src.as_deref() {
                             match std::fs::remove_file(src) {
-                                Ok(()) => emit(CloudEvent::Deleted { file: src.to_string() }),
-                                Err(e) => emit(CloudEvent::CloudFailed {
+                                Ok(()) => emit(CloudEvent::Deleted {
+                                    file: src.to_string(),
+                                }),
+                                Err(e) => emit(CloudEvent::DeleteFailed {
                                     file: src.to_string(),
                                     error: format!("post-upload delete failed: {e}"),
                                 }),
@@ -208,8 +290,16 @@ impl CloudWorker {
                     let err_text = e.to_string();
                     if is_retryable(&e) && attempt_num < self.max_attempts {
                         // Reschedule: park in Failed with a future next_retry_at.
-                        let delay = backoff_delay(attempt_num, crate::backoff::jitter_ms());
-                        let next = now_unix.saturating_add(delay.as_secs() as i64);
+                        // Base it on the FAILURE-time clock (pass start +
+                        // elapsed), not `now_unix`: a long upload that fails
+                        // must never schedule its retry in the past.
+                        // `backoff_delay_secs` rounds sub-second jitter up so
+                        // the anti-thundering-herd jitter survives.
+                        let now_fail =
+                            now_unix.saturating_add(pass_start.elapsed().as_secs() as i64);
+                        let delay_secs =
+                            backoff_delay_secs(attempt_num, crate::backoff::jitter_ms());
+                        let next = now_fail.saturating_add(delay_secs);
                         ledger.mark_job_failed(job.id, &err_text, Some(next))?;
                         // NOT terminal: do not increment `terminal`.
                     } else {
@@ -228,6 +318,12 @@ impl CloudWorker {
             }
         }
 
+        // Defensive: every sender finished before its result joined, so the
+        // channel should already be empty — but never silently drop an event.
+        while let Ok(ev) = event_rx.try_recv() {
+            emit(ev);
+        }
+
         Ok(terminal)
     }
 
@@ -235,23 +331,38 @@ impl CloudWorker {
     /// progress but jobs are still pending (parked in `Failed` awaiting a future
     /// `next_retry_at`), sleep until the nearest retry is due before looping
     /// again, so the loop never busy-spins.
-    pub async fn run_until_drained(
-        &self,
-        emit: &mut (dyn FnMut(CloudEvent) + Send),
-    ) -> Result<()> {
+    pub async fn run_until_drained(&self, emit: &mut (dyn FnMut(CloudEvent) + Send)) -> Result<()> {
+        // Cross-process single-worker invariant: the Tauri app's drain loop and
+        // `gpbeam-cli mirror` can target the SAME ledger (WAL allows concurrent
+        // connections), and the reclaim below assumes any `Uploading` row is
+        // orphaned. Without this advisory lock a second drain would steal the
+        // first's in-flight jobs: double uploads of the same file, interleaved
+        // progress writes, terminal states clobbering each other, duplicate
+        // deletes. Held for the whole drain; the OS releases it when the file
+        // drops (including on crash, which is exactly when reclaim is needed).
+        let _worker_lock = match self.try_acquire_worker_lock()? {
+            Some(lock) => lock,
+            None => {
+                // Another worker is already draining this ledger; its pass will
+                // handle everything pending. Skip gracefully — touch nothing.
+                eprintln!(
+                    "gpbeam: another cloud worker is draining this ledger; skipping this pass"
+                );
+                return Ok(());
+            }
+        };
         // H1 crash recovery: reset any job left stuck in `Uploading` by a prior
         // crash/force-quit back to `Queued` before draining. Exactly one worker
-        // runs at a time and a healthy pass always leaves jobs terminal, so any
-        // `Uploading` row seen here is orphaned; without this it is never
-        // reclaimed (claim only takes Queued/due-Failed) AND `pending_cloud_count`
-        // would keep the loop alive on an unclaimable job — a silent stall.
+        // runs at a time (enforced by the lock above) and a healthy pass always
+        // leaves jobs terminal, so any `Uploading` row seen here is orphaned;
+        // without this it is never reclaimed (claim only takes Queued/due-Failed)
+        // AND `pending_cloud_count` would keep the loop alive on an unclaimable
+        // job — a silent stall.
         {
             let mut ledger = Ledger::open(&self.ledger_path)?;
             let reclaimed = ledger.reclaim_orphaned_uploading()?;
             if reclaimed > 0 {
-                eprintln!(
-                    "gpbeam: reclaimed {reclaimed} orphaned cloud upload(s) after a restart"
-                );
+                eprintln!("gpbeam: reclaimed {reclaimed} orphaned cloud upload(s) after a restart");
             }
         }
         loop {
@@ -270,8 +381,12 @@ impl CloudWorker {
             if terminal == 0 {
                 // No job became terminal this pass. Either nothing was due yet
                 // (all parked Failed with a future next_retry_at) or all due jobs
-                // got rescheduled. Sleep until the soonest retry to avoid spinning.
-                let sleep_secs = self.secs_until_next_retry(now)?;
+                // got rescheduled. Sleep until the soonest retry — measured from
+                // a FRESH clock, not the pass-start `now`: retries are scheduled
+                // against the failure-time clock, so after a long failed upload
+                // the stale `now` would overshoot the due time by the whole pass
+                // duration (while holding the worker lock).
+                let sleep_secs = self.secs_until_next_retry(now_unix())?;
                 if let Some(secs) = sleep_secs {
                     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 } else {
@@ -291,6 +406,25 @@ impl CloudWorker {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Try to take the cross-process worker lock: an exclusive flock on
+    /// `.gpbeam-worker.lock` beside the ledger. `Ok(Some(file))` holds the lock
+    /// until the returned `File` drops; `Ok(None)` means another worker
+    /// (this process or another) already holds it.
+    fn try_acquire_worker_lock(&self) -> Result<Option<std::fs::File>> {
+        let lock_path = self.ledger_path.with_file_name(".gpbeam-worker.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(io_at(&lock_path))?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(Some(file)),
+            Err(fs4::TryLockError::WouldBlock) => Ok(None),
+            Err(fs4::TryLockError::Error(e)) => Err(io_at(&lock_path)(e)),
         }
     }
 
@@ -338,6 +472,8 @@ mod tests {
         behaviors: Vec<Behavior>,
         calls: AtomicUsize,
         present: bool,
+        /// When set, `already_present` returns this error (pre-flight failure).
+        present_error: Option<CoreError>,
         /// The `ResumeState` handed to the LAST `upload()` call, captured for
         /// G1 assertions (`None` until `upload` is invoked once).
         last_resume: Mutex<Option<ResumeState>>,
@@ -351,7 +487,10 @@ mod tests {
     }
 
     enum AttemptOutcome {
-        Ok { bytes: u64, etag: Option<String> },
+        Ok {
+            bytes: u64,
+            etag: Option<String>,
+        },
         // Consumed by the scripted error tests added in Tasks 3.3+.
         #[allow(dead_code)]
         Err(CoreError),
@@ -376,10 +515,14 @@ mod tests {
             MockUploader {
                 behaviors: vec![Behavior {
                     progress_to: None,
-                    outcome: AttemptOutcome::Ok { bytes, etag: Some("etag-1".into()) },
+                    outcome: AttemptOutcome::Ok {
+                        bytes,
+                        etag: Some("etag-1".into()),
+                    },
                 }],
                 calls: AtomicUsize::new(0),
                 present: false,
+                present_error: None,
                 last_resume: Mutex::new(None),
             }
         }
@@ -390,6 +533,7 @@ mod tests {
                 behaviors,
                 calls: AtomicUsize::new(0),
                 present: false,
+                present_error: None,
                 last_resume: Mutex::new(None),
             }
         }
@@ -399,10 +543,35 @@ mod tests {
             MockUploader {
                 behaviors: vec![Behavior {
                     progress_to: None,
-                    outcome: AttemptOutcome::Ok { bytes: 0, etag: None },
+                    outcome: AttemptOutcome::Ok {
+                        bytes: 0,
+                        etag: None,
+                    },
                 }],
                 calls: AtomicUsize::new(0),
                 present: true,
+                present_error: None,
+                last_resume: Mutex::new(None),
+            }
+        }
+
+        /// An uploader whose `already_present` pre-flight check always errors,
+        /// so `upload` is never reached.
+        fn present_check_fails() -> Self {
+            MockUploader {
+                behaviors: vec![Behavior {
+                    progress_to: None,
+                    outcome: AttemptOutcome::Ok {
+                        bytes: 0,
+                        etag: None,
+                    },
+                }],
+                calls: AtomicUsize::new(0),
+                present: false,
+                present_error: Some(CoreError::Http {
+                    status: Some(503),
+                    msg: "preflight down".into(),
+                }),
                 last_resume: Mutex::new(None),
             }
         }
@@ -420,6 +589,9 @@ mod tests {
     #[async_trait]
     impl CloudUploader for MockUploader {
         async fn already_present(&self, _remote: &str, _size: u64) -> Result<bool> {
+            if let Some(e) = &self.present_error {
+                return Err(clone_err(e));
+            }
             Ok(self.present)
         }
 
@@ -458,7 +630,14 @@ mod tests {
         let path = dir.path().join("ledger.sqlite");
         let mut l = Ledger::open(&path).unwrap();
         let imported_id = l
-            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", Some("h"))
+            .record(
+                "C346",
+                "GX010001.MP4",
+                4096,
+                1000,
+                "/dest/GX010001.MP4",
+                Some("h"),
+            )
             .unwrap();
         let job_id = l
             .enqueue_cloud_job(
@@ -512,7 +691,9 @@ mod tests {
             CloudEvent::Mirrored { file } if file == "GX010001.MP4"
         )));
         // An Uploading event was emitted at least once (start-of-upload).
-        assert!(events.iter().any(|e| matches!(e, CloudEvent::Uploading { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CloudEvent::Uploading { .. })));
     }
 
     #[tokio::test]
@@ -531,18 +712,28 @@ mod tests {
             },
             Behavior {
                 progress_to: None,
-                outcome: AttemptOutcome::Ok { bytes: 4096, etag: Some("e".into()) },
+                outcome: AttemptOutcome::Ok {
+                    bytes: 4096,
+                    etag: Some("e".into()),
+                },
             },
         ]));
-        let worker =
-            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
 
         // Pass 1 at t=1000: fails retryably, reschedules to next_retry_at = 1000 + ~2s.
         let mut ev1: Vec<CloudEvent> = Vec::new();
         let t1 = worker.run_once(1000, &mut |e| ev1.push(e)).await.unwrap();
         assert_eq!(t1, 0, "a rescheduled job is NOT terminal");
         assert!(
-            !ev1.iter().any(|e| matches!(e, CloudEvent::CloudFailed { .. })),
+            !ev1.iter()
+                .any(|e| matches!(e, CloudEvent::CloudFailed { .. })),
             "retryable failure must not emit CloudFailed"
         );
 
@@ -558,7 +749,10 @@ mod tests {
 
         // Pass 2 well after the retry window: claim_due picks up the due Failed job.
         let mut ev2: Vec<CloudEvent> = Vec::new();
-        let t2 = worker.run_once(100_000, &mut |e| ev2.push(e)).await.unwrap();
+        let t2 = worker
+            .run_once(100_000, &mut |e| ev2.push(e))
+            .await
+            .unwrap();
         assert_eq!(t2, 1, "now terminal (Done)");
         assert_eq!(uploader.call_count(), 2);
 
@@ -578,11 +772,20 @@ mod tests {
             progress_to: None,
             outcome: AttemptOutcome::Err(CoreError::CloudAuth("bad app password".into())),
         }]));
-        let worker =
-            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
 
         let mut events: Vec<CloudEvent> = Vec::new();
-        let terminal = worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+        let terminal = worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
         assert_eq!(terminal, 1, "a non-retryable failure IS terminal");
         assert_eq!(uploader.call_count(), 1);
 
@@ -617,18 +820,32 @@ mod tests {
                 msg: "still down".into(),
             }),
         }]));
-        let worker =
-            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 1, false);
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            1,
+            false,
+        );
 
         let mut events: Vec<CloudEvent> = Vec::new();
-        let terminal = worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+        let terminal = worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
         assert_eq!(terminal, 1, "retries exhausted -> terminal");
-        assert!(events.iter().any(|e| matches!(e, CloudEvent::CloudFailed { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CloudEvent::CloudFailed { .. })));
 
         let l = Ledger::open(&ledger_path).unwrap();
         let failed = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
         assert_eq!(failed.len(), 1);
-        assert!(failed[0].next_retry_at.is_none(), "no retry after exhaustion");
+        assert!(
+            failed[0].next_retry_at.is_none(),
+            "no retry after exhaustion"
+        );
         assert_eq!(l.pending_cloud_count().unwrap(), 0);
     }
 
@@ -640,10 +857,24 @@ mod tests {
         let job_id = {
             let mut l = Ledger::open(&path).unwrap();
             let imported_id = l
-                .record("C346", "GX010002.MP4", 100_000, 1000, "/dest/GX010002.MP4", Some("h"))
+                .record(
+                    "C346",
+                    "GX010002.MP4",
+                    100_000,
+                    1000,
+                    "/dest/GX010002.MP4",
+                    Some("h"),
+                )
                 .unwrap();
-            l.enqueue_cloud_job(imported_id, "nc1", "/dest/GX010002.MP4", "GX010002.MP4", 100_000, None)
-                .unwrap()
+            l.enqueue_cloud_job(
+                imported_id,
+                "nc1",
+                "/dest/GX010002.MP4",
+                "GX010002.MP4",
+                100_000,
+                None,
+            )
+            .unwrap()
         };
 
         // Attempt 1: report 60_000 bytes via progress, THEN fail retryably.
@@ -658,7 +889,10 @@ mod tests {
             },
             Behavior {
                 progress_to: Some(100_000),
-                outcome: AttemptOutcome::Ok { bytes: 100_000, etag: Some("e".into()) },
+                outcome: AttemptOutcome::Ok {
+                    bytes: 100_000,
+                    etag: Some("e".into()),
+                },
             },
         ]));
         let worker = CloudWorker::new(path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
@@ -672,8 +906,14 @@ mod tests {
             let jobs = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
             assert_eq!(jobs.len(), 1);
             assert_eq!(jobs[0].id, job_id);
-            assert_eq!(jobs[0].uploaded_bytes, 60_000, "progress persisted across the failure");
-            let resume = jobs[0].resume_state.as_ref().expect("resume_state persisted");
+            assert_eq!(
+                jobs[0].uploaded_bytes, 60_000,
+                "progress persisted across the failure"
+            );
+            let resume = jobs[0]
+                .resume_state
+                .as_ref()
+                .expect("resume_state persisted");
             assert_eq!(resume.uploaded_bytes, 60_000);
         }
 
@@ -730,6 +970,131 @@ mod tests {
             e,
             CloudEvent::Mirrored { file } if file == "GX010001.MP4"
         )));
+        // No upload ever started, so no Uploading event may fire on the skip path.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CloudEvent::Uploading { .. })),
+            "already-present skip must NOT emit Uploading"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_error_emits_no_uploading_event() {
+        // When `already_present` itself errors, no upload ever starts — the
+        // worker must NOT emit an Uploading event for a transfer that never ran.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, _job_id) = ledger_with_one_job(&dir);
+
+        let uploader = Arc::new(MockUploader::present_check_fails());
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(uploader.call_count(), 0, "upload never started");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CloudEvent::Uploading { .. })),
+            "a failed pre-flight check must NOT emit Uploading"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploading_event_fires_at_upload_start_with_resume_offset() {
+        // The Uploading event announces a transfer that is genuinely STARTING:
+        // it must precede Mirrored and carry the persisted resume offset, not a
+        // post-completion hard-coded `uploaded: 0`.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let resume = ResumeState {
+                upload_id: None,
+                uploaded_bytes: 2048,
+            };
+            l.save_job_progress(job_id, 2048, &resume).unwrap();
+        }
+
+        let uploader = Arc::new(MockUploader::ok(4096));
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        let uploading_at = events
+            .iter()
+            .position(|e| matches!(e, CloudEvent::Uploading { .. }))
+            .expect("an Uploading event was emitted");
+        let mirrored_at = events
+            .iter()
+            .position(|e| matches!(e, CloudEvent::Mirrored { .. }))
+            .expect("a Mirrored event was emitted");
+        assert!(
+            uploading_at < mirrored_at,
+            "Uploading must precede Mirrored"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CloudEvent::Uploading {
+                    uploaded: 2048,
+                    total: 4096,
+                    ..
+                }
+            )),
+            "Uploading carries the resume offset, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploading_precedes_cloud_failed_on_terminal_failure() {
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, _job_id) = ledger_with_one_job(&dir);
+
+        let uploader: Arc<dyn CloudUploader> = Arc::new(FakeUploader { succeed: false });
+        // max_attempts = 1 so the failure is terminal and emits CloudFailed.
+        let worker = CloudWorker::new(ledger_path, uploader, "nc1".into(), 2, 1, false);
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        let uploading_at = events
+            .iter()
+            .position(|e| matches!(e, CloudEvent::Uploading { .. }))
+            .expect("an Uploading event was emitted (the upload genuinely started)");
+        let failed_at = events
+            .iter()
+            .position(|e| matches!(e, CloudEvent::CloudFailed { .. }))
+            .expect("a CloudFailed event was emitted");
+        assert!(
+            uploading_at < failed_at,
+            "Uploading must precede CloudFailed"
+        );
     }
 
     #[tokio::test]
@@ -745,7 +1110,10 @@ mod tests {
         // uploaded_bytes into the next claim.
         {
             let mut l = Ledger::open(&ledger_path).unwrap();
-            let resume = ResumeState { upload_id: None, uploaded_bytes: 2048 };
+            let resume = ResumeState {
+                upload_id: None,
+                uploaded_bytes: 2048,
+            };
             l.save_job_progress(job_id, 2048, &resume).unwrap();
         }
 
@@ -767,8 +1135,9 @@ mod tests {
             .expect("worker passed a ResumeState into upload()");
         assert_eq!(
             resume.upload_id,
-            Some(format!("gpbeam-{job_id}")),
-            "deterministic upload_id derived from the job id"
+            Some(derive_upload_id(job_id, "GX010001.MP4", 4096)),
+            "deterministic upload_id derived from the job id + target (salted \
+             so two ledgers mirroring the same account cannot collide)"
         );
         assert_eq!(
             resume.uploaded_bytes, 2048,
@@ -786,12 +1155,21 @@ mod tests {
         {
             let mut l = Ledger::open(&ledger_path).unwrap();
             l.claim_due_cloud_jobs(0, 10).unwrap(); // -> Uploading, then "crash"
-            assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 1);
+            assert_eq!(
+                l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(),
+                1
+            );
         }
 
         let uploader = Arc::new(MockUploader::ok(4096));
-        let worker =
-            CloudWorker::new(ledger_path.clone(), uploader.clone(), "nc1".into(), 2, 8, false);
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
 
         // Bound it: a regression to the busy-spin would hang here instead of
         // returning, so the timeout converts that into a clean failure.
@@ -800,7 +1178,10 @@ mod tests {
             worker.run_until_drained(&mut |_| {}),
         )
         .await;
-        assert!(res.is_ok(), "run_until_drained must not spin on an orphaned Uploading job");
+        assert!(
+            res.is_ok(),
+            "run_until_drained must not spin on an orphaned Uploading job"
+        );
         res.unwrap().unwrap();
 
         let l = Ledger::open(&ledger_path).unwrap();
@@ -808,7 +1189,116 @@ mod tests {
         let done = l.list_cloud_jobs(Some(JobState::Done)).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].id, job_id);
-        assert_eq!(uploader.call_count(), 1, "the reclaimed job was actually uploaded");
+        assert_eq!(
+            uploader.call_count(),
+            1,
+            "the reclaimed job was actually uploaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_drained_skips_when_worker_lock_already_held() {
+        // Cross-process single-worker invariant: when another worker (the app's
+        // 5s drain loop vs `gpbeam-cli mirror`) holds `.gpbeam-worker.lock`,
+        // this drain must skip gracefully — no reclaim of the other worker's
+        // in-flight Uploading rows, no claims, no uploads, no events.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, job_id) = ledger_with_one_job(&dir);
+        // Simulate the OTHER worker mid-upload: its claimed job sits in Uploading.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            l.claim_due_cloud_jobs(0, 10).unwrap();
+            assert_eq!(
+                l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(),
+                1
+            );
+        }
+        // Hold the advisory lock as the concurrent process would (flock
+        // conflicts across separate file descriptions even in one process).
+        let lock_path = ledger_path.with_file_name(".gpbeam-worker.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+
+        let uploader = Arc::new(MockUploader::ok(4096));
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        let mut events: Vec<CloudEvent> = Vec::new();
+        worker
+            .run_until_drained(&mut |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert_eq!(uploader.call_count(), 0, "a skipped drain must not upload");
+        assert!(events.is_empty(), "a skipped drain must not emit events");
+        let l = Ledger::open(&ledger_path).unwrap();
+        let uploading = l.list_cloud_jobs(Some(JobState::Uploading)).unwrap();
+        assert_eq!(
+            uploading.len(),
+            1,
+            "the other worker's in-flight Uploading row must NOT be reclaimed"
+        );
+        assert_eq!(uploading[0].id, job_id);
+    }
+
+    #[tokio::test]
+    async fn run_until_drained_releases_lock_so_sequential_drains_both_run() {
+        // The worker lock is held only for the duration of a drain: two
+        // sequential drains on the same ledger must both make progress.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, _job_a) = ledger_with_one_job(&dir);
+
+        let uploader = Arc::new(MockUploader::ok(0)); // 0 => report `total`
+        let worker = CloudWorker::new(
+            ledger_path.clone(),
+            uploader.clone(),
+            "nc1".into(),
+            2,
+            8,
+            false,
+        );
+
+        worker.run_until_drained(&mut |_| {}).await.unwrap();
+        assert_eq!(uploader.call_count(), 1, "first drain uploaded the job");
+
+        // Enqueue a second job, then drain again — must not be blocked by a
+        // stale lock from the first drain.
+        {
+            let mut l = Ledger::open(&ledger_path).unwrap();
+            let imp = l
+                .record(
+                    "C346",
+                    "GX010002.MP4",
+                    8192,
+                    1001,
+                    "/dest/GX010002.MP4",
+                    Some("h"),
+                )
+                .unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/dest/GX010002.MP4", "GX010002.MP4", 8192, None)
+                .unwrap();
+        }
+        worker.run_until_drained(&mut |_| {}).await.unwrap();
+        assert_eq!(
+            uploader.call_count(),
+            2,
+            "second drain uploaded the new job"
+        );
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        assert_eq!(l.pending_cloud_count().unwrap(), 0);
+        assert_eq!(l.list_cloud_jobs(Some(JobState::Done)).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -818,23 +1308,51 @@ mod tests {
         let (id_a, id_b) = {
             let mut l = Ledger::open(&path).unwrap();
             let imp_a = l
-                .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", Some("h"))
+                .record(
+                    "C346",
+                    "GX010001.MP4",
+                    4096,
+                    1000,
+                    "/dest/GX010001.MP4",
+                    Some("h"),
+                )
                 .unwrap();
             let imp_b = l
-                .record("C346", "GX010002.MP4", 8192, 1001, "/dest/GX010002.MP4", Some("h"))
+                .record(
+                    "C346",
+                    "GX010002.MP4",
+                    8192,
+                    1001,
+                    "/dest/GX010002.MP4",
+                    Some("h"),
+                )
                 .unwrap();
             let a = l
-                .enqueue_cloud_job(imp_a, "nc1", "/dest/GX010001.MP4", "GX010001.MP4", 4096, None)
+                .enqueue_cloud_job(
+                    imp_a,
+                    "nc1",
+                    "/dest/GX010001.MP4",
+                    "GX010001.MP4",
+                    4096,
+                    None,
+                )
                 .unwrap();
             let b = l
-                .enqueue_cloud_job(imp_b, "nc1", "/dest/GX010002.MP4", "GX010002.MP4", 8192, None)
+                .enqueue_cloud_job(
+                    imp_b,
+                    "nc1",
+                    "/dest/GX010002.MP4",
+                    "GX010002.MP4",
+                    8192,
+                    None,
+                )
                 .unwrap();
             (a, b)
         };
 
         // Always succeeds; behavior round-robins the last entry across both jobs.
         let uploader = Arc::new(MockUploader::ok(0)); // 0 => report `total`
-        // max_concurrency = 1 forces TWO run_once passes, exercising the loop.
+                                                      // max_concurrency = 1 forces TWO run_once passes, exercising the loop.
         let worker = CloudWorker::new(path.clone(), uploader.clone(), "nc1".into(), 1, 8, false);
 
         let mut events: Vec<CloudEvent> = Vec::new();
@@ -859,6 +1377,64 @@ mod tests {
         assert_eq!(mirrored, 2);
     }
 
+    /// Fails retryably after a real-time delay — proves the retry schedule is
+    /// computed from the failure-time clock, not the pass-start clock.
+    struct SlowFailUploader {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl CloudUploader for SlowFailUploader {
+        async fn already_present(&self, _remote: &str, _size: u64) -> Result<bool> {
+            Ok(false)
+        }
+        async fn upload(
+            &self,
+            _local: &Path,
+            _remote: &str,
+            _total: u64,
+            _resume: Option<ResumeState>,
+            _progress: &mut (dyn FnMut(u64) + Send),
+        ) -> Result<UploadOutcome> {
+            tokio::time::sleep(self.delay).await;
+            Err(CoreError::Http {
+                status: Some(503),
+                msg: "slow boom".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_schedule_uses_failure_time_clock_not_pass_start() {
+        // An upload that runs ~2.2s before failing retryably must schedule
+        // next_retry_at from the clock AT FAILURE TIME: at least
+        // now_unix + elapsed(>=2s) + base(2s) = 1004. The pass-start clock
+        // (old behavior) tops out at 1000 + 2 + ceil(jitter) = 1003, so a
+        // multi-minute upload would schedule its retry in the past.
+        let dir = TempDir::new().unwrap();
+        let (ledger_path, _job_id) = ledger_with_one_job(&dir);
+
+        let uploader: Arc<dyn CloudUploader> = Arc::new(SlowFailUploader {
+            delay: std::time::Duration::from_millis(2_200),
+        });
+        let worker = CloudWorker::new(ledger_path.clone(), uploader, "nc1".into(), 2, 8, false);
+
+        let terminal = worker.run_once(1000, &mut |_| {}).await.unwrap();
+        assert_eq!(
+            terminal, 0,
+            "a retryable failure is rescheduled, not terminal"
+        );
+
+        let l = Ledger::open(&ledger_path).unwrap();
+        let failed = l.list_cloud_jobs(Some(JobState::Failed)).unwrap();
+        assert_eq!(failed.len(), 1);
+        let next = failed[0].next_retry_at.unwrap();
+        assert!(
+            next >= 1000 + 2 + 2,
+            "retry base must reflect the ~2s spent uploading, got {next}"
+        );
+    }
+
     /// Fake uploader: succeeds or fails deterministically; never touches a network.
     struct FakeUploader {
         succeed: bool,
@@ -879,9 +1455,16 @@ mod tests {
         ) -> Result<UploadOutcome> {
             progress(total);
             if self.succeed {
-                Ok(UploadOutcome { remote_ref: remote.to_string(), bytes: total, etag: Some("\"e\"".into()) })
+                Ok(UploadOutcome {
+                    remote_ref: remote.to_string(),
+                    bytes: total,
+                    etag: Some("\"e\"".into()),
+                })
             } else {
-                Err(CoreError::Http { status: Some(500), msg: "boom".into() })
+                Err(CoreError::Http {
+                    status: Some(500),
+                    msg: "boom".into(),
+                })
             }
         }
     }
@@ -924,7 +1507,9 @@ mod tests {
             .unwrap();
 
         assert!(!card_file.exists(), "card source deleted after cloud Done");
-        assert!(events.iter().any(|e| matches!(e, CloudEvent::Deleted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CloudEvent::Deleted { .. })));
     }
 
     #[tokio::test]
@@ -939,9 +1524,17 @@ mod tests {
         let worker = CloudWorker::new(ledger_path, uploader, "nc1".into(), 2, 1, true);
 
         let mut events = Vec::new();
-        worker.run_once(1000, &mut |e| events.push(e)).await.unwrap();
+        worker
+            .run_once(1000, &mut |e| events.push(e))
+            .await
+            .unwrap();
 
-        assert!(card_file.exists(), "failed upload must NOT delete the card source");
-        assert!(!events.iter().any(|e| matches!(e, CloudEvent::Deleted { .. })));
+        assert!(
+            card_file.exists(),
+            "failed upload must NOT delete the card source"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CloudEvent::Deleted { .. })));
     }
 }

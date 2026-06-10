@@ -58,6 +58,19 @@ pub struct CloudJob {
     pub resume_state: Option<ResumeState>,
 }
 
+/// The cloud-job half of an atomic record+enqueue (see
+/// [`Ledger::record_imported_with_cloud_job`]). The job's `local_path` is the
+/// imported file's `dest_path`, so it is not repeated here.
+#[derive(Debug, Clone, Copy)]
+pub struct CloudJobSpec<'a> {
+    pub destination_id: &'a str,
+    pub remote_path: &'a str,
+    pub total_bytes: u64,
+    /// On-card source path (worker deletes after a verified upload); `None`
+    /// for the wired path, which has no on-disk source.
+    pub card_src: Option<&'a str>,
+}
+
 /// One due row of `camera_delete_pending` (joined to a Done cloud upload).
 /// `size`/`captured_unix` identify the exact recording so the reap never deletes
 /// a different file that happens to reuse the same on-card path (M4 safety).
@@ -82,6 +95,14 @@ pub struct ImportRow {
 }
 
 impl Ledger {
+    /// Test-only escape hatch: the raw connection, for fault injection from
+    /// sibling modules' tests (e.g. dropping a table to force an enqueue
+    /// failure inside `commit_imported`).
+    #[cfg(test)]
+    pub(crate) fn raw_conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::from_conn(conn)
@@ -91,7 +112,7 @@ impl Ledger {
         Self::from_conn(Connection::open_in_memory()?)
     }
 
-    fn from_conn(conn: Connection) -> Result<Self> {
+    fn from_conn(mut conn: Connection) -> Result<Self> {
         // WAL + busy_timeout let the sync offload connection and the async cloud
         // worker's own connection share this file without "database is locked".
         // journal_mode returns a row, so use query_row (execute_batch would error
@@ -99,9 +120,17 @@ impl Ledger {
         conn.query_row("PRAGMA journal_mode=WAL", [], |_r| Ok(()))?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
 
+        // Each migration body runs inside ONE explicit transaction (the
+        // `PRAGMA user_version = N` bump included — it is header data and
+        // journals like any write). A mid-batch failure therefore rolls the
+        // whole step back: without this, a failure after e.g. the v2 ALTER
+        // TABLE succeeded would leave the schema half-migrated with
+        // user_version un-bumped, and every later open would die on
+        // "duplicate column name" — a permanently bricked ledger.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 1 {
-            conn.execute_batch(
+            let tx = conn.transaction()?;
+            tx.execute_batch(
                 "CREATE TABLE imported (
                     id            INTEGER PRIMARY KEY,
                     camera_serial TEXT NOT NULL,
@@ -115,11 +144,13 @@ impl Ledger {
                  );
                  PRAGMA user_version = 1;",
             )?;
+            tx.commit()?;
         }
         if version < 2 {
             // Additive v2 migration: cloud-job queue + per-file cloud status.
             // cloud_jobs includes card_src from the start (Shared Contract C3).
-            conn.execute_batch(
+            let tx = conn.transaction()?;
+            tx.execute_batch(
                 "ALTER TABLE imported ADD COLUMN cloud_status TEXT;
                  CREATE TABLE cloud_jobs (
                      id             INTEGER PRIMARY KEY,
@@ -141,12 +172,14 @@ impl Ledger {
                  CREATE INDEX idx_cloud_jobs_state ON cloud_jobs(state, next_retry_at);
                  PRAGMA user_version = 2;",
             )?;
+            tx.commit()?;
         }
         if version < 3 {
             // Additive v3 migration (M4 deferred delete-after-verify): a per-file
             // marker that the camera original may be deleted once its cloud upload
             // reaches Done. Reaped on the next wired connect (see wired/offload.rs).
-            conn.execute_batch(
+            let tx = conn.transaction()?;
+            tx.execute_batch(
                 "CREATE TABLE camera_delete_pending (
                      id            INTEGER PRIMARY KEY,
                      camera_serial TEXT NOT NULL,
@@ -163,12 +196,19 @@ impl Ledger {
                      ON camera_delete_pending(camera_serial, deleted);
                  PRAGMA user_version = 3;",
             )?;
+            tx.commit()?;
         }
         Ok(Ledger { conn })
     }
 
     /// Cheap dedup pre-check — never hashes the file.
-    pub fn is_imported(&self, serial: &str, name: &str, size: u64, mtime_unix: i64) -> Result<bool> {
+    pub fn is_imported(
+        &self,
+        serial: &str,
+        name: &str,
+        size: u64,
+        mtime_unix: i64,
+    ) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(1) FROM imported
              WHERE camera_serial=?1 AND name=?2 AND size=?3 AND mtime_unix=?4",
@@ -190,22 +230,40 @@ impl Ledger {
         dest_path: &str,
         hash: Option<&str>,
     ) -> Result<i64> {
-        // Upsert (ON CONFLICT DO UPDATE) rather than INSERT OR REPLACE so the
-        // existing rowid is preserved on a re-record of the same UNIQUE key
-        // (REPLACE would delete + re-insert, allocating a fresh rowid).
-        self.conn.execute(
-            "INSERT INTO imported
-             (camera_serial, name, size, mtime_unix, dest_path, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(camera_serial, name, size, mtime_unix)
-             DO UPDATE SET dest_path=excluded.dest_path, hash=excluded.hash",
-            rusqlite::params![serial, name, size as i64, mtime_unix, dest_path, hash],
-        )?;
-        // Read the id back by UNIQUE key (robust to rowid reassignment).
-        let id = self
-            .imported_id(serial, name, size, mtime_unix)?
-            .expect("row just inserted must exist");
-        Ok(id)
+        record_on(&self.conn, serial, name, size, mtime_unix, dest_path, hash)
+    }
+
+    /// Atomically record an imported file AND (when `job` is `Some`) enqueue
+    /// its cloud upload job in ONE transaction, so either both land or neither
+    /// — a failure between the two can never leave a file imported-but-never-
+    /// queued (silently unmirrored forever). The job's `local_path` is
+    /// `dest_path` (true for every caller). Returns the `imported` row id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_imported_with_cloud_job(
+        &mut self,
+        serial: &str,
+        name: &str,
+        size: u64,
+        mtime_unix: i64,
+        dest_path: &str,
+        hash: Option<&str>,
+        job: Option<CloudJobSpec<'_>>,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        let imported_id = record_on(&tx, serial, name, size, mtime_unix, dest_path, hash)?;
+        if let Some(j) = job {
+            enqueue_cloud_job_on(
+                &tx,
+                imported_id,
+                j.destination_id,
+                dest_path,
+                j.remote_path,
+                j.total_bytes,
+                j.card_src,
+            )?;
+        }
+        tx.commit()?;
+        Ok(imported_id)
     }
 
     /// Look up the `imported` row id for a UNIQUE key, if present.
@@ -216,20 +274,7 @@ impl Ledger {
         size: u64,
         mtime_unix: i64,
     ) -> Result<Option<i64>> {
-        let id = self
-            .conn
-            .query_row(
-                "SELECT id FROM imported
-                 WHERE camera_serial=?1 AND name=?2 AND size=?3 AND mtime_unix=?4",
-                rusqlite::params![serial, name, size as i64, mtime_unix],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        Ok(id)
+        imported_id_on(&self.conn, serial, name, size, mtime_unix)
     }
 
     /// Stamp the per-file cloud status (e.g. "queued", "done").
@@ -257,7 +302,14 @@ impl Ledger {
             "INSERT INTO camera_delete_pending
              (camera_serial, dir, name, size, captured_unix, imported_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![camera_serial, dir, name, size as i64, captured_unix, imported_id],
+            rusqlite::params![
+                camera_serial,
+                dir,
+                name,
+                size as i64,
+                captured_unix,
+                imported_id
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -308,22 +360,15 @@ impl Ledger {
         total_bytes: u64,
         card_src: Option<&str>,
     ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO cloud_jobs
-             (imported_id, destination_id, local_path, remote_path, card_src, state,
-              attempts, total_bytes, uploaded_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0)",
-            rusqlite::params![
-                imported_id,
-                destination_id,
-                local_path,
-                remote_path,
-                card_src,
-                JobState::Queued.as_str(),
-                total_bytes as i64,
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        enqueue_cloud_job_on(
+            &self.conn,
+            imported_id,
+            destination_id,
+            local_path,
+            remote_path,
+            total_bytes,
+            card_src,
+        )
     }
 
     /// Count jobs not yet finished: Queued, Uploading, or Failed-pending-retry
@@ -343,6 +388,20 @@ impl Ledger {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Count of cloud jobs in the TERMINAL Failed state: `state='failed'` AND
+    /// `next_retry_at IS NULL` (the worker gave up — Shared Contract C2).
+    /// Failed-but-pending-retry rows (non-NULL `next_retry_at`) are NOT
+    /// counted here; they still count in [`Ledger::pending_cloud_count`].
+    pub fn failed_cloud_count(&self) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM cloud_jobs
+             WHERE state=?1 AND next_retry_at IS NULL",
+            rusqlite::params![JobState::Failed.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     /// List cloud jobs, optionally filtered to one state, ordered by id.
@@ -538,6 +597,86 @@ impl Ledger {
     }
 }
 
+/// Connection-level body of [`Ledger::record`]: upsert the `imported` row and
+/// return its id. Takes `&Connection` (a `Transaction` derefs to one) so the
+/// atomic record+enqueue path shares the exact same SQL.
+fn record_on(
+    conn: &Connection,
+    serial: &str,
+    name: &str,
+    size: u64,
+    mtime_unix: i64,
+    dest_path: &str,
+    hash: Option<&str>,
+) -> Result<i64> {
+    // Upsert (ON CONFLICT DO UPDATE) rather than INSERT OR REPLACE so the
+    // existing rowid is preserved on a re-record of the same UNIQUE key
+    // (REPLACE would delete + re-insert, allocating a fresh rowid).
+    conn.execute(
+        "INSERT INTO imported
+         (camera_serial, name, size, mtime_unix, dest_path, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(camera_serial, name, size, mtime_unix)
+         DO UPDATE SET dest_path=excluded.dest_path, hash=excluded.hash",
+        rusqlite::params![serial, name, size as i64, mtime_unix, dest_path, hash],
+    )?;
+    // Read the id back by UNIQUE key (robust to rowid reassignment).
+    let id = imported_id_on(conn, serial, name, size, mtime_unix)?
+        .expect("row just inserted must exist");
+    Ok(id)
+}
+
+/// Connection-level body of [`Ledger::imported_id`].
+fn imported_id_on(
+    conn: &Connection,
+    serial: &str,
+    name: &str,
+    size: u64,
+    mtime_unix: i64,
+) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM imported
+             WHERE camera_serial=?1 AND name=?2 AND size=?3 AND mtime_unix=?4",
+            rusqlite::params![serial, name, size as i64, mtime_unix],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(id)
+}
+
+/// Connection-level body of [`Ledger::enqueue_cloud_job`].
+fn enqueue_cloud_job_on(
+    conn: &Connection,
+    imported_id: i64,
+    destination_id: &str,
+    local_path: &str,
+    remote_path: &str,
+    total_bytes: u64,
+    card_src: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO cloud_jobs
+         (imported_id, destination_id, local_path, remote_path, card_src, state,
+          attempts, total_bytes, uploaded_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0)",
+        rusqlite::params![
+            imported_id,
+            destination_id,
+            local_path,
+            remote_path,
+            card_src,
+            JobState::Queued.as_str(),
+            total_bytes as i64,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Map a `cloud_jobs` row to a [`CloudJob`]. The SELECT column order is fixed
 /// (see `list_cloud_jobs` / `claim_due_cloud_jobs`): id, imported_id,
 /// destination_id, local_path, remote_path, card_src, state, attempts,
@@ -559,11 +698,7 @@ fn row_to_cloud_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudJob> {
     let resume_json: Option<String> = row.get(12)?;
     let resume_state = match resume_json {
         Some(s) => Some(serde_json::from_str::<ResumeState>(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                12,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e))
         })?),
         None => None,
     };
@@ -591,10 +726,14 @@ fn row_to_cloud_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudJob> {
 mod tests {
     use super::*;
 
-    fn mem() -> Ledger { Ledger::open_in_memory().unwrap() }
+    fn mem() -> Ledger {
+        Ledger::open_in_memory().unwrap()
+    }
 
     fn user_version(l: &Ledger) -> i64 {
-        l.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+        l.conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
@@ -617,20 +756,24 @@ mod tests {
         // The table exists and is queryable.
         let n: i64 = l
             .conn
-            .query_row("SELECT COUNT(*) FROM camera_delete_pending", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM camera_delete_pending", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 0);
     }
 
     fn record_imported(l: &mut Ledger, serial: &str, name: &str) -> i64 {
-        l.record(serial, name, 4096, 1000, "/dest/file", None).unwrap()
+        l.record(serial, name, 4096, 1000, "/dest/file", None)
+            .unwrap()
     }
 
     #[test]
     fn camera_delete_is_hidden_until_cloud_status_done() {
         let mut l = mem();
         let imp = record_imported(&mut l, "C346", "GX010001.MP4");
-        l.enqueue_camera_delete("C346", "100GOPRO", "GX010001.MP4", 4096, 1000, imp).unwrap();
+        l.enqueue_camera_delete("C346", "100GOPRO", "GX010001.MP4", 4096, 1000, imp)
+            .unwrap();
 
         // cloud_status NULL -> not due.
         assert!(l.due_camera_deletes("C346").unwrap().is_empty());
@@ -652,8 +795,11 @@ mod tests {
         let mut l = mem();
         let a = record_imported(&mut l, "C346", "A.MP4");
         let b = record_imported(&mut l, "C999", "B.MP4");
-        let ia = l.enqueue_camera_delete("C346", "100GOPRO", "A.MP4", 1, 1, a).unwrap();
-        l.enqueue_camera_delete("C999", "100GOPRO", "B.MP4", 1, 1, b).unwrap();
+        let ia = l
+            .enqueue_camera_delete("C346", "100GOPRO", "A.MP4", 1, 1, a)
+            .unwrap();
+        l.enqueue_camera_delete("C999", "100GOPRO", "B.MP4", 1, 1, b)
+            .unwrap();
         l.set_cloud_status(a, "done").unwrap();
         l.set_cloud_status(b, "done").unwrap();
 
@@ -668,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_v1_db_upgrades_to_v2_without_losing_rows() {
+    fn existing_v1_db_upgrades_to_v3_without_losing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.db");
 
@@ -728,12 +874,173 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    /// Hand-build the exact M2 (v2) schema: the v1 `imported` table plus the
+    /// v2 additions (`cloud_status` column, `cloud_jobs` table + index).
+    fn build_v2_db(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE imported (
+                 id            INTEGER PRIMARY KEY,
+                 camera_serial TEXT NOT NULL,
+                 name          TEXT NOT NULL,
+                 size          INTEGER NOT NULL,
+                 mtime_unix    INTEGER NOT NULL,
+                 dest_path     TEXT NOT NULL,
+                 hash          TEXT,
+                 copied_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                 cloud_status  TEXT,
+                 UNIQUE(camera_serial, name, size, mtime_unix)
+             );
+             CREATE TABLE cloud_jobs (
+                 id             INTEGER PRIMARY KEY,
+                 imported_id    INTEGER NOT NULL,
+                 destination_id TEXT NOT NULL,
+                 local_path     TEXT NOT NULL,
+                 remote_path    TEXT NOT NULL,
+                 card_src       TEXT,
+                 state          TEXT NOT NULL,
+                 attempts       INTEGER NOT NULL DEFAULT 0,
+                 next_retry_at  INTEGER,
+                 last_error     TEXT,
+                 total_bytes    INTEGER NOT NULL DEFAULT 0,
+                 uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                 resume_state   TEXT,
+                 created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                 FOREIGN KEY (imported_id) REFERENCES imported(id)
+             );
+             CREATE INDEX idx_cloud_jobs_state ON cloud_jobs(state, next_retry_at);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn existing_v2_db_with_cloud_jobs_upgrades_to_v3_without_losing_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+
+        // A v2 DB with one imported row and one QUEUED cloud job, then closed.
+        {
+            build_v2_db(&path);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO imported (camera_serial, name, size, mtime_unix, dest_path, hash)
+                 VALUES ('C346', 'GX010001.MP4', 4096, 1000, '/dest/GX010001.MP4', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cloud_jobs
+                 (imported_id, destination_id, local_path, remote_path, card_src, state,
+                  attempts, total_bytes, uploaded_bytes)
+                 VALUES (1, 'nc1', '/dest/GX010001.MP4', 'GoPro/GX010001.MP4',
+                         '/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4', 'queued', 0, 4096, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Re-open through Ledger -> v3 in place, queue intact.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 3);
+        assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+        assert_eq!(
+            l.pending_cloud_count().unwrap(),
+            1,
+            "queued job survives the migration"
+        );
+        let jobs = l.list_cloud_jobs(Some(JobState::Queued)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].remote_path, "GoPro/GX010001.MP4");
+        assert_eq!(
+            jobs[0].card_src.as_deref(),
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4")
+        );
+        // The v3 table exists.
+        let n: i64 = l
+            .conn
+            .query_row("SELECT COUNT(*) FROM camera_delete_pending", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_a_later_open_can_retry() {
+        // A v1 DB whose v2 migration WILL fail partway: the ALTER TABLE
+        // succeeds, then `CREATE TABLE cloud_jobs` hits a pre-existing table of
+        // that name. Without a transaction around the batch, the ALTER sticks
+        // while user_version stays 1 — every later open then dies forever on
+        // "duplicate column name" (a bricked ledger). With the transaction the
+        // whole step rolls back, and once the obstacle is removed the same DB
+        // migrates cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE imported (
+                     id            INTEGER PRIMARY KEY,
+                     camera_serial TEXT NOT NULL,
+                     name          TEXT NOT NULL,
+                     size          INTEGER NOT NULL,
+                     mtime_unix    INTEGER NOT NULL,
+                     dest_path     TEXT NOT NULL,
+                     hash          TEXT,
+                     copied_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE(camera_serial, name, size, mtime_unix)
+                 );
+                 CREATE TABLE cloud_jobs (bogus TEXT); -- collides with the v2 migration
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO imported (camera_serial, name, size, mtime_unix, dest_path, hash)
+                 VALUES ('C346', 'GX010001.MP4', 4096, 1000, '/old', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // First open: the v2 migration fails (cloud_jobs already exists) ...
+        assert!(
+            Ledger::open(&path).is_err(),
+            "v2 migration must fail on the bogus table"
+        );
+
+        // ... but the failed step rolled back: still v1, no half-added column.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 1, "user_version untouched by the failed migration");
+            // Remove the obstacle for the retry.
+            conn.execute_batch("DROP TABLE cloud_jobs;").unwrap();
+        }
+
+        // Retry: migrates cleanly to v3 — the v2 ALTER must NOT now fail with
+        // "duplicate column name" — and the v1 row survived.
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(user_version(&l), 3);
+        assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+    }
+
     #[test]
     fn new_file_is_not_a_duplicate_then_is_after_record() {
         let mut l = mem();
         let serial = "C346";
         assert!(!l.is_imported(serial, "GX010001.MP4", 4096, 1000).unwrap());
-        l.record(serial, "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", Some("deadbeef")).unwrap();
+        l.record(
+            serial,
+            "GX010001.MP4",
+            4096,
+            1000,
+            "/dest/GX010001.MP4",
+            Some("deadbeef"),
+        )
+        .unwrap();
         assert!(l.is_imported(serial, "GX010001.MP4", 4096, 1000).unwrap());
     }
 
@@ -746,10 +1053,18 @@ mod tests {
         // multi-camera discriminator is a conscious behavior change, not a
         // regression (see orchestrator's serial_key fallback).
         let mut l = mem();
-        l.record("unknown", "GX010001.MP4", 4096, 1000, "/destA/GX010001.MP4", None)
-            .unwrap();
+        l.record(
+            "unknown",
+            "GX010001.MP4",
+            4096,
+            1000,
+            "/destA/GX010001.MP4",
+            None,
+        )
+        .unwrap();
         assert!(
-            l.is_imported("unknown", "GX010001.MP4", 4096, 1000).unwrap(),
+            l.is_imported("unknown", "GX010001.MP4", 4096, 1000)
+                .unwrap(),
             "a second serial-less camera's identical file is (mis)treated as a dup"
         );
     }
@@ -757,7 +1072,8 @@ mod tests {
     #[test]
     fn different_size_or_mtime_is_not_duplicate() {
         let mut l = mem();
-        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None).unwrap();
+        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None)
+            .unwrap();
         assert!(!l.is_imported("C346", "GX010001.MP4", 9999, 1000).unwrap()); // size differs
         assert!(!l.is_imported("C346", "GX010001.MP4", 4096, 2000).unwrap()); // mtime differs
         assert!(!l.is_imported("OTHER", "GX010001.MP4", 4096, 1000).unwrap()); // serial differs
@@ -766,8 +1082,10 @@ mod tests {
     #[test]
     fn record_is_idempotent_on_same_key() {
         let mut l = mem();
-        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None).unwrap();
-        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", Some("hash")).unwrap(); // no error
+        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None)
+            .unwrap();
+        l.record("C346", "GX010001.MP4", 4096, 1000, "/d/a", Some("hash"))
+            .unwrap(); // no error
         assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
     }
 
@@ -789,7 +1107,10 @@ mod tests {
     #[test]
     fn imported_id_finds_recorded_row_and_none_otherwise() {
         let mut l = mem();
-        assert_eq!(l.imported_id("C346", "GX010001.MP4", 4096, 1000).unwrap(), None);
+        assert_eq!(
+            l.imported_id("C346", "GX010001.MP4", 4096, 1000).unwrap(),
+            None
+        );
         let id = l
             .record("C346", "GX010001.MP4", 4096, 1000, "/d/a", None)
             .unwrap();
@@ -819,7 +1140,14 @@ mod tests {
 
     fn enqueue_sample(l: &mut Ledger) -> (i64, i64) {
         let imported_id = l
-            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+            .record(
+                "C346",
+                "GX010001.MP4",
+                4096,
+                1000,
+                "/dest/GX010001.MP4",
+                None,
+            )
             .unwrap();
         let job_id = l
             .enqueue_cloud_job(
@@ -862,7 +1190,14 @@ mod tests {
     fn enqueue_persists_card_src_when_provided() {
         let mut l = mem();
         let imported_id = l
-            .record("C346", "GX010001.MP4", 4096, 1000, "/dest/GX010001.MP4", None)
+            .record(
+                "C346",
+                "GX010001.MP4",
+                4096,
+                1000,
+                "/dest/GX010001.MP4",
+                None,
+            )
             .unwrap();
         l.enqueue_cloud_job(
             imported_id,
@@ -879,6 +1214,122 @@ mod tests {
             jobs[0].card_src.as_deref(),
             Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4")
         );
+    }
+
+    #[test]
+    fn record_with_cloud_job_records_and_enqueues_together() {
+        let mut l = mem();
+        let spec = CloudJobSpec {
+            destination_id: "nc1",
+            remote_path: "GoPro/GX010001.MP4",
+            total_bytes: 4096,
+            card_src: Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4"),
+        };
+        let id = l
+            .record_imported_with_cloud_job(
+                "C346",
+                "GX010001.MP4",
+                4096,
+                1000,
+                "/dest/GX010001.MP4",
+                Some("h1"),
+                Some(spec),
+            )
+            .unwrap();
+        assert!(id > 0);
+        assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+        let jobs = l.list_cloud_jobs(Some(JobState::Queued)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].imported_id, id);
+        assert_eq!(
+            jobs[0].local_path, "/dest/GX010001.MP4",
+            "job local_path is the dest_path"
+        );
+        assert_eq!(jobs[0].remote_path, "GoPro/GX010001.MP4");
+        assert_eq!(jobs[0].total_bytes, 4096);
+        assert_eq!(
+            jobs[0].card_src.as_deref(),
+            Some("/Volumes/GOPRO/DCIM/100GOPRO/GX010001.MP4")
+        );
+    }
+
+    #[test]
+    fn record_with_cloud_job_none_spec_records_only() {
+        let mut l = mem();
+        let id = l
+            .record_imported_with_cloud_job(
+                "C346",
+                "GX010001.MP4",
+                4096,
+                1000,
+                "/dest/GX010001.MP4",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(id > 0);
+        assert!(l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap());
+        assert_eq!(l.pending_cloud_count().unwrap(), 0, "no spec => no job");
+    }
+
+    #[test]
+    fn record_with_cloud_job_rolls_back_record_when_enqueue_fails() {
+        // The record and the enqueue must land in ONE transaction: if the
+        // enqueue errors, the imported row must NOT survive — otherwise the
+        // file is marked imported but never queued, and later scans skip it,
+        // so it would silently never be mirrored.
+        let mut l = mem();
+        l.conn.execute_batch("DROP TABLE cloud_jobs;").unwrap();
+        let spec = CloudJobSpec {
+            destination_id: "nc1",
+            remote_path: "GoPro/GX010001.MP4",
+            total_bytes: 4096,
+            card_src: None,
+        };
+        let res = l.record_imported_with_cloud_job(
+            "C346",
+            "GX010001.MP4",
+            4096,
+            1000,
+            "/dest/GX010001.MP4",
+            None,
+            Some(spec),
+        );
+        assert!(res.is_err(), "enqueue into a missing table must fail");
+        assert!(
+            !l.is_imported("C346", "GX010001.MP4", 4096, 1000).unwrap(),
+            "the record must roll back with the failed enqueue"
+        );
+    }
+
+    #[test]
+    fn failed_cloud_count_counts_only_terminal_failed() {
+        let mut l = mem();
+        assert_eq!(l.failed_cloud_count().unwrap(), 0);
+
+        // Three jobs: one stays queued, one fails with a retry scheduled, one
+        // fails terminally (next_retry_at NULL = the worker gave up).
+        let mk = |l: &mut Ledger, name: &str, mt: i64| -> i64 {
+            let imp = l.record("C346", name, 1, mt, "/d", None).unwrap();
+            l.enqueue_cloud_job(imp, "nc1", "/d", name, 1, None)
+                .unwrap()
+        };
+        let _queued = mk(&mut l, "q.MP4", 1);
+        let retrying = mk(&mut l, "r.MP4", 2);
+        let terminal = mk(&mut l, "t.MP4", 3);
+        l.mark_job_failed(retrying, "transient", Some(9999))
+            .unwrap();
+        l.mark_job_failed(terminal, "fatal", None).unwrap();
+
+        assert_eq!(
+            l.failed_cloud_count().unwrap(),
+            1,
+            "only the terminal failure counts; queued + pending-retry do not"
+        );
+
+        // Requeueing the terminal failure empties the count again.
+        l.requeue_failed_cloud_jobs().unwrap();
+        assert_eq!(l.failed_cloud_count().unwrap(), 0);
     }
 
     #[test]
@@ -983,7 +1434,7 @@ mod tests {
         let (_imp, job_id) = enqueue_sample(&mut l);
         l.claim_due_cloud_jobs(0, 10).unwrap();
         l.mark_job_failed(job_id, "fatal", None).unwrap(); // give up: no retry
-        // Even far in the future, a NULL next_retry_at is never reclaimed.
+                                                           // Even far in the future, a NULL next_retry_at is never reclaimed.
         assert_eq!(l.claim_due_cloud_jobs(i64::MAX, 10).unwrap().len(), 0);
     }
 
@@ -1045,11 +1496,17 @@ mod tests {
         let mut l = mem();
         let (_imp, job_id) = enqueue_sample(&mut l);
         l.claim_due_cloud_jobs(0, 10).unwrap();
-        assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 1);
+        assert_eq!(
+            l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(),
+            1
+        );
 
         let n = l.reclaim_orphaned_uploading().unwrap();
         assert_eq!(n, 1, "the one orphaned Uploading row is reclaimed");
-        assert_eq!(l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(), 0);
+        assert_eq!(
+            l.list_cloud_jobs(Some(JobState::Uploading)).unwrap().len(),
+            0
+        );
         let queued = l.list_cloud_jobs(Some(JobState::Queued)).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, job_id);
@@ -1064,7 +1521,9 @@ mod tests {
         let mut l = mem();
         let mk = |l: &mut Ledger, name: &str, mt: i64, state: &str| -> i64 {
             let imp = l.record("C346", name, 1, mt, "/d", None).unwrap();
-            let j = l.enqueue_cloud_job(imp, "nc1", "/d", name, 1, None).unwrap();
+            let j = l
+                .enqueue_cloud_job(imp, "nc1", "/d", name, 1, None)
+                .unwrap();
             l.conn
                 .execute(
                     "UPDATE cloud_jobs SET state=?2 WHERE id=?1",
@@ -1160,7 +1619,14 @@ mod tests {
         let mut l = mem();
         for i in 0..3 {
             let imp = l
-                .record("C346", &format!("GX01000{i}.MP4"), 4096, 1000 + i, "/d", None)
+                .record(
+                    "C346",
+                    &format!("GX01000{i}.MP4"),
+                    4096,
+                    1000 + i,
+                    "/d",
+                    None,
+                )
                 .unwrap();
             l.enqueue_cloud_job(imp, "nc1", "/d", &format!("r{i}"), 4096, None)
                 .unwrap();
@@ -1193,12 +1659,33 @@ mod tests {
     fn recent_imports_most_recent_first() {
         let mut l = mem();
         // Three distinct files; ORDER BY id DESC means the last-recorded is first.
-        l.record("C346", "GX010001.MP4", 100, 1000, "/dest/GX010001.MP4", None)
-            .unwrap();
-        l.record("C346", "GX010002.MP4", 200, 1001, "/dest/GX010002.MP4", None)
-            .unwrap();
-        l.record("C346", "GX010003.MP4", 300, 1002, "/dest/GX010003.MP4", None)
-            .unwrap();
+        l.record(
+            "C346",
+            "GX010001.MP4",
+            100,
+            1000,
+            "/dest/GX010001.MP4",
+            None,
+        )
+        .unwrap();
+        l.record(
+            "C346",
+            "GX010002.MP4",
+            200,
+            1001,
+            "/dest/GX010002.MP4",
+            None,
+        )
+        .unwrap();
+        l.record(
+            "C346",
+            "GX010003.MP4",
+            300,
+            1002,
+            "/dest/GX010003.MP4",
+            None,
+        )
+        .unwrap();
 
         let rows = l.recent_imports(10).unwrap();
         assert_eq!(rows.len(), 3);
@@ -1238,7 +1725,14 @@ mod tests {
     fn recent_imports_reflects_cloud_status() {
         let mut l = mem();
         let id = l
-            .record("C346", "GX010001.MP4", 100, 1000, "/dest/GX010001.MP4", None)
+            .record(
+                "C346",
+                "GX010001.MP4",
+                100,
+                1000,
+                "/dest/GX010001.MP4",
+                None,
+            )
             .unwrap();
         // Before set_cloud_status the column is NULL -> None.
         assert_eq!(l.recent_imports(10).unwrap()[0].cloud_status, None);

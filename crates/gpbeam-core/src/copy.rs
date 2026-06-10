@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone)]
-pub struct CopyOutcome { pub dest: PathBuf, pub bytes: u64, pub hash: Option<String> }
+pub struct CopyOutcome {
+    pub dest: PathBuf,
+    pub bytes: u64,
+    pub hash: Option<String>,
+}
 
 /// Re-read the quiescent file at `path` from disk and confirm its BLAKE3 matches
 /// `expected_hex`. A no-op when `verify` is false. On mismatch the file is
@@ -42,14 +46,24 @@ pub fn copy_verified(
     let mut reader = std::fs::File::open(src).map_err(io_at(src))?;
     let mut tmp = NamedTempFile::new_in(dest_dir).map_err(io_at(dest_dir))?;
 
-    let mut hasher = if verify { Some(blake3::Hasher::new()) } else { None };
+    let mut hasher = if verify {
+        Some(blake3::Hasher::new())
+    } else {
+        None
+    };
     let mut buf = vec![0u8; 1024 * 1024];
     let mut copied: u64 = 0;
     loop {
         let n = reader.read(&mut buf).map_err(io_at(src))?;
-        if n == 0 { break; }
-        if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
-        tmp.as_file_mut().write_all(&buf[..n]).map_err(io_at(dest_dir))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(h) = hasher.as_mut() {
+            h.update(&buf[..n]);
+        }
+        tmp.as_file_mut()
+            .write_all(&buf[..n])
+            .map_err(io_at(dest_dir))?;
         copied += n as u64;
         progress(copied);
     }
@@ -59,8 +73,10 @@ pub fn copy_verified(
     let src_hash = hasher.map(|h| h.finalize().to_hex().to_string());
 
     // Atomically place the file (NamedTempFile is dropped/removed on early return above).
-    let persisted = tmp.persist(final_path)
-        .map_err(|e| CoreError::Io { path: final_path.to_path_buf(), source: e.error })?;
+    let persisted = tmp.persist(final_path).map_err(|e| CoreError::Io {
+        path: final_path.to_path_buf(),
+        source: e.error,
+    })?;
     persisted.sync_all().map_err(io_at(final_path))?;
 
     if let Some(ref expected) = src_hash {
@@ -69,7 +85,11 @@ pub fn copy_verified(
         verify_dest_hash(final_path, expected, true)?;
     }
 
-    Ok(CopyOutcome { dest: final_path.to_path_buf(), bytes: copied, hash: src_hash })
+    Ok(CopyOutcome {
+        dest: final_path.to_path_buf(),
+        bytes: copied,
+        hash: src_hash,
+    })
 }
 
 #[cfg(test)]
@@ -96,7 +116,10 @@ mod tests {
         let wrong = blake3::hash(b"what we expected").to_hex().to_string();
         let err = verify_dest_hash(&path, &wrong, true).unwrap_err();
         assert!(matches!(err, CoreError::VerifyFailed(_)), "got {err:?}");
-        assert!(!path.exists(), "a corrupt file is removed, not left half-verified");
+        assert!(
+            !path.exists(),
+            "a corrupt file is removed, not left half-verified"
+        );
     }
 
     #[test]
@@ -135,7 +158,7 @@ mod tests {
         let err = copy_verified(&missing, &dest, true, &mut |_| {});
         assert!(err.is_err());
         assert!(!dest.exists()); // temp discarded, no half-file under real name
-        // no stray temp files remain in dst_dir
+                                 // no stray temp files remain in dst_dir
         let leftovers: Vec<_> = fs::read_dir(dst_dir.path()).unwrap().collect();
         assert!(leftovers.is_empty());
     }
@@ -159,7 +182,10 @@ mod tests {
         let dest = dst_dir.path().join("empty.MP4");
         let out = copy_verified(&src, &dest, true, &mut |_| {}).unwrap();
         assert_eq!(out.bytes, 0);
-        assert!(out.hash.is_some(), "zero-byte file should still produce a hash");
+        assert!(
+            out.hash.is_some(),
+            "zero-byte file should still produce a hash"
+        );
         assert!(dest.exists());
         assert_eq!(fs::read(&dest).unwrap().len(), 0);
     }

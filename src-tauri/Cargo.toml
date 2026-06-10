@@ -30,3 +30,7 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# Enables tauri::test (mock_builder/MockRuntime) for the IPC smoke test that
+# invokes real commands through the registered handler. Dev-only: feature
+# unification applies it to test builds without touching release artifacts.
+tauri = { version = "2", features = ["test"] }

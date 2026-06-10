@@ -7,6 +7,7 @@
     setNextcloudCredentials,
   } from "../lib/bindings";
   import { defaultConfigView, withCloud, buildCloudView } from "./wizard_view";
+  import { isInsecureHttpUrl } from "../lib/url";
 
   /** The default destination offered on the folder step (e.g. "~/GPBeam"). */
   export let defaultDest: string;
@@ -25,7 +26,7 @@
   let baseUrl = "";
   let username = "";
   let appPassword = "";
-  let remoteRoot = "/GoPro";
+  let remoteRoot = "GoPro";
   let mirrorMode: "off" | "auto" | "manual" = "auto";
 
   let busy = false;
@@ -55,8 +56,9 @@
     error = null;
     try {
       let view = defaultConfigView(dest);
+      let cloud = null as ReturnType<typeof buildCloudView>;
       if (includeCloud) {
-        const cloud = buildCloudView({
+        cloud = buildCloudView({
           baseUrl,
           username,
           appPassword,
@@ -64,13 +66,18 @@
           mirrorMode,
         });
         view = withCloud(view, cloud);
-        if (cloud && appPassword.trim() !== "") {
-          await setNextcloudCredentials(cloud.destinationId, appPassword);
-        }
       }
+      // Validate/save the config FIRST so a rejected config never leaves an
+      // orphaned secret in the keychain.
       await completeWizard(view);
-      dispatch("done");
+      if (cloud && appPassword.trim() !== "") {
+        await setNextcloudCredentials(cloud.destinationId, appPassword);
+      }
+      // Hide before dispatching done: if hide rejects (e.g. a missing
+      // capability), the error must land on a still-mounted component where
+      // the user can see it — `done` swaps Settings over to the tabs.
       await getCurrentWindow().hide();
+      dispatch("done");
     } catch (e) {
       error = String(e);
     } finally {
@@ -122,6 +129,12 @@
         <span>Base URL</span>
         <input type="text" bind:value={baseUrl} placeholder="https://cloud.example.com" />
       </label>
+      {#if isInsecureHttpUrl(baseUrl)}
+        <p class="warn-inline" role="alert">
+          ⚠ Plain http sends your password and footage unencrypted. Use https:// —
+          http is allowed only for localhost.
+        </p>
+      {/if}
       <label>
         <span>Username</span>
         <input type="text" bind:value={username} />
@@ -201,5 +214,10 @@
   }
   .error {
     color: #d23c3c;
+  }
+  .warn-inline {
+    color: #b15c00;
+    font-size: 12px;
+    margin: 4px 0 0;
   }
 </style>

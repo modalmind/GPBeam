@@ -16,21 +16,53 @@ fn retry_cloud_requeues_only_terminally_failed_jobs() {
 
         // Job A: driven to a TERMINAL Failed state (worker gave up -> next_retry_at NULL).
         let imp_a = ledger
-            .record("C123", "GX010003.MP4", 42, 1_700_000_200, "/dest/GX010003.MP4", None)
+            .record(
+                "C123",
+                "GX010003.MP4",
+                42,
+                1_700_000_200,
+                "/dest/GX010003.MP4",
+                None,
+            )
             .unwrap();
         let job_a = ledger
-            .enqueue_cloud_job(imp_a, "home-nc", "/dest/GX010003.MP4", "GoProBackup/GX010003.MP4", 42, None)
+            .enqueue_cloud_job(
+                imp_a,
+                "home-nc",
+                "/dest/GX010003.MP4",
+                "GoProBackup/GX010003.MP4",
+                42,
+                None,
+            )
             .unwrap();
-        ledger.mark_job_failed(job_a, "401 unauthorized", None).unwrap();
+        ledger
+            .mark_job_failed(job_a, "401 unauthorized", None)
+            .unwrap();
 
         // Job B: Failed but still PENDING a retry (non-NULL next_retry_at) -> must NOT be touched.
         let imp_b = ledger
-            .record("C123", "GX010004.MP4", 7, 1_700_000_300, "/dest/GX010004.MP4", None)
+            .record(
+                "C123",
+                "GX010004.MP4",
+                7,
+                1_700_000_300,
+                "/dest/GX010004.MP4",
+                None,
+            )
             .unwrap();
         let job_b = ledger
-            .enqueue_cloud_job(imp_b, "home-nc", "/dest/GX010004.MP4", "GoProBackup/GX010004.MP4", 7, None)
+            .enqueue_cloud_job(
+                imp_b,
+                "home-nc",
+                "/dest/GX010004.MP4",
+                "GoProBackup/GX010004.MP4",
+                7,
+                None,
+            )
             .unwrap();
-        ledger.mark_job_failed(job_b, "503 transient", Some(9_999_999_999)).unwrap();
+        ledger
+            .mark_job_failed(job_b, "503 transient", Some(9_999_999_999))
+            .unwrap();
 
         // Only the pending-retry job is counted as pending; the terminal one is not (Contract C2).
         assert_eq!(ledger.pending_cloud_count().unwrap(), 1);

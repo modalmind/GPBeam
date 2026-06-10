@@ -145,7 +145,10 @@ mod tests {
     #[test]
     fn new_sets_wired_ingest_true_by_default() {
         let c = Config::new(PathBuf::from("/tmp/dest"));
-        assert!(c.wired_ingest, "wired_ingest defaults to true in Config::new");
+        assert!(
+            c.wired_ingest,
+            "wired_ingest defaults to true in Config::new"
+        );
     }
 
     #[test]
@@ -224,9 +227,18 @@ mod tests {
         struct K {
             v: CloudKind,
         }
-        assert_eq!(toml::from_str::<M>("v = \"auto\"").unwrap().v, MirrorMode::Auto);
-        assert_eq!(toml::from_str::<M>("v = \"manual\"").unwrap().v, MirrorMode::Manual);
-        assert_eq!(toml::from_str::<M>("v = \"off\"").unwrap().v, MirrorMode::Off);
+        assert_eq!(
+            toml::from_str::<M>("v = \"auto\"").unwrap().v,
+            MirrorMode::Auto
+        );
+        assert_eq!(
+            toml::from_str::<M>("v = \"manual\"").unwrap().v,
+            MirrorMode::Manual
+        );
+        assert_eq!(
+            toml::from_str::<M>("v = \"off\"").unwrap().v,
+            MirrorMode::Off
+        );
         assert_eq!(
             toml::from_str::<K>("v = \"nextcloud\"").unwrap().v,
             CloudKind::Nextcloud

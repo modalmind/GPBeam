@@ -9,7 +9,9 @@ pub fn newly_appeared(before: &HashSet<PathBuf>, now: &HashSet<PathBuf>) -> Vec<
 }
 
 fn snapshot(disks: &Disks) -> HashSet<PathBuf> {
-    disks.list().iter()
+    disks
+        .list()
+        .iter()
         .filter(|d| d.is_removable())
         .map(|d| d.mount_point().to_path_buf())
         .collect()
@@ -27,7 +29,9 @@ pub async fn poll_removable_mounts(tx: UnboundedSender<PathBuf>) {
         disks.refresh(true);
         let now = snapshot(&disks);
         for mp in newly_appeared(&seen, &now) {
-            if tx.send(mp).is_err() { return; } // receiver dropped -> stop
+            if tx.send(mp).is_err() {
+                return;
+            } // receiver dropped -> stop
         }
         seen = now;
     }
@@ -40,7 +44,9 @@ mod tests {
     #[test]
     fn detects_only_newly_appeared_mounts() {
         let before: HashSet<PathBuf> = ["/Volumes/A".into()].into_iter().collect();
-        let now: HashSet<PathBuf> = ["/Volumes/A".into(), "/Volumes/GOPRO".into()].into_iter().collect();
+        let now: HashSet<PathBuf> = ["/Volumes/A".into(), "/Volumes/GOPRO".into()]
+            .into_iter()
+            .collect();
         let mut appeared = newly_appeared(&before, &now);
         appeared.sort();
         assert_eq!(appeared, vec![PathBuf::from("/Volumes/GOPRO")]);

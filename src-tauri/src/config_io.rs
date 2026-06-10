@@ -3,12 +3,6 @@
 //! `gpbeam_core::config::Config`. Also the atomic config writer used by the
 //! `save_config` / `complete_wizard` commands. No Tauri types here — every
 //! function is pure and unit-tested.
-//!
-//! These items are the typed UI<->Core bridge consumed by the Phase 5
-//! `commands` module (`save_config`, `complete_wizard`, `get_config`); until
-//! those commands land they are not yet called from non-test code, so the
-//! module opts out of `dead_code` for its public API.
-#![allow(dead_code)]
 
 use std::io::Write;
 use std::path::Path;
@@ -101,67 +95,20 @@ fn parse_mirror_mode(s: &str) -> Result<MirrorMode, String> {
         "off" => Ok(MirrorMode::Off),
         "auto" => Ok(MirrorMode::Auto),
         "manual" => Ok(MirrorMode::Manual),
-        other => Err(format!("invalid mirror mode {other:?} (want off|auto|manual)")),
+        other => Err(format!(
+            "invalid mirror mode {other:?} (want off|auto|manual)"
+        )),
     }
 }
 
 /// True if `url` is an acceptable Nextcloud base URL: `https://` with a
 /// non-empty host (any host), or `http://` **only** for a loopback host. Plain
 /// http to a remote host would send the app password and all uploaded footage
-/// in cleartext (the uploader uses HTTP Basic auth), so it is rejected here
-/// (finding M3). Kept dependency-light (no `url` crate) — full WebDAV validation
-/// happens when the uploader actually connects.
+/// in cleartext (finding M3). The implementation lives in
+/// `gpbeam_core::cloud::is_valid_base_url` so the runtime/CLI `build_uploader`
+/// path enforces the SAME rule as this GUI save path; this is a thin delegate.
 fn is_valid_base_url(url: &str) -> bool {
-    let (rest, is_https) = if let Some(r) = url.strip_prefix("https://") {
-        (r, true)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (r, false)
-    } else {
-        return false;
-    };
-    // Authority is everything up to the first '/'; it must be non-empty.
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.trim().is_empty() {
-        return false;
-    }
-    is_https || is_loopback_host(authority)
-}
-
-/// True for a loopback authority — `localhost`, `127.0.0.1`, or `::1` — with or
-/// without a `[...]` IPv6 wrapper and/or a trailing `:port`.
-fn is_loopback_host(authority: &str) -> bool {
-    // Strip any `userinfo@` prefix first: the real host is after the last '@'.
-    // Otherwise `http://[::1]@evil.com` would parse as loopback but actually
-    // connect to evil.com in cleartext (an M3 bypass).
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        // Bracketed IPv6: `[host]` optionally followed by `:port`. A missing
-        // closing bracket, or any junk after `]` other than a numeric port,
-        // is malformed and rejected (e.g. `[::1]extra` must not pass).
-        let (ipv6, suffix) = match after_bracket.split_once(']') {
-            Some(parts) => parts,
-            None => return false,
-        };
-        let suffix_ok = suffix.is_empty()
-            || (suffix.starts_with(':') && suffix[1..].chars().all(|c| c.is_ascii_digit()));
-        if !suffix_ok {
-            return false;
-        }
-        ipv6
-    } else {
-        // `host` / `host:port` -> strip a single trailing numeric port. A bare
-        // IPv6 like `::1` has multiple colons and no port, so only strip when
-        // the part before the last colon is itself colon-free.
-        match authority.rsplit_once(':') {
-            Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => h,
-            _ => authority,
-        }
-    };
-    // Hostnames are case-insensitive (RFC 1035/1123); IPv6 hex is too.
-    matches!(
-        host.trim().to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    gpbeam_core::cloud::is_valid_base_url(url)
 }
 
 /// Validate a `ConfigView` from the UI. Returns `Ok(())` when the view can be
@@ -252,15 +199,21 @@ pub fn view_to_config(view: &ConfigView) -> Result<Config, String> {
 /// absent/unparseable/has none. Surfaced to the UI so the Cloud tab can offer a
 /// one-click migration into the OS keychain.
 pub fn plaintext_credential_ids(path: &Path) -> Vec<String> {
-    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
-    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else { return Vec::new() };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+        return Vec::new();
+    };
     let Some(creds) = doc.get("credentials").and_then(|c| c.as_table()) else {
         return Vec::new();
     };
     creds
         .iter()
         .filter(|(_, v)| {
-            v.get("app_password").and_then(|p| p.as_str()).is_some_and(|s| !s.is_empty())
+            v.get("app_password")
+                .and_then(|p| p.as_str())
+                .is_some_and(|s| !s.is_empty())
         })
         .map(|(k, _)| k.clone())
         .collect()
@@ -286,7 +239,9 @@ pub fn plaintext_app_password(path: &Path, id: &str) -> Option<String> {
 /// `[credentials]` table. A missing file is a successful no-op. Preserves the
 /// atomic/0600 write discipline.
 pub fn strip_credential_password(path: &Path, id: &str) -> Result<(), String> {
-    let Ok(raw) = std::fs::read_to_string(path) else { return Ok(()) };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
     let mut doc: toml::Value =
         toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     if let Some(table) = doc.as_table_mut() {
@@ -324,11 +279,12 @@ fn atomic_write_string(path: &Path, body: &str) -> Result<(), String> {
         std::path::PathBuf::from(p)
     };
     {
-        let mut f = std::fs::File::create(&part)
-            .map_err(|e| format!("create {}: {e}", part.display()))?;
+        let mut f =
+            std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
         f.write_all(body.as_bytes())
             .map_err(|e| format!("write {}: {e}", part.display()))?;
-        f.sync_all().map_err(|e| format!("fsync {}: {e}", part.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", part.display()))?;
     }
     // Owner-only (0600) BEFORE the rename, so a secret-bearing config is never
     // even briefly group/world-readable. Unix only.
@@ -340,7 +296,11 @@ fn atomic_write_string(path: &Path, body: &str) -> Result<(), String> {
     }
     if let Err(e) = std::fs::rename(&part, path) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!("rename {} -> {}: {e}", part.display(), path.display()));
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            part.display(),
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -362,8 +322,7 @@ fn extract_credentials_table(path: &Path) -> Option<String> {
 pub fn write_config_atomic(path: &Path, cfg: &Config) -> Result<(), String> {
     // Serialize the Config itself. `Config` has no `credentials` field, so this
     // never emits one — we re-attach any preserved table below.
-    let mut body =
-        toml::to_string(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    let mut body = toml::to_string(cfg).map_err(|e| format!("serialize config: {e}"))?;
 
     if let Some(creds) = extract_credentials_table(path) {
         // M2: a plaintext [credentials] table on disk is a liability — it can be
@@ -468,8 +427,14 @@ mod tests {
     fn config_to_view_serializes_wired_ingest_camelcase() {
         let cfg = Config::new(PathBuf::from("/d"));
         let json = serde_json::to_value(config_to_view(&cfg, false)).unwrap();
-        assert!(json.get("wiredIngest").is_some(), "camelCase key wiredIngest present");
-        assert_eq!(json.get("wiredIngest").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            json.get("wiredIngest").is_some(),
+            "camelCase key wiredIngest present"
+        );
+        assert_eq!(
+            json.get("wiredIngest").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -547,8 +512,10 @@ mod tests {
         c.base_url = String::new();
         v.cloud = Some(c);
         let err = validate_view(&v).unwrap_err();
-        assert!(err.to_lowercase().contains("base url") || err.to_lowercase().contains("base_url"),
-                "got: {err}");
+        assert!(
+            err.to_lowercase().contains("base url") || err.to_lowercase().contains("base_url"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -685,13 +652,19 @@ mod tests {
         let mut c = cloud_view();
         c.mirror_mode = "off".into();
         v.cloud = Some(c);
-        assert_eq!(view_to_config(&v).unwrap().cloud.unwrap().mirror_mode, MirrorMode::Off);
+        assert_eq!(
+            view_to_config(&v).unwrap().cloud.unwrap().mirror_mode,
+            MirrorMode::Off
+        );
 
         let mut v2 = base_view();
         let mut c2 = cloud_view();
         c2.mirror_mode = "manual".into();
         v2.cloud = Some(c2);
-        assert_eq!(view_to_config(&v2).unwrap().cloud.unwrap().mirror_mode, MirrorMode::Manual);
+        assert_eq!(
+            view_to_config(&v2).unwrap().cloud.unwrap().mirror_mode,
+            MirrorMode::Manual
+        );
     }
 
     #[test]
@@ -805,7 +778,10 @@ mod tests {
             .get("credentials")
             .and_then(|c| c.get("nc1"))
             .expect("[credentials.nc1] preserved");
-        assert_eq!(creds.get("username").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(
+            creds.get("username").and_then(|v| v.as_str()),
+            Some("alice")
+        );
         assert_eq!(
             creds.get("app_password").and_then(|v| v.as_str()),
             Some("s3cret-app-pw")
@@ -820,7 +796,10 @@ mod tests {
         write_config_atomic(&path, &cfg).expect("write ok");
         let raw = std::fs::read_to_string(&path).unwrap();
         let doc: toml::Value = toml::from_str(&raw).unwrap();
-        assert!(doc.get("credentials").is_none(), "no credentials table fabricated");
+        assert!(
+            doc.get("credentials").is_none(),
+            "no credentials table fabricated"
+        );
     }
 
     // ---- M2: plaintext credential detection / strip / migrate helpers ----
@@ -829,10 +808,13 @@ mod tests {
     fn plaintext_credential_ids_lists_entries_with_app_password() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gpbeam.toml");
-        std::fs::write(&path,
+        std::fs::write(
+            &path,
             "dest_root = \"/d\"\n\
              [credentials.nc1]\nusername=\"a\"\napp_password=\"pw\"\n\
-             [credentials.nc2]\nusername=\"b\"\napp_password=\"\"\n").unwrap();
+             [credentials.nc2]\nusername=\"b\"\napp_password=\"\"\n",
+        )
+        .unwrap();
         let ids = plaintext_credential_ids(&path);
         assert_eq!(ids, vec!["nc1".to_string()]); // nc2 has an empty password
     }
@@ -850,8 +832,11 @@ mod tests {
     fn strip_credential_password_keeps_username_drops_password() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gpbeam.toml");
-        std::fs::write(&path,
-            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"alice\"\napp_password=\"pw1\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"alice\"\napp_password=\"pw1\"\n",
+        )
+        .unwrap();
         strip_credential_password(&path, "nc1").unwrap();
         // No longer flagged (no plaintext password) but the username is preserved.
         assert!(plaintext_credential_ids(&path).is_empty());
@@ -865,10 +850,13 @@ mod tests {
     fn strip_credential_password_leaves_other_entries_and_keeps_0600() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gpbeam.toml");
-        std::fs::write(&path,
+        std::fs::write(
+            &path,
             "dest_root = \"/d\"\n\
              [credentials.nc1]\nusername=\"a\"\napp_password=\"pw1\"\n\
-             [credentials.nc2]\nusername=\"b\"\napp_password=\"pw2\"\n").unwrap();
+             [credentials.nc2]\nusername=\"b\"\napp_password=\"pw2\"\n",
+        )
+        .unwrap();
         strip_credential_password(&path, "nc1").unwrap();
         assert_eq!(plaintext_credential_ids(&path), vec!["nc2".to_string()]);
         #[cfg(unix)]
@@ -885,20 +873,32 @@ mod tests {
         let path = dir.path().join("gpbeam.toml");
         // An entry with only a password (no username) becomes empty -> dropped,
         // and the now-empty [credentials] table is dropped too.
-        std::fs::write(&path,
-            "dest_root = \"/d\"\n[credentials.nc1]\napp_password=\"pw\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "dest_root = \"/d\"\n[credentials.nc1]\napp_password=\"pw\"\n",
+        )
+        .unwrap();
         strip_credential_password(&path, "nc1").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("credentials"), "empty entry and table dropped");
+        assert!(
+            !raw.contains("credentials"),
+            "empty entry and table dropped"
+        );
     }
 
     #[test]
     fn plaintext_app_password_reads_the_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gpbeam.toml");
-        std::fs::write(&path,
-            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"a\"\napp_password=\"sekret\"\n").unwrap();
-        assert_eq!(plaintext_app_password(&path, "nc1").as_deref(), Some("sekret"));
+        std::fs::write(
+            &path,
+            "dest_root = \"/d\"\n[credentials.nc1]\nusername=\"a\"\napp_password=\"sekret\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            plaintext_app_password(&path, "nc1").as_deref(),
+            Some("sekret")
+        );
         assert_eq!(plaintext_app_password(&path, "nope"), None);
     }
 

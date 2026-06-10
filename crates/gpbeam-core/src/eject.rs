@@ -30,8 +30,12 @@ impl Ejector for SystemEjector {
             "(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{drive}').InvokeVerb('Eject')"
         );
         run_cmd(
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &ps]),
+            std::process::Command::new("powershell").args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &ps,
+            ]),
             mount,
         )
     }
@@ -84,7 +88,10 @@ mod tests {
 
     impl MockEjector {
         fn ok() -> Self {
-            MockEjector { calls: Mutex::new(Vec::new()), result: Ok(()) }
+            MockEjector {
+                calls: Mutex::new(Vec::new()),
+                result: Ok(()),
+            }
         }
     }
 

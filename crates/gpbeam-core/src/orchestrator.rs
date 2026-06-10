@@ -1,35 +1,85 @@
 use crate::config::{Config, MirrorMode};
 use crate::copy::copy_verified;
 use crate::diskguard;
-use crate::progress::ProgressThrottle;
 use crate::eject::{default_ejector, Ejector};
 use crate::error::{CoreError, Result};
 use crate::gopro::{is_gopro_card, model_family, read_version};
 use crate::ledger::Ledger;
+use crate::progress::ProgressThrottle;
 use crate::scanner::scan_with_skips;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
     NotGoPro(std::path::PathBuf),
-    CardDetected { model: Option<String>, serial: Option<String> },
-    Scanned { new_files: usize, total_bytes: u64 },
-    InsufficientSpace { need: u64, have: u64 },
-    Copying { file: String, index: usize, total: usize },
+    CardDetected {
+        model: Option<String>,
+        serial: Option<String>,
+    },
+    Scanned {
+        new_files: usize,
+        total_bytes: u64,
+    },
+    InsufficientSpace {
+        need: u64,
+        have: u64,
+    },
+    Copying {
+        file: String,
+        index: usize,
+        total: usize,
+    },
     /// `copied` is the CUMULATIVE bytes for the current file (not a delta); `total`
     /// is the current file's expected size. Emitted live during a transfer.
-    Progress { file: String, copied: u64, total: u64 },
-    Verified { file: String },
-    Skipped { file: String },
-    Failed { file: String, error: String },
-    CloudQueued { file: String },
-    CardFileDeleted { file: String },
-    Ejected { mount: String },
-    RunComplete { copied: usize, skipped: usize, failed: usize, bytes: u64 },
+    Progress {
+        file: String,
+        copied: u64,
+        total: u64,
+    },
+    Verified {
+        file: String,
+    },
+    Skipped {
+        file: String,
+    },
+    Failed {
+        file: String,
+        error: String,
+    },
+    CloudQueued {
+        file: String,
+    },
+    CardFileDeleted {
+        file: String,
+    },
+    /// delete-after-verify cleanup of the CARD source failed AFTER the file was
+    /// successfully copied + verified + recorded. Non-fatal: the import itself
+    /// is safe (it counts in `RunSummary.copied`); only the card-side delete
+    /// needs attention. Distinct from `Failed` so UIs do not show a safe file
+    /// as a failed transfer.
+    CardDeleteFailed {
+        file: String,
+        error: String,
+    },
+    Ejected {
+        mount: String,
+    },
+    RunComplete {
+        copied: usize,
+        skipped: usize,
+        failed: usize,
+        bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RunSummary { pub copied: usize, pub skipped: usize, pub failed: usize, pub bytes: u64, pub queued: usize }
+pub struct RunSummary {
+    pub copied: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub bytes: u64,
+    pub queued: usize,
+}
 
 /// Join the configured `remote_root` with a destination filename to form a
 /// remote-relative path. Always uses '/' (WebDAV remote paths use '/' regardless
@@ -42,6 +92,21 @@ pub(crate) fn remote_path_for(remote_root: &str, dest_name: &str) -> String {
     } else {
         format!("{root}/{name}")
     }
+}
+
+/// BLAKE3-hash both `src` (card source) and `dest` (candidate adoptee) and
+/// return `Some(hash)` only when both are readable and identical. `None` —
+/// mismatch or read error — means "do not adopt": the caller falls through to
+/// a normal re-copy, which is idempotent and safe.
+fn matching_hash(src: &Path, dest: &Path) -> Option<String> {
+    let hash_of = |p: &Path| -> Option<String> {
+        let mut h = blake3::Hasher::new();
+        h.update_mmap_rayon(p).ok()?;
+        Some(h.finalize().to_hex().to_string())
+    };
+    let s = hash_of(src)?;
+    let d = hash_of(dest)?;
+    (s == d).then_some(s)
 }
 
 /// Whether the orchestrator should delete the card source file *inline* right
@@ -87,20 +152,36 @@ pub fn run_offload_with_ejector(
 ) -> Result<RunSummary> {
     if !is_gopro_card(card_root) {
         emit(RunEvent::NotGoPro(card_root.to_path_buf()));
-        return Ok(RunSummary { copied: 0, skipped: 0, failed: 0, bytes: 0, queued: 0 });
+        return Ok(RunSummary {
+            copied: 0,
+            skipped: 0,
+            failed: 0,
+            bytes: 0,
+            queued: 0,
+        });
     }
 
     let version = read_version(card_root);
-    let serial = version.as_ref().map(|v| v.camera_serial_number.clone())
+    let serial = version
+        .as_ref()
+        .map(|v| v.camera_serial_number.clone())
         .filter(|s| !s.is_empty());
-    let model = version.as_ref()
+    let model = version
+        .as_ref()
         .and_then(|v| model_family(&v.firmware_version))
         .map(|m| m.to_string());
-    emit(RunEvent::CardDetected { model: model.clone(), serial: serial.clone() });
+    emit(RunEvent::CardDetected {
+        model: model.clone(),
+        serial: serial.clone(),
+    });
 
-    let (plan, skipped) = scan_with_skips(card_root, cfg, ledger, serial.as_deref(), model.as_deref())?;
+    let (plan, skipped) =
+        scan_with_skips(card_root, cfg, ledger, serial.as_deref(), model.as_deref())?;
     let total_bytes: u64 = plan.iter().map(|p| p.size).sum();
-    emit(RunEvent::Scanned { new_files: plan.len(), total_bytes });
+    emit(RunEvent::Scanned {
+        new_files: plan.len(),
+        total_bytes,
+    });
 
     // Free-space guard before any copy.
     let needed = total_bytes.saturating_add(cfg.space_headroom);
@@ -118,6 +199,12 @@ pub fn run_offload_with_ejector(
     // discriminator (content/inode, or refusing to dedupe under "unknown")
     // should be a conscious behavior change, not an accident. See [`Ledger`].
     let serial_key = serial.as_deref().unwrap_or("unknown");
+    let mirror = cfg
+        .cloud
+        .as_ref()
+        .map(|c| c.mirror_mode)
+        .unwrap_or(MirrorMode::Off);
+    let mirroring = cfg.cloud.is_some() && matches!(mirror, MirrorMode::Auto | MirrorMode::Manual);
     let total = plan.len();
     let mut copied = 0usize;
     let mut failed = 0usize;
@@ -136,22 +223,69 @@ pub fn run_offload_with_ejector(
         if !ledger.is_imported(serial_key, &item.name, item.size, item.mtime_unix)? {
             if let Ok(meta) = std::fs::metadata(&item.canonical_dest_path) {
                 if meta.is_file() && meta.len() == item.size {
-                    ledger.record(
-                        serial_key,
-                        &item.name,
-                        item.size,
-                        item.mtime_unix,
-                        &item.canonical_dest_path.to_string_lossy(),
-                        None,
-                    )?;
-                    skipped_recovered += 1;
-                    emit(RunEvent::Skipped { file: item.name.clone() });
-                    continue;
+                    // A byte-length match alone is NOT proof of a verified copy:
+                    // copy_verified persists (rename + fsync) BEFORE its read-back
+                    // verify, so a crash in that window leaves an UNVERIFIED file
+                    // here — and an unrelated same-name same-length file would
+                    // also match. With verify on, adopt only when the dest file
+                    // hashes identically to the card source (and record THAT
+                    // hash); a mismatch falls through to a normal re-copy onto
+                    // the `_1` path the scanner already resolved. With verify
+                    // off, the length match is trusted, mirroring the no-hash
+                    // copy contract.
+                    let adopted_hash: Option<String>;
+                    let adopt = if cfg.verify {
+                        adopted_hash = matching_hash(&item.src, &item.canonical_dest_path);
+                        adopted_hash.is_some()
+                    } else {
+                        adopted_hash = None;
+                        true
+                    };
+                    if adopt {
+                        // Route through commit_imported so a recovered file honors
+                        // mirror_mode exactly like a freshly copied one: a bare
+                        // record() would never enqueue its cloud job, and later
+                        // scans skip the file via the ledger — silently never
+                        // mirrored.
+                        let src_str = item.src.to_string_lossy();
+                        let canonical_name = item
+                            .canonical_dest_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| item.dest_name.clone());
+                        crate::transfer::commit_imported(
+                            ledger,
+                            cfg,
+                            serial_key,
+                            &item.name,
+                            item.size,
+                            item.mtime_unix,
+                            &item.canonical_dest_path,
+                            &canonical_name,
+                            adopted_hash.as_deref(),
+                            Some(&src_str),
+                        )?;
+                        skipped_recovered += 1;
+                        emit(RunEvent::Skipped {
+                            file: item.name.clone(),
+                        });
+                        if mirroring {
+                            queued += 1;
+                            emit(RunEvent::CloudQueued {
+                                file: item.name.clone(),
+                            });
+                        }
+                        continue;
+                    }
                 }
             }
         }
 
-        emit(RunEvent::Copying { file: item.name.clone(), index: i + 1, total });
+        emit(RunEvent::Copying {
+            file: item.name.clone(),
+            index: i + 1,
+            total,
+        });
         // Forward live, throttled progress. copy_verified calls back with the
         // cumulative bytes copied per 1 MiB read; ProgressThrottle gates that to ~one
         // Progress per integer-percent (plus a guaranteed terminal tick). `copied` is
@@ -163,7 +297,11 @@ pub fn run_offload_with_ejector(
         let copy_result = {
             let mut on_progress = |cum: u64| {
                 if throttle.should_emit(cum) {
-                    emit(RunEvent::Progress { file: name.clone(), copied: cum, total: expected });
+                    emit(RunEvent::Progress {
+                        file: name.clone(),
+                        copied: cum,
+                        total: expected,
+                    });
                 }
             };
             copy_verified(&item.src, &item.dest_path, cfg.verify, &mut on_progress)
@@ -190,60 +328,77 @@ pub fn run_offload_with_ejector(
                 let _ = imported_id; // returned id not needed inline (kept for parity)
                 bytes += n;
                 copied += 1;
-                emit(RunEvent::Progress { file: item.name.clone(), copied: n, total: n });
-                emit(RunEvent::Verified { file: item.name.clone() });
+                emit(RunEvent::Progress {
+                    file: item.name.clone(),
+                    copied: n,
+                    total: n,
+                });
+                emit(RunEvent::Verified {
+                    file: item.name.clone(),
+                });
 
                 // Cloud mirror: the job was enqueued inside commit_imported for
                 // Auto|Manual; emit the matching CloudQueued event + bump the
                 // counter here (the helper is event-free by design — Contract G3).
-                let mirror = cfg
-                    .cloud
-                    .as_ref()
-                    .map(|c| c.mirror_mode)
-                    .unwrap_or(MirrorMode::Off);
-                if cfg.cloud.is_some() && matches!(mirror, MirrorMode::Auto | MirrorMode::Manual)
-                {
+                if mirroring {
                     queued += 1;
-                    emit(RunEvent::CloudQueued { file: item.name.clone() });
+                    emit(RunEvent::CloudQueued {
+                        file: item.name.clone(),
+                    });
                 }
 
                 // delete-after-verify (opt-in, default OFF): once the file is
                 // verified locally, delete the card SOURCE for the non-Auto path.
                 // Under Auto, deletion is deferred to the cloud worker after the
                 // upload reaches Done (the card_src is retained on the queued job).
+                // A delete failure is NON-fatal — the file is already copied +
+                // verified + recorded — so it must not surface as `Failed`.
                 if cfg.delete_after_verify && should_delete_card(true, mirror) {
                     match std::fs::remove_file(&item.src) {
-                        Ok(()) => emit(RunEvent::CardFileDeleted { file: item.name.clone() }),
-                        Err(e) => emit(RunEvent::Failed {
+                        Ok(()) => emit(RunEvent::CardFileDeleted {
                             file: item.name.clone(),
-                            error: format!("delete-after-verify failed: {e}"),
+                        }),
+                        Err(e) => emit(RunEvent::CardDeleteFailed {
+                            file: item.name.clone(),
+                            error: e.to_string(),
                         }),
                     }
                 }
             }
             Err(e) => {
                 failed += 1;
-                emit(RunEvent::Failed { file: item.name.clone(), error: e.to_string() });
+                emit(RunEvent::Failed {
+                    file: item.name.clone(),
+                    error: e.to_string(),
+                });
             }
         }
     }
 
     let skipped = skipped + skipped_recovered;
-    let summary = RunSummary { copied, skipped, failed, bytes, queued };
-    emit(RunEvent::RunComplete { copied, skipped, failed, bytes });
+    let summary = RunSummary {
+        copied,
+        skipped,
+        failed,
+        bytes,
+        queued,
+    };
+    emit(RunEvent::RunComplete {
+        copied,
+        skipped,
+        failed,
+        bytes,
+    });
 
     // Auto-eject (opt-in, default OFF; sync-path only — Contract G4). Gated by
     // `should_auto_eject`: suppressed for the `delete_after_verify && Auto`
     // combo, where the worker still needs the card mounted. The non-GoPro early
     // return above means a non-GoPro volume is never ejected.
-    let mirror = cfg
-        .cloud
-        .as_ref()
-        .map(|c| c.mirror_mode)
-        .unwrap_or(MirrorMode::Off);
     if should_auto_eject(cfg.auto_eject, cfg.delete_after_verify, mirror) {
         match ejector.eject(card_root) {
-            Ok(()) => emit(RunEvent::Ejected { mount: card_root.to_string_lossy().into_owned() }),
+            Ok(()) => emit(RunEvent::Ejected {
+                mount: card_root.to_string_lossy().into_owned(),
+            }),
             Err(e) => emit(RunEvent::Failed {
                 file: card_root.to_string_lossy().into_owned(),
                 error: format!("auto-eject failed: {e}"),
@@ -287,10 +442,21 @@ mod tests {
         let s1 = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
         assert_eq!(s1.copied, 4);
         assert_eq!(s1.failed, 0);
-        assert!(events.iter().any(|e| matches!(e, RunEvent::CardDetected { .. })));
-        assert!(events.iter().filter(|e| matches!(e, RunEvent::Verified { .. })).count() == 4);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CardDetected { .. })));
+        assert!(
+            events
+                .iter()
+                .filter(|e| matches!(e, RunEvent::Verified { .. }))
+                .count()
+                == 4
+        );
         // files exist at destination
-        let copied: Vec<_> = std::fs::read_dir(dest.path()).unwrap().filter_map(|e| e.ok()).collect();
+        let copied: Vec<_> = std::fs::read_dir(dest.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert_eq!(copied.len(), 4);
 
         // Second run: everything already in ledger -> 0 copied, 4 skipped.
@@ -298,7 +464,10 @@ mod tests {
         assert_eq!(s2.copied, 0);
         assert_eq!(s2.skipped, 4);
         // no duplicate files created
-        let after: Vec<_> = std::fs::read_dir(dest.path()).unwrap().filter_map(|e| e.ok()).collect();
+        let after: Vec<_> = std::fs::read_dir(dest.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert_eq!(after.len(), 4);
     }
 
@@ -312,7 +481,9 @@ mod tests {
         let mut events = Vec::new();
         let err = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e));
         assert!(matches!(err, Err(CoreError::InsufficientSpace { .. })));
-        assert!(events.iter().any(|e| matches!(e, RunEvent::InsufficientSpace { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::InsufficientSpace { .. })));
         // nothing copied
         assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
     }
@@ -344,14 +515,29 @@ mod tests {
         run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
 
         let size = 5 * 1024 * 1024u64;
-        let copied_seq: Vec<u64> = events.iter().filter_map(|e| match e {
-            RunEvent::Progress { copied, .. } => Some(*copied),
-            _ => None,
-        }).collect();
-        assert!(copied_seq.len() >= 3, "expected several streaming Progress ticks, got {copied_seq:?}");
-        assert!(copied_seq.iter().any(|c| *c < size), "at least one mid-file tick (copied < size)");
-        assert!(copied_seq.contains(&size), "a Progress reaches the file size");
-        assert!(copied_seq.windows(2).all(|w| w[0] <= w[1]), "cumulative copied is monotonic: {copied_seq:?}");
+        let copied_seq: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::Progress { copied, .. } => Some(*copied),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            copied_seq.len() >= 3,
+            "expected several streaming Progress ticks, got {copied_seq:?}"
+        );
+        assert!(
+            copied_seq.iter().any(|c| *c < size),
+            "at least one mid-file tick (copied < size)"
+        );
+        assert!(
+            copied_seq.contains(&size),
+            "a Progress reaches the file size"
+        );
+        assert!(
+            copied_seq.windows(2).all(|w| w[0] <= w[1]),
+            "cumulative copied is monotonic: {copied_seq:?}"
+        );
     }
 
     fn cloud_cfg(dest: std::path::PathBuf, mode: crate::config::MirrorMode) -> Config {
@@ -455,7 +641,9 @@ mod tests {
 
         assert_eq!(summary.copied, 4);
         assert_eq!(summary.queued, 0);
-        assert!(!events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CloudQueued { .. })));
         assert_eq!(ledger.pending_cloud_count().unwrap(), 0);
     }
 
@@ -471,7 +659,9 @@ mod tests {
 
         assert_eq!(summary.copied, 4);
         assert_eq!(summary.queued, 0);
-        assert!(!events.iter().any(|e| matches!(e, RunEvent::CloudQueued { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CloudQueued { .. })));
         assert_eq!(ledger.pending_cloud_count().unwrap(), 0);
     }
 
@@ -527,7 +717,9 @@ mod tests {
 
         assert_eq!(summary.copied, 4);
         assert!(!media.exists(), "card source deleted after local verify");
-        assert!(events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
     }
 
     #[test]
@@ -543,8 +735,13 @@ mod tests {
         let mut events = Vec::new();
         run_offload(card.path(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
 
-        assert!(media.exists(), "Auto mirror must NOT delete inline; worker deletes after Done");
-        assert!(!events.iter().any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
+        assert!(
+            media.exists(),
+            "Auto mirror must NOT delete inline; worker deletes after Done"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
         // The card_src is recorded on the queued job for the worker to delete later.
         let jobs = ledger.list_cloud_jobs(None).unwrap();
         assert!(jobs.iter().all(|j| j.card_src.is_some()));
@@ -560,7 +757,10 @@ mod tests {
 
         let media = card.path().join("DCIM/100GOPRO/GX010001.MP4");
         run_offload(card.path(), &cfg, &mut ledger, &mut |_| {}).unwrap();
-        assert!(media.exists(), "deletion is opt-in; flag off keeps card source");
+        assert!(
+            media.exists(),
+            "deletion is opt-in; flag off keeps card source"
+        );
     }
 
     #[test]
@@ -590,11 +790,8 @@ mod tests {
         for item in &plan {
             std::fs::copy(&item.src, &item.dest_path).unwrap();
             let mtime = UNIX_EPOCH + Duration::from_secs(item.mtime_unix as u64);
-            filetime::set_file_mtime(
-                &item.dest_path,
-                filetime::FileTime::from_system_time(mtime),
-            )
-            .unwrap();
+            filetime::set_file_mtime(&item.dest_path, filetime::FileTime::from_system_time(mtime))
+                .unwrap();
         }
         let before: usize = std::fs::read_dir(dest.path()).unwrap().count();
 
@@ -602,7 +799,10 @@ mod tests {
         let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
 
         // Adopted, not re-copied: 0 fresh copies, and the recovered files are recorded.
-        assert_eq!(summary.copied, 0, "files already on disk must be adopted, not re-copied");
+        assert_eq!(
+            summary.copied, 0,
+            "files already on disk must be adopted, not re-copied"
+        );
         assert_eq!(summary.failed, 0);
         assert!(summary.skipped >= plan.len());
 
@@ -612,12 +812,232 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.iter().any(|n| n.contains("_1.")), "no collision-suffixed copies: {names:?}");
-        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), before, "no new files on disk");
+        assert!(
+            !names.iter().any(|n| n.contains("_1.")),
+            "no collision-suffixed copies: {names:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.path()).unwrap().count(),
+            before,
+            "no new files on disk"
+        );
 
         // Idempotent on a second run too.
         let s2 = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
         assert_eq!(s2.copied, 0);
+    }
+
+    #[test]
+    fn corrupt_same_length_dest_is_not_adopted_when_verify_on() {
+        // F1: copy_verified persists (rename + fsync) BEFORE its read-back
+        // verify, so a crash in that window leaves an UNVERIFIED file at the
+        // canonical dest path — and an unrelated same-name same-length file
+        // matches the old length-only adoption too. With verify on, such a
+        // file must be hash-checked against the card source and REJECTED.
+        let card = fixtures::card_with_one_clip(4096);
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf()); // verify defaults to true
+        assert!(cfg.verify);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let plan = crate::scanner::scan_card(
+            card.root(),
+            &cfg,
+            &ledger,
+            Some("C3461324500001"),
+            Some("HERO11"),
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 1);
+        let item = &plan[0];
+
+        // Same length, different bytes — simulates the corrupt/unrelated file.
+        let corrupt = vec![0xAB_u8; item.size as usize];
+        std::fs::write(&item.canonical_dest_path, &corrupt).unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(
+            summary.copied, 1,
+            "corrupt dest must NOT be adopted; the real file is copied"
+        );
+        assert_eq!(summary.failed, 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RunEvent::Verified { .. })));
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::Skipped { .. })));
+
+        // The pre-existing corrupt file is left alone (we do not own it) ...
+        assert_eq!(std::fs::read(&item.canonical_dest_path).unwrap(), corrupt);
+        // ... and a real, byte-identical copy landed under the bumped name.
+        let src_bytes = std::fs::read(&item.src).unwrap();
+        let real_copy_exists = std::fs::read_dir(dest.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != item.canonical_dest_path)
+            .any(|e| std::fs::read(e.path()).unwrap() == src_bytes);
+        assert!(
+            real_copy_exists,
+            "the true bytes were re-copied under a collision name"
+        );
+    }
+
+    #[test]
+    fn matching_same_length_dest_is_adopted_with_its_hash_when_verify_on() {
+        // The legitimate crash-recovery case still adopts under verify — and
+        // now records the verified hash instead of None.
+        let card = fixtures::card_with_one_clip(4096);
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let plan = crate::scanner::scan_card(
+            card.root(),
+            &cfg,
+            &ledger,
+            Some("C3461324500001"),
+            Some("HERO11"),
+        )
+        .unwrap();
+        let item = &plan[0];
+        std::fs::copy(&item.src, &item.canonical_dest_path).unwrap();
+
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
+        assert_eq!(summary.copied, 0, "byte-identical dest is adopted");
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(
+            std::fs::read_dir(dest.path()).unwrap().count(),
+            1,
+            "no _1 duplicate"
+        );
+    }
+
+    #[test]
+    fn corrupt_same_length_dest_is_still_adopted_when_verify_off() {
+        // verify=false opts out of hashing everywhere; the length-trust
+        // adoption contract is intentional there (pinned so the verify-gated
+        // hash check stays a conscious choice).
+        let card = fixtures::card_with_one_clip(4096);
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.verify = false;
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let plan = crate::scanner::scan_card(
+            card.root(),
+            &cfg,
+            &ledger,
+            Some("C3461324500001"),
+            Some("HERO11"),
+        )
+        .unwrap();
+        let item = &plan[0];
+        std::fs::write(&item.canonical_dest_path, vec![0xAB_u8; item.size as usize]).unwrap();
+
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |_| {}).unwrap();
+        assert_eq!(summary.copied, 0, "verify off trusts the length match");
+        assert_eq!(summary.skipped, 1);
+    }
+
+    #[test]
+    fn adopted_file_with_auto_mirror_enqueues_a_cloud_job() {
+        // F2: a recovered (adopted) file must honor mirror_mode like a freshly
+        // copied one. A bare record() never enqueues, and later scans skip the
+        // file via the ledger — so without this it is silently never uploaded.
+        let card = fixtures::hero11_card();
+        let dest = fixtures::dest();
+        let cfg = cloud_cfg(dest.path().to_path_buf(), crate::config::MirrorMode::Auto);
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        let plan = crate::scanner::scan_card(
+            card.root(),
+            &cfg,
+            &ledger,
+            Some("C3461324500001"),
+            Some("HERO11"),
+        )
+        .unwrap();
+        assert!(!plan.is_empty());
+        for item in &plan {
+            std::fs::copy(&item.src, &item.canonical_dest_path).unwrap();
+        }
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.root(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(summary.copied, 0, "all adopted, none re-copied");
+        assert_eq!(summary.skipped, plan.len());
+        assert_eq!(
+            summary.queued,
+            plan.len(),
+            "every adopted file queues a cloud job"
+        );
+        assert_eq!(ledger.pending_cloud_count().unwrap(), plan.len());
+        let queued_events = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::CloudQueued { .. }))
+            .count();
+        assert_eq!(queued_events, plan.len());
+
+        // The jobs point at the ADOPTED canonical files and carry the card_src.
+        let jobs = ledger.list_cloud_jobs(None).unwrap();
+        assert!(jobs.iter().all(|j| j.remote_path.starts_with("GoPro/")));
+        assert!(jobs
+            .iter()
+            .all(|j| j.card_src.as_deref().is_some_and(|s| s.contains("DCIM"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn card_delete_failure_is_nonfatal_card_delete_failed_event() {
+        // F5: a failed delete-after-verify cleanup concerns a file that was
+        // copied + verified + recorded — it must surface as the non-fatal
+        // CardDeleteFailed, never as Failed (which UIs read as a lost file).
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = fixtures::hero11_card();
+        let card = writable_card_copy(fixture.root());
+        let dest = fixtures::dest();
+        let mut cfg = Config::new(dest.path().to_path_buf());
+        cfg.delete_after_verify = true; // mirror Off (cloud == None) -> inline delete
+        let mut ledger = Ledger::open_in_memory().unwrap();
+
+        // Read-only media dir: files stay readable (copy works) but unlinking
+        // fails with EACCES.
+        let media_dir = card.path().join("DCIM/100GOPRO");
+        let mut perms = std::fs::metadata(&media_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&media_dir, perms).unwrap();
+
+        let mut events = Vec::new();
+        let summary = run_offload(card.path(), &cfg, &mut ledger, &mut |e| events.push(e)).unwrap();
+
+        // Restore so TempDir can clean up.
+        let mut perms = std::fs::metadata(&media_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&media_dir, perms).unwrap();
+
+        assert_eq!(summary.copied, 4, "the copies themselves succeeded");
+        assert_eq!(
+            summary.failed, 0,
+            "a failed card delete is not a failed file"
+        );
+        let delete_failures = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::CardDeleteFailed { .. }))
+            .count();
+        assert_eq!(
+            delete_failures, 4,
+            "one CardDeleteFailed per undeletable source"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, RunEvent::Failed { .. })),
+            "no Failed events for safely-imported files"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::CardFileDeleted { .. })));
     }
 
     use crate::eject::Ejector;
@@ -628,7 +1048,11 @@ mod tests {
         calls: Mutex<Vec<std::path::PathBuf>>,
     }
     impl RecordingEjector {
-        fn new() -> Self { RecordingEjector { calls: Mutex::new(Vec::new()) } }
+        fn new() -> Self {
+            RecordingEjector {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
     }
     impl Ejector for RecordingEjector {
         fn eject(&self, mount: &StdPath) -> Result<()> {
@@ -663,7 +1087,8 @@ mod tests {
         let mut ledger = Ledger::open_in_memory().unwrap();
         let ej = RecordingEjector::new();
 
-        let summary = run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
+        let summary =
+            run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
 
         assert_eq!(summary.copied, 4);
         let calls = ej.calls.lock().unwrap();
@@ -681,7 +1106,10 @@ mod tests {
 
         run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
 
-        assert!(ej.calls.lock().unwrap().is_empty(), "deletion opt-in; flag off => no eject");
+        assert!(
+            ej.calls.lock().unwrap().is_empty(),
+            "deletion opt-in; flag off => no eject"
+        );
     }
 
     #[test]
@@ -695,7 +1123,10 @@ mod tests {
 
         run_offload_with_ejector(card.root(), &cfg, &mut ledger, &ej, &mut |_| {}).unwrap();
 
-        assert!(ej.calls.lock().unwrap().is_empty(), "non-GoPro volume is never ejected");
+        assert!(
+            ej.calls.lock().unwrap().is_empty(),
+            "non-GoPro volume is never ejected"
+        );
     }
 
     #[test]

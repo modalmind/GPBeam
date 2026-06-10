@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { ask } from '@tauri-apps/plugin-dialog';
   import type { ConfigView } from '../../lib/bindings';
   import { getAutostart, setAutostart } from '../../lib/bindings';
   import { bytesToGiB, giBToBytes } from '../../lib/format';
@@ -9,6 +10,7 @@
 
   let headroomGiB = bytesToGiB(view.spaceHeadroom);
   let autostart = false;
+  let autostartError: string | null = null;
 
   onMount(async () => {
     autostart = await getAutostart();
@@ -20,16 +22,26 @@
     view.spaceHeadroom = giBToBytes(headroomGiB);
   }
 
-  function onDeleteToggle(e: Event) {
+  async function onDeleteToggle(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     // `wantOn` is the value the user is trying to move *to* (the platform toggles
     // the checkbox before dispatching click).
     const wantOn = !view.deleteAfterVerify;
     if (wantOn) {
-      const ok = window.confirm(
-        'Delete originals from the card after a verified copy? ' +
-          'Files removed from the card cannot be recovered.'
-      );
+      // Must be the dialog plugin, NOT window.confirm(): wry's WKWebView ships no
+      // runJavaScriptConfirmPanelWithMessage handler, so confirm() always returns
+      // false on macOS and the feature could never be enabled. A failing dialog
+      // counts as declined.
+      let ok = false;
+      try {
+        ok = await ask(
+          'Delete originals from the card after a verified copy? ' +
+            'Files removed from the card cannot be recovered.',
+          { title: 'GPBeam', kind: 'warning' }
+        );
+      } catch {
+        ok = false;
+      }
       view.deleteAfterVerify = ok;
     } else {
       view.deleteAfterVerify = false;
@@ -45,9 +57,20 @@
   }
 
   async function onAutostartToggle(e: Event) {
-    const next = (e.currentTarget as HTMLInputElement).checked;
+    const input = e.currentTarget as HTMLInputElement;
+    const next = input.checked;
+    const prev = autostart;
     autostart = next;
-    await setAutostart(next);
+    autostartError = null;
+    try {
+      await setAutostart(next);
+    } catch (err) {
+      // Revert the optimistic flip and surface the failure inline.
+      autostart = prev;
+      input.checked = prev;
+      autostartError =
+        typeof err === 'string' ? err : ((err as Error)?.message ?? 'Could not update launch-at-login.');
+    }
   }
 </script>
 
@@ -105,6 +128,9 @@
       <input type="checkbox" aria-label="Launch at login" checked={autostart} on:change={onAutostartToggle} />
       Launch at login
     </label>
+    {#if autostartError}
+      <p class="error" role="alert">{autostartError}</p>
+    {/if}
   </Field>
 </section>
 
@@ -113,4 +139,5 @@
   h2 { font-size: 15px; margin: 0 0 8px; }
   .check { display: flex; align-items: center; gap: 6px; font-weight: 400; }
   input[type='number'] { width: 100px; }
+  .error { color: #d23c3c; font-size: 12px; margin: 4px 0 0; }
 </style>

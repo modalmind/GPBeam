@@ -61,11 +61,13 @@ app_password = "test-app-pw"
 
     let mut lines: Vec<String> = Vec::new();
     let flags = gpbeam_cli::SafetyFlags::default();
-    gpbeam_cli::run_offload_and_mirror(&card, &dest, Some(&cfg_path), &flags, &mut |l| {
-        lines.push(l)
-    })
-    .await
-    .expect("offload+mirror ok");
+    let failed =
+        gpbeam_cli::run_offload_and_mirror(&card, &dest, Some(&cfg_path), &flags, &mut |l| {
+            lines.push(l)
+        })
+        .await
+        .expect("offload+mirror ok");
+    assert_eq!(failed, 0, "fully-clean run reports zero failures");
 
     assert!(
         lines.iter().any(|l| l.contains("[cloud-queued]")),

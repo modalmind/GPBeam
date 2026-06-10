@@ -9,7 +9,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "macOSPrivateApi": true,
     "windows": [
       {
@@ -38,7 +38,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' tauri:; script-src 'self' tauri:; style-src 'self' tauri: 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {
