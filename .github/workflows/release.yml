@@ -1,9 +1,11 @@
 name: release
 
-# Cut a release by bumping `version` in src-tauri/tauri.conf.json, then pushing a
-# matching tag:  git tag v0.1.0 && git push origin v0.1.0
-# (Keep the tag in sync with tauri.conf.json — tauri-action names the release
-# `v__VERSION__` from that file, so a `v0.1.0` tag and `version: "0.1.0"` align.)
+# Cut a release by bumping `version` in the workspace Cargo.toml ([workspace.package] —
+# the single source; tauri.conf.json has no version field and inherits it via
+# src-tauri/Cargo.toml), then pushing a matching tag:
+#   git tag v0.2.0 && git push origin v0.2.0
+# (Keep the tag in sync — tauri-action names the release `v__VERSION__` from the
+# resolved app version, so a `v0.2.0` tag and version = "0.2.0" align.)
 # You can also run it manually from the Actions tab (workflow_dispatch).
 on:
   workflow_dispatch:
@@ -58,18 +60,36 @@ jobs:
         run: npm --prefix ui ci
 
       - name: Build the app and publish a (draft) release
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__ # __VERSION__ is read from src-tauri/tauri.conf.json
+          tagName: v__VERSION__ # __VERSION__ resolves from the app version (workspace Cargo.toml)
           releaseName: GPBeam v__VERSION__
           releaseBody: |
             Download the asset for your platform below.
 
-            These builds are **unsigned / not notarized**. First launch:
+            These builds are **unsigned / not notarized** — verify the SHA-256 checksum
+            asset for your platform after downloading. First launch:
             - macOS: right-click the app → Open (once) to bypass Gatekeeper.
             - Windows: "More info" → "Run anyway" on the SmartScreen prompt.
           releaseDraft: true # review the release, then publish it manually
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Attach SHA-256 checksums (unsigned builds — the only integrity check)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(echo '${{ steps.tauri.outputs.appVersion }}' | sed 's/^/v/')"
+          out="SHA256SUMS-${{ runner.os }}-${{ runner.arch }}.txt"
+          echo "$ARTIFACT_PATHS" | jq -r '.[]' | while read -r f; do
+            [ -f "$f" ] || continue
+            if command -v shasum >/dev/null; then shasum -a 256 "$f"; else sha256sum "$f"; fi
+          done | sed 's|  .*/|  |' > "$out"
+          cat "$out"
+          gh release upload "$tag" "$out" --clobber
