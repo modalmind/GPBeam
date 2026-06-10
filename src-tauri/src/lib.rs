@@ -45,8 +45,24 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Last applied tray-icon state, encoded (0 idle / 1 working / 2 error;
+/// `u8::MAX` = nothing applied yet). The tray is re-derived from EVERY folded
+/// snapshot — including the ~100 `Progress` folds per file — so unchanged
+/// states must skip the PNG decode + OS `set_icon` call instead of hammering
+/// the tray API. Process-global like the tray itself.
+static LAST_TRAY_CODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
 /// Swap the tray icon for the current state ("idle" | "working" | "error").
+/// Idempotent: re-applying the current state is a no-op (see [`LAST_TRAY_CODE`]).
 fn set_tray_state(app: &AppHandle, state: &str) {
+    let code: u8 = match state {
+        "working" => 1,
+        "error" => 2,
+        _ => 0,
+    };
+    if LAST_TRAY_CODE.swap(code, Ordering::SeqCst) == code {
+        return;
+    }
     let bytes: &[u8] = match state {
         "working" => include_bytes!("../icons/working.png"),
         "error" => include_bytes!("../icons/error.png"),
@@ -650,6 +666,37 @@ async fn run_wired_offload_for_camera(
     rearm
 }
 
+/// The application's REAL command handler — the single `generate_handler!`
+/// list. Factored out of `run()` and generic over the runtime so the
+/// `ipc_smoke` tests register the EXACT production list on a `MockRuntime`
+/// app: a command rename/removal that desyncs this list from `COMMAND_NAMES`
+/// or `ui/src/lib/bindings.ts` fails a test instead of dying at runtime.
+fn invoke_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        commands::get_state,
+        commands::get_config,
+        commands::get_config_path,
+        commands::save_config,
+        commands::pick_folder,
+        commands::open_path,
+        commands::reveal_path,
+        commands::open_settings,
+        commands::set_nextcloud_credentials,
+        commands::clear_nextcloud_credentials,
+        commands::migrate_plaintext_credentials,
+        commands::pause_cloud,
+        commands::resume_cloud,
+        commands::retry_failed_cloud,
+        commands::get_history,
+        commands::get_autostart,
+        commands::set_autostart,
+        commands::is_first_run,
+        commands::complete_wizard,
+        commands::quit,
+    ]
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Resolve paths + load config ONCE, before the builder, so we can seed the
@@ -697,28 +744,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(ctx)
-        .invoke_handler(tauri::generate_handler![
-            commands::get_state,
-            commands::get_config,
-            commands::get_config_path,
-            commands::save_config,
-            commands::pick_folder,
-            commands::open_path,
-            commands::reveal_path,
-            commands::open_settings,
-            commands::set_nextcloud_credentials,
-            commands::clear_nextcloud_credentials,
-            commands::migrate_plaintext_credentials,
-            commands::pause_cloud,
-            commands::resume_cloud,
-            commands::retry_failed_cloud,
-            commands::get_history,
-            commands::get_autostart,
-            commands::set_autostart,
-            commands::is_first_run,
-            commands::complete_wizard,
-            commands::quit,
-        ])
+        .invoke_handler(invoke_handler())
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -1534,11 +1560,10 @@ mod ipc_smoke {
         );
         mock_builder()
             .manage(ctx)
-            .invoke_handler(tauri::generate_handler![
-                commands::get_config_path,
-                commands::get_state,
-                commands::pause_cloud,
-            ])
+            // The REAL production handler list (see `invoke_handler`), not a
+            // test-local subset: every registered command's IPC glue compiles
+            // for this runtime, and renames desync-fail here.
+            .invoke_handler(invoke_handler())
             .build(mock_context(noop_assets()))
             .expect("mock app builds")
     }
