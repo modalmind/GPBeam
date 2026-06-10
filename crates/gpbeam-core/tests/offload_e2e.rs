@@ -19,10 +19,12 @@ fn full_offload_then_replug_is_idempotent_and_verified() {
 
     // Destination contents match source bytes for the MP4 (verify the copy is faithful).
     let src = std::fs::read(card.root().join("DCIM/100GOPRO/GX010001.MP4")).unwrap();
-    let copied_name = std::fs::read_dir(dest.path()).unwrap()
+    let copied_name = std::fs::read_dir(dest.path())
+        .unwrap()
         .filter_map(|e| e.ok())
         .find(|e| e.file_name().to_string_lossy().ends_with("_GX010001.MP4"))
-        .unwrap().path();
+        .unwrap()
+        .path();
     assert_eq!(std::fs::read(&copied_name).unwrap(), src);
 
     // Re-plug: nothing new.

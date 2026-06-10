@@ -18,7 +18,10 @@ impl ProgressThrottle {
     /// `total` is the file's expected size. A zero total (unknown/empty file)
     /// emits once on the first observation.
     pub fn new(total: u64) -> Self {
-        Self { total, last_pct: -1 }
+        Self {
+            total,
+            last_pct: -1,
+        }
     }
 
     /// Returns true when `cum` (cumulative bytes for this file) should be emitted:

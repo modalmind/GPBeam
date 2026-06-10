@@ -3,7 +3,11 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("io error at {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("db error: {0}")]
     Db(#[from] rusqlite::Error),
     /// Reserved for a future strict mode. M1 reports non-GoPro volumes via
@@ -44,9 +48,9 @@ pub(crate) fn io_at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> 
 pub fn is_retryable(err: &CoreError) -> bool {
     match err {
         CoreError::Http { status: None, .. } => true,
-        CoreError::Http { status: Some(code), .. } => {
-            *code >= 500 || *code == 429 || *code == 408
-        }
+        CoreError::Http {
+            status: Some(code), ..
+        } => *code >= 500 || *code == 429 || *code == 408,
         _ => false,
     }
 }
@@ -57,30 +61,45 @@ mod tests {
 
     #[test]
     fn http_display_includes_status_and_msg() {
-        let e = CoreError::Http { status: Some(500), msg: "boom".into() };
+        let e = CoreError::Http {
+            status: Some(500),
+            msg: "boom".into(),
+        };
         assert_eq!(e.to_string(), "http error Some(500): boom");
-        let e = CoreError::Http { status: None, msg: "transport".into() };
+        let e = CoreError::Http {
+            status: None,
+            msg: "transport".into(),
+        };
         assert_eq!(e.to_string(), "http error None: transport");
     }
 
     #[test]
     fn server_errors_are_retryable() {
         for s in [500u16, 502, 503, 408, 429] {
-            let e = CoreError::Http { status: Some(s), msg: "x".into() };
+            let e = CoreError::Http {
+                status: Some(s),
+                msg: "x".into(),
+            };
             assert!(is_retryable(&e), "status {s} should be retryable");
         }
     }
 
     #[test]
     fn transport_error_is_retryable() {
-        let e = CoreError::Http { status: None, msg: "connection reset".into() };
+        let e = CoreError::Http {
+            status: None,
+            msg: "connection reset".into(),
+        };
         assert!(is_retryable(&e));
     }
 
     #[test]
     fn client_errors_are_not_retryable() {
         for s in [400u16, 401, 403, 404, 409, 412] {
-            let e = CoreError::Http { status: Some(s), msg: "x".into() };
+            let e = CoreError::Http {
+                status: Some(s),
+                msg: "x".into(),
+            };
             assert!(!is_retryable(&e), "status {s} should NOT be retryable");
         }
     }
@@ -89,7 +108,9 @@ mod tests {
     fn auth_config_db_io_are_not_retryable() {
         assert!(!is_retryable(&CoreError::CloudAuth("nope".into())));
         assert!(!is_retryable(&CoreError::Config("bad toml".into())));
-        assert!(!is_retryable(&CoreError::VerifyFailed(std::path::PathBuf::from("/x"))));
+        assert!(!is_retryable(&CoreError::VerifyFailed(
+            std::path::PathBuf::from("/x")
+        )));
         let io = CoreError::Io {
             path: std::path::PathBuf::from("/x"),
             source: std::io::Error::other("io"),

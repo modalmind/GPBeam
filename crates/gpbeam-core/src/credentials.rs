@@ -7,10 +7,21 @@ use std::collections::HashMap;
 /// `ZeroizeOnDrop` wipes the `app_password` (and `username`) bytes from memory
 /// when the `Secret` is dropped, so a resolved credential does not linger in a
 /// heap buffer after use (finding L3, defense-in-depth against memory dumps).
-#[derive(Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
 pub struct Secret {
     pub username: String,
     pub app_password: String,
+}
+
+/// Manual `Debug` so a `{:?}` (logs, error context, `dbg!`) can never leak the
+/// cleartext app password — companion to the `ZeroizeOnDrop` hygiene above.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("username", &self.username)
+            .field("app_password", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Looks up a [`Secret`] for a given destination id.
@@ -56,8 +67,7 @@ impl EnvConfigStore {
         env_username: Option<String>,
         env_app_password: Option<String>,
     ) -> Result<Self> {
-        let parsed: CredFile =
-            toml::from_str(s).map_err(|e| CoreError::Config(e.to_string()))?;
+        let parsed: CredFile = toml::from_str(s).map_err(|e| CoreError::Config(e.to_string()))?;
         let entries = parsed
             .credentials
             .into_iter()
@@ -131,6 +141,26 @@ mod tests {
     "#;
 
     #[test]
+    fn secret_debug_redacts_app_password() {
+        // Companion to zeroize hygiene: a `{:?}` in logs or error context must
+        // never print the cleartext app password.
+        let s = Secret {
+            username: "alice".into(),
+            app_password: "super-secret-pw".into(),
+        };
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "Debug leaked the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("[redacted]"),
+            "Debug should mark the redaction: {dbg}"
+        );
+        assert!(dbg.contains("alice"), "username stays visible: {dbg}");
+    }
+
+    #[test]
     fn secret_zeroizes_on_drop() {
         // L3: the resolved credential must wipe its app_password from memory on
         // drop. Compile-time assertion that the ZeroizeOnDrop derive is present
@@ -155,12 +185,8 @@ mod tests {
 
     #[test]
     fn env_app_password_overrides_file() {
-        let store = EnvConfigStore::from_toml_str(
-            SAMPLE,
-            None,
-            Some("env-pw-zzzz".into()),
-        )
-        .unwrap();
+        let store =
+            EnvConfigStore::from_toml_str(SAMPLE, None, Some("env-pw-zzzz".into())).unwrap();
         let s = store.get("nc1").unwrap().expect("nc1 present");
         // username still from file, app_password from env override.
         assert_eq!(s.username, "alice");
@@ -182,11 +208,11 @@ mod tests {
 
     #[test]
     fn empty_store_with_env_yields_secret() {
-        let store = EnvConfigStore::empty(
-            Some("env-user".into()),
-            Some("env-pw-zzzz".into()),
-        );
-        let s = store.get("anything").unwrap().expect("env produces a secret");
+        let store = EnvConfigStore::empty(Some("env-user".into()), Some("env-pw-zzzz".into()));
+        let s = store
+            .get("anything")
+            .unwrap()
+            .expect("env produces a secret");
         assert_eq!(s.username, "env-user");
         assert_eq!(s.app_password, "env-pw-zzzz");
     }
@@ -201,12 +227,9 @@ mod tests {
     fn entry_without_app_password_parses_with_empty_password() {
         // After a keychain migration the file keeps only the username; that
         // entry must still parse (M2) so resolution can supply the username.
-        let store = EnvConfigStore::from_toml_str(
-            "[credentials.nc1]\nusername = \"alice\"\n",
-            None,
-            None,
-        )
-        .unwrap();
+        let store =
+            EnvConfigStore::from_toml_str("[credentials.nc1]\nusername = \"alice\"\n", None, None)
+                .unwrap();
         let s = store.get("nc1").unwrap().expect("nc1 present");
         assert_eq!(s.username, "alice");
         assert_eq!(s.app_password, "");

@@ -40,6 +40,20 @@ pub fn should_drain(paused: bool, runtime: &CloudRuntime) -> bool {
     }
 }
 
+/// Once-guard for the cloud loop's uploader-build failures: returns `true`
+/// (and records `msg`) only when `msg` differs from the last surfaced error,
+/// so a persistent misconfiguration (missing app password, non-loopback http
+/// base URL) notifies ONCE instead of every 5-second tick. A *different*
+/// failure re-notifies; the caller clears `last` on a successful build so the
+/// same error notifies again after a regression.
+pub fn should_surface_build_error(last: &mut Option<String>, msg: &str) -> bool {
+    if last.as_deref() == Some(msg) {
+        return false;
+    }
+    *last = Some(msg.to_string());
+    true
+}
+
 /// Seconds since the Unix epoch as an `i64`. Used for `apply_run_event`'s
 /// `now_unix` argument and ETA math. Before-epoch clocks (never, in practice)
 /// clamp to 0 rather than panic.
@@ -111,6 +125,38 @@ mod tests {
             delete_after_verify: false,
         };
         assert!(!should_drain(true, &rt));
+    }
+
+    #[test]
+    fn build_error_surfaces_once_until_message_changes() {
+        let mut last = None;
+        assert!(
+            should_surface_build_error(&mut last, "no creds"),
+            "first occurrence notifies"
+        );
+        assert!(
+            !should_surface_build_error(&mut last, "no creds"),
+            "repeat is silent"
+        );
+        assert!(
+            !should_surface_build_error(&mut last, "no creds"),
+            "still silent"
+        );
+        assert!(
+            should_surface_build_error(&mut last, "http not allowed"),
+            "a different failure notifies"
+        );
+        assert!(!should_surface_build_error(&mut last, "http not allowed"));
+    }
+
+    #[test]
+    fn build_error_renotifies_after_a_successful_build_reset() {
+        let mut last = None;
+        assert!(should_surface_build_error(&mut last, "no creds"));
+        // The loop clears the guard on a successful build...
+        last = None;
+        // ...so the SAME error notifies again if it regresses later.
+        assert!(should_surface_build_error(&mut last, "no creds"));
     }
 
     #[test]

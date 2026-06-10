@@ -25,6 +25,16 @@ pub struct PlannedCopy {
     pub canonical_dest_path: PathBuf,
 }
 
+/// The plan-visible file name for a directory entry. Non-UTF-8 names are
+/// rendered lossily (invalid bytes become U+FFFD) rather than silently
+/// dropped, so such a file is still planned, copied, and counted: `src` (the
+/// exact `OsStr` path) opens the real file, while this string only feeds
+/// classification, the ledger dedup key, and the rendered dest name. `None`
+/// only for a path with no final component (never true for read_dir entries).
+fn entry_name(src: &Path) -> Option<String> {
+    src.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
 /// Like `scan_card`, but also returns the count of files skipped because they
 /// were already recorded in the ledger.
 pub fn scan_with_skips(
@@ -43,8 +53,13 @@ pub fn scan_with_skips(
     let mut media_dirs: Vec<PathBuf> = folders
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str())
-            .map(crate::gopro::is_gopro_media_folder).unwrap_or(false))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(crate::gopro::is_gopro_media_folder)
+                    .unwrap_or(false)
+        })
         .collect();
     media_dirs.sort();
 
@@ -60,8 +75,8 @@ pub fn scan_with_skips(
         files.sort();
 
         for src in files {
-            let name = match src.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
+            let name = match entry_name(&src) {
+                Some(n) => n,
                 None => continue,
             };
             let kind = classify(&name);
@@ -100,12 +115,7 @@ pub fn scan_with_skips(
                 kind,
                 size,
                 mtime_unix,
-                dest_name: dest_path
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
+                dest_name: dest_path.file_name().unwrap().to_str().unwrap().to_string(),
                 dest_path,
                 canonical_dest_path,
             });
@@ -197,7 +207,10 @@ mod tests {
         let cfg = Config::new(dest.path().to_path_buf());
         let ledger = Ledger::open_in_memory().unwrap();
         let plan = scan_card(card.path(), &cfg, &ledger, Some("C346"), None).unwrap();
-        assert!(plan.iter().any(|p| p.name == "GX010001.XYZ"), "unknown media must still be copied");
+        assert!(
+            plan.iter().any(|p| p.name == "GX010001.XYZ"),
+            "unknown media must still be copied"
+        );
     }
 
     #[test]
@@ -205,7 +218,11 @@ mod tests {
         use std::fs;
         let card = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(card.path().join("DCIM/100GOPRO")).unwrap();
-        fs::write(card.path().join("DCIM/100GOPRO/GX010001.MP4"), vec![0u8; 16]).unwrap();
+        fs::write(
+            card.path().join("DCIM/100GOPRO/GX010001.MP4"),
+            vec![0u8; 16],
+        )
+        .unwrap();
         fs::create_dir_all(card.path().join("DCIM/Camera")).unwrap(); // non-GoPro
         fs::write(card.path().join("DCIM/Camera/IMG_0001.JPG"), vec![0u8; 16]).unwrap();
         let dest = fixtures::dest();
@@ -214,7 +231,10 @@ mod tests {
         let plan = scan_card(card.path(), &cfg, &ledger, Some("C346"), None).unwrap();
         let names: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"GX010001.MP4"));
-        assert!(!names.contains(&"IMG_0001.JPG"), "non-GoPro DCIM folders must be ignored");
+        assert!(
+            !names.contains(&"IMG_0001.JPG"),
+            "non-GoPro DCIM folders must be ignored"
+        );
     }
 
     #[test]
@@ -226,8 +246,15 @@ mod tests {
         // Pre-record GX010001.MP4 with its real size+mtime so it's treated as done.
         let src = card.root().join("DCIM/100GOPRO/GX010001.MP4");
         let md = std::fs::metadata(&src).unwrap();
-        let mtime = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        ledger.record("C346", "GX010001.MP4", md.len(), mtime, "/old", None).unwrap();
+        let mtime = md
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        ledger
+            .record("C346", "GX010001.MP4", md.len(), mtime, "/old", None)
+            .unwrap();
 
         let plan = scan_card(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
@@ -242,11 +269,68 @@ mod tests {
         let mut ledger = Ledger::open_in_memory().unwrap();
         let src = card.root().join("DCIM/100GOPRO/GX010001.MP4");
         let md = std::fs::metadata(&src).unwrap();
-        let mtime = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        ledger.record("C346", "GX010001.MP4", md.len(), mtime, "/old", None).unwrap();
-        let (plan, skipped) = scan_with_skips(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
+        let mtime = md
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        ledger
+            .record("C346", "GX010001.MP4", md.len(), mtime, "/old", None)
+            .unwrap();
+        let (plan, skipped) =
+            scan_with_skips(card.root(), &cfg, &ledger, Some("C346"), Some("HERO11")).unwrap();
         assert_eq!(skipped, 1);
         assert!(!plan.iter().any(|p| p.name == "GX010001.MP4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_entry_name_is_lossy_not_dropped() {
+        // F6: a non-UTF-8 file name must not be silently skipped. The name
+        // derivation is lossy (U+FFFD) so the entry stays visible/plannable.
+        // (Tested on the helper: APFS itself rejects non-UTF-8 names, so the
+        // on-disk case cannot be staged on macOS dev machines.)
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(
+            b"DCIM/100GOPRO/GX01\xFF0001.MP4",
+        ));
+        let name = super::entry_name(p).expect("read_dir entries always have a file name");
+        assert!(
+            name.contains('\u{FFFD}'),
+            "invalid bytes render as U+FFFD, keeping the file visible: {name:?}"
+        );
+        assert!(name.starts_with("GX01"));
+        assert!(
+            name.ends_with(".MP4"),
+            "the extension survives for classification"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_on_disk_is_planned_when_the_fs_allows_it() {
+        // End-to-end variant of the above: on filesystems that accept
+        // non-UTF-8 names (ext4 etc.), the file must appear in the plan. APFS
+        // rejects the creation (EILSEQ) — then there is nothing to test here.
+        use std::os::unix::ffi::OsStrExt;
+        let card = tempfile::TempDir::new().unwrap();
+        let dir = card.path().join("DCIM/100GOPRO");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"GX01\xFF0001.MP4");
+        if std::fs::write(dir.join(bad), vec![0u8; 8]).is_err() {
+            return; // fs refuses non-UTF-8 names; covered by the helper test
+        }
+        let dest = fixtures::dest();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let ledger = Ledger::open_in_memory().unwrap();
+        let plan = scan_card(card.path(), &cfg, &ledger, Some("C346"), None).unwrap();
+        assert_eq!(
+            plan.len(),
+            1,
+            "non-UTF-8 names must not be silently dropped"
+        );
+        assert!(plan[0].name.contains('\u{FFFD}'));
     }
 
     #[test]

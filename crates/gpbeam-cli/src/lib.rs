@@ -9,7 +9,7 @@ use gpbeam_core::config::{Config, MirrorMode};
 use gpbeam_core::credentials::EnvConfigStore;
 use gpbeam_core::error::{CoreError, Result};
 use gpbeam_core::ledger::{CloudJob, JobState, Ledger};
-use gpbeam_core::orchestrator::{run_offload, RunEvent};
+use gpbeam_core::orchestrator::{run_offload, RunEvent, RunSummary};
 use std::path::{Path, PathBuf};
 
 /// Where the SQLite ledger lives for a given destination root. The async cloud
@@ -35,7 +35,10 @@ pub fn format_run_event(e: &RunEvent) -> Option<String> {
             model.clone().unwrap_or_else(|| "GoPro".into()),
             serial.clone().unwrap_or_else(|| "unknown".into())
         ),
-        RunEvent::Scanned { new_files, total_bytes } => {
+        RunEvent::Scanned {
+            new_files,
+            total_bytes,
+        } => {
             format!("[scan] {new_files} new file(s), {total_bytes} bytes")
         }
         RunEvent::InsufficientSpace { need, have } => {
@@ -48,8 +51,18 @@ pub fn format_run_event(e: &RunEvent) -> Option<String> {
         RunEvent::Failed { file, error } => format!("  [FAIL] {file}: {error}"),
         RunEvent::CloudQueued { file } => format!("[cloud-queued] {file}"),
         RunEvent::CardFileDeleted { file } => format!("  [deleted] {file}"),
+        // Non-fatal: the file itself copied + verified fine; only the card-side
+        // delete-after-verify cleanup failed.
+        RunEvent::CardDeleteFailed { file, error } => {
+            format!("  [warn] {file}: card delete-after-verify failed: {error}")
+        }
         RunEvent::Ejected { mount } => format!("[ejected] {mount}"),
-        RunEvent::RunComplete { copied, skipped, failed, bytes } => {
+        RunEvent::RunComplete {
+            copied,
+            skipped,
+            failed,
+            bytes,
+        } => {
             format!("[done] copied {copied}, skipped {skipped}, failed {failed}, {bytes} bytes")
         }
     })
@@ -58,12 +71,21 @@ pub fn format_run_event(e: &RunEvent) -> Option<String> {
 /// Format an async cloud-worker `CloudEvent` as one human-readable line.
 pub fn format_cloud_event(e: &CloudEvent) -> String {
     match e {
-        CloudEvent::Uploading { file, uploaded, total } => {
+        CloudEvent::Uploading {
+            file,
+            uploaded,
+            total,
+        } => {
             format!("[uploading] {file} {uploaded}/{total}")
         }
         CloudEvent::Mirrored { file } => format!("[mirrored] {file}"),
         CloudEvent::CloudFailed { file, error } => format!("[cloud-FAIL] {file}: {error}"),
         CloudEvent::Deleted { file } => format!("[deleted] {file}"),
+        // Non-fatal: the upload succeeded; only the card-side cleanup failed.
+        // Not counted toward the exit code (see `drain_counting_failures`).
+        CloudEvent::DeleteFailed { file, error } => {
+            format!("[warn] could not delete {file} from card: {error}")
+        }
     }
 }
 
@@ -143,13 +165,18 @@ fn build_cloud_worker(
 /// Run one synchronous offload pass and, when the config requests Auto cloud
 /// mirroring, drain the cloud upload queue. `emit` receives one preformatted
 /// line per event from both the sync and async phases.
+///
+/// Returns the number of files that terminally failed (sync copy failures from
+/// `RunSummary.failed` plus cloud jobs the worker gave up on, i.e. `CloudFailed`
+/// events). `Ok(0)` strictly means a fully-clean run — `main.rs` exits non-zero
+/// on `Ok(n > 0)` so scripts/cron can detect partial failure.
 pub async fn run_offload_and_mirror(
     card: &Path,
     dest: &Path,
     config_path: Option<&Path>,
     flags: &SafetyFlags,
     emit: &mut (dyn FnMut(String) + Send),
-) -> Result<()> {
+) -> Result<usize> {
     std::fs::create_dir_all(dest).map_err(|source| CoreError::Io {
         path: dest.to_path_buf(),
         source,
@@ -160,18 +187,18 @@ pub async fn run_offload_and_mirror(
 
     // --- Sync offload (blocking rusqlite + std::fs). Runs on a blocking thread
     //     so we never block the async runtime; its OWN Ledger connection is
-    //     dropped before the async worker opens its own. ---
-    {
+    //     dropped before the async worker opens its own. Per-file copy failures
+    //     do NOT error the run — they are tallied in the returned summary. ---
+    let summary: RunSummary = {
         let cfg = cfg.clone();
         let card = card.to_path_buf();
         let lpath = lpath.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
-        let join = tokio::task::spawn_blocking(move || -> Result<()> {
+        let join = tokio::task::spawn_blocking(move || -> Result<RunSummary> {
             let mut ledger = Ledger::open(&lpath)?;
             run_offload(&card, &cfg, &mut ledger, &mut |e| {
                 let _ = tx.send(e);
-            })?;
-            Ok(())
+            })
         });
         while let Some(ev) = rx.recv().await {
             if let Some(line) = format_run_event(&ev) {
@@ -179,24 +206,46 @@ pub async fn run_offload_and_mirror(
             }
         }
         join.await
-            .map_err(|e| CoreError::Config(format!("offload task panicked: {e}")))??;
-    }
+            .map_err(|e| CoreError::Config(format!("offload task panicked: {e}")))??
+    };
 
     // --- Async cloud mirror, only for Auto mode with a configured cloud.
     //     Manual-queued jobs are flushed on demand by `run_mirror`. ---
     let Some(cloud) = cfg.cloud.as_ref() else {
-        return Ok(());
+        return Ok(summary.failed);
     };
     if cloud.mirror_mode != MirrorMode::Auto {
-        return Ok(());
+        return Ok(summary.failed);
     }
     let Some(worker) = build_cloud_worker(&cfg, &toml_text, lpath)? else {
-        return Ok(());
+        return Ok(summary.failed);
     };
+    let cloud_failed = drain_counting_failures(&worker, emit).await?;
+    Ok(summary.failed + cloud_failed)
+}
+
+/// Drain the cloud queue, forwarding formatted lines to `emit`, and return how
+/// many `CloudFailed` events fired. The worker only emits `CloudFailed` for
+/// TERMINAL upload problems (retries exhausted / non-retryable) — retryable
+/// failures are rescheduled silently and a post-upload card-delete failure is
+/// the separate, non-fatal `DeleteFailed` — so the count is exactly the number
+/// of permanently-failed uploads this drain produced. (If another GPBeam
+/// process holds the worker lock the drain is skipped with a stderr notice and
+/// the count is 0 — nothing was attempted.)
+async fn drain_counting_failures(
+    worker: &CloudWorker,
+    emit: &mut (dyn FnMut(String) + Send),
+) -> Result<usize> {
+    let mut cloud_failed = 0usize;
     worker
-        .run_until_drained(&mut |ev: CloudEvent| emit(format_cloud_event(&ev)))
+        .run_until_drained(&mut |ev: CloudEvent| {
+            if matches!(ev, CloudEvent::CloudFailed { .. }) {
+                cloud_failed += 1;
+            }
+            emit(format_cloud_event(&ev))
+        })
         .await?;
-    Ok(())
+    Ok(cloud_failed)
 }
 
 /// Flush the cloud upload queue ON DEMAND: build the worker from the CLI cloud
@@ -206,14 +255,17 @@ pub async fn run_offload_and_mirror(
 /// usable — jobs the orchestrator enqueued (but never auto-drained) get
 /// uploaded here. `emit` receives one preformatted line per `CloudEvent`.
 ///
-/// Returns `CoreError::Config` when the config has no `[cloud]` section, since
-/// there is nothing to flush to.
+/// Returns the number of jobs that TERMINALLY failed during the drain
+/// (`CloudFailed` events); `Ok(0)` strictly means everything pending uploaded
+/// cleanly, so `main.rs` can exit non-zero on partial failure. Returns
+/// `CoreError::Config` when the config has no `[cloud]` section, since there is
+/// nothing to flush to.
 pub async fn run_mirror(
     dest: &Path,
     config_path: Option<&Path>,
     flags: &SafetyFlags,
     emit: &mut (dyn FnMut(String) + Send),
-) -> Result<()> {
+) -> Result<usize> {
     let (mut cfg, toml_text) = load_or_default_config(dest, config_path)?;
     apply_safety_overrides(&mut cfg, flags);
     let lpath = ledger_path_for(dest);
@@ -223,10 +275,7 @@ pub async fn run_mirror(
             "no [cloud] destination configured; nothing to mirror".into(),
         ));
     };
-    worker
-        .run_until_drained(&mut |ev: CloudEvent| emit(format_cloud_event(&ev)))
-        .await?;
-    Ok(())
+    drain_counting_failures(&worker, emit).await
 }
 
 /// Build the lines for `mirror-status`: every cloud job grouped by state plus a
@@ -236,7 +285,12 @@ pub fn mirror_status_lines(dest: &Path) -> Result<Vec<String>> {
     let lpath = ledger_path_for(dest);
     let ledger = Ledger::open(&lpath)?;
     let mut lines = Vec::new();
-    for state in [JobState::Uploading, JobState::Queued, JobState::Failed, JobState::Done] {
+    for state in [
+        JobState::Uploading,
+        JobState::Queued,
+        JobState::Failed,
+        JobState::Done,
+    ] {
         let jobs: Vec<CloudJob> = ledger.list_cloud_jobs(Some(state))?;
         if jobs.is_empty() {
             continue;
@@ -251,7 +305,11 @@ pub fn mirror_status_lines(dest: &Path) -> Result<Vec<String>> {
                 j.attempts,
                 j.local_path,
                 j.remote_path,
-                if err.is_empty() { String::new() } else { format!("({err})") }
+                if err.is_empty() {
+                    String::new()
+                } else {
+                    format!("({err})")
+                }
             ));
         }
     }
@@ -291,15 +349,74 @@ pub fn apply_safety_overrides(cfg: &mut Config, flags: &SafetyFlags) {
 
 /// Pull `--delete-after-verify` and `--auto-eject` out of an argv slice,
 /// returning the remaining positional args and the parsed flags.
-pub fn parse_safety_flags(args: &[String]) -> (Vec<String>, SafetyFlags) {
+///
+/// Any OTHER `--token` is a usage error (`Err` with a message naming it) — a
+/// typo like `--delete-after-verfy` must never silently become a positional
+/// `<card>` argument (which used to route the offload at the wrong paths and
+/// write a stray ledger onto the SD card). `--version` is the one long flag
+/// passed through, since `main.rs` dispatches on it as a pseudo-subcommand
+/// (`-V` has a single dash and passes through untouched).
+pub fn parse_safety_flags(
+    args: &[String],
+) -> std::result::Result<(Vec<String>, SafetyFlags), String> {
     let mut positional = Vec::new();
     let mut flags = SafetyFlags::default();
     for a in args {
         match a.as_str() {
             "--delete-after-verify" => flags.delete_after_verify = true,
             "--auto-eject" => flags.auto_eject = true,
+            other if other.starts_with("--") && other != "--version" => {
+                return Err(format!("unrecognized flag '{other}'"));
+            }
             other => positional.push(other.to_string()),
         }
     }
-    (positional, flags)
+    Ok((positional, flags))
+}
+
+/// Pull `--config <path>` out of an argv slice, returning the remaining args
+/// and the config path. A `--config` with no following value is a usage error
+/// (`Err`) — it used to be silently treated as a positional argument.
+pub fn split_config(
+    args: &[String],
+) -> std::result::Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut rest = Vec::new();
+    let mut config = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--config" {
+            let Some(p) = args.get(i + 1) else {
+                return Err("'--config' requires a <path> value".into());
+            };
+            config = Some(PathBuf::from(p));
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    Ok((rest, config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_delete_failed_formats_as_warn_not_fail() {
+        // The file was copied + verified + recorded; only the card cleanup
+        // failed — the CLI line must read as a warning, never as a FAIL.
+        let line = format_run_event(&RunEvent::CardDeleteFailed {
+            file: "GX010001.MP4".into(),
+            error: "permission denied".into(),
+        })
+        .expect("CardDeleteFailed is printed, not suppressed");
+        assert!(line.contains("[warn]"), "warning prefix: {line:?}");
+        assert!(line.contains("GX010001.MP4"));
+        assert!(line.contains("permission denied"));
+        assert!(
+            !line.contains("FAIL"),
+            "must not look like a failed file: {line:?}"
+        );
+    }
 }

@@ -19,11 +19,26 @@ pub fn backoff_delay(attempts: u32, jitter_ms: u64) -> Duration {
     total.min(Duration::from_secs(MAX_BACKOFF_SECS))
 }
 
-/// Production jitter source (0..1000 ms). Injected into `backoff_delay` at the
+/// Whole-second view of `backoff_delay` for callers persisting a Unix
+/// `next_retry_at`: rounds sub-second jitter UP instead of flooring it away
+/// (a plain `as_secs()` on a whole-second base + 0..1000ms jitter would strip
+/// the jitter entirely, defeating its anti-thundering-herd purpose).
+pub fn backoff_delay_secs(attempts: u32, jitter_ms: u64) -> i64 {
+    backoff_delay(attempts, jitter_ms)
+        .as_millis()
+        .div_ceil(1000) as i64
+}
+
+/// Production jitter source (0..4000 ms). Injected into `backoff_delay` at the
 /// call site so tests stay deterministic by passing a fixed value instead.
+///
+/// The range spans several whole seconds on purpose: persisted retry schedules
+/// are whole-second (`backoff_delay_secs` rounds up), so a sub-second range
+/// would collapse to a constant +1s for 99.9% of draws and the
+/// anti-thundering-herd spread would vanish.
 pub fn jitter_ms() -> u64 {
     use rand::Rng;
-    rand::rng().random_range(0..1000)
+    rand::rng().random_range(0..4000)
 }
 
 #[cfg(test)]
@@ -59,5 +74,24 @@ mod tests {
     fn attempt_zero_is_one_second() {
         // 2^0 = 1s — defensive lower bound.
         assert_eq!(backoff_delay(0, 0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn whole_second_schedule_keeps_jitter_alive() {
+        // The whole-second view must round sub-second jitter UP, never floor
+        // it away: schedules computed with different jitter draws can differ,
+        // keeping the anti-thundering-herd jitter effective.
+        assert_eq!(backoff_delay_secs(1, 0), 2);
+        assert_eq!(backoff_delay_secs(1, 1), 3);
+        assert_eq!(backoff_delay_secs(1, 999), 3);
+        assert_ne!(backoff_delay_secs(1, 0), backoff_delay_secs(1, 500));
+    }
+
+    #[test]
+    fn whole_second_schedule_respects_the_cap() {
+        // Jitter rounding must not push past the 64s ceiling.
+        assert_eq!(backoff_delay_secs(10, 0), 64);
+        assert_eq!(backoff_delay_secs(10, 999), 64);
+        assert_eq!(backoff_delay_secs(100, 999), 64); // no overflow panic
     }
 }

@@ -1,11 +1,19 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::wired::client::GoProClient;
+
+/// Per-probe deadline. Probes run serially inside the ~2s poll tick and every
+/// 172.20-29.x.x /24 the machine has (VPN/Docker ranges) gets one, so a
+/// routed-but-unanswering candidate must not stall the detector: the client's
+/// 2s connect timeout covers SYN blackholes, and this bounds a host that
+/// accepts the connection and then never answers.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Enumerate the host's IPv4 interface addresses via the `if-addrs` crate.
 /// Returns an empty vec on enumeration failure (e.g. restricted CI sandboxes).
@@ -66,7 +74,11 @@ pub fn probe_edge(before: &HashSet<IpAddr>, now: &HashSet<IpAddr>) -> Vec<IpAddr
 /// successfully (confirming a real Open GoPro device, not just any host on a `172.x` net).
 /// Any error — non-2xx, transport failure, or unparseable body — yields `false`.
 pub(crate) async fn probe_version(base: &str) -> bool {
-    GoProClient::with_base(base).version().await.is_ok()
+    GoProClient::with_base(base)
+        .with_timeouts(PROBE_TIMEOUT, PROBE_TIMEOUT)
+        .version()
+        .await
+        .is_ok()
 }
 
 /// A USB-connected GoPro confirmed by a `/gopro/version` probe, with its identity.
@@ -121,6 +133,44 @@ async fn poll_once<S, B>(
     *present = confirmed;
 }
 
+/// Handle for re-arming the detector: forget an IP from the poller's de-bounce
+/// set so a STILL-CONNECTED camera fires `CameraFound` again on the next
+/// unpaused tick (if it still answers probes).
+///
+/// Why: while `paused` is held for an offload, the poller never touches its
+/// `present` set, so a camera that drops and re-plugs DURING the offload — or
+/// one whose offload ended with failures — stays de-bounced forever and no new
+/// `CameraFound` edge fires. The offload consumer calls [`DetectorHandle::rearm`]
+/// with the camera IP after an offload that returned `Err` or ended with
+/// per-file failures; clean runs must NOT re-arm (that would loop forever).
+#[derive(Debug, Clone, Default)]
+pub struct DetectorHandle {
+    rearm: Arc<Mutex<HashSet<IpAddr>>>,
+}
+
+impl DetectorHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request that `ip` re-fires `CameraFound` on the next unpaused poll tick
+    /// (one-shot: the request is consumed by that tick).
+    pub fn rearm(&self, ip: IpAddr) {
+        self.rearm.lock().expect("detector rearm lock").insert(ip);
+    }
+
+    /// Apply pending re-arm requests to the poller's de-bounce set: each
+    /// requested IP is forgotten, so a still-present camera produces a fresh
+    /// absent→present edge in the next `poll_once`. Called by the poll loop
+    /// once per unpaused tick.
+    fn apply(&self, present: &mut HashSet<IpAddr>) {
+        let mut pending = self.rearm.lock().expect("detector rearm lock");
+        for ip in pending.drain() {
+            present.remove(&ip);
+        }
+    }
+}
+
 /// Async detector: every ~2s enumerate the host's IPv4 interface addresses (`if-addrs`),
 /// derive GoPro-Connect camera candidates, probe `http://{ip}:8080/gopro/version`, and on an
 /// absent→present edge fetch `info()` and send `CameraFound` on `tx`. De-bounced so a present
@@ -131,7 +181,22 @@ async fn poll_once<S, B>(
 /// download hangs the download. The caller sets `paused` true around an offload; while paused
 /// we skip probing entirely (and don't touch `present`, so the camera stays de-bounced and
 /// does not re-fire when probing resumes).
+///
+/// Consumers that need to retry a failed offload without an unplug/replug should
+/// use [`poll_for_camera_with_rearm`] and keep its [`DetectorHandle`].
 pub async fn poll_for_camera(tx: UnboundedSender<CameraFound>, paused: Arc<AtomicBool>) {
+    poll_for_camera_with_rearm(tx, paused, DetectorHandle::new()).await
+}
+
+/// [`poll_for_camera`] plus a [`DetectorHandle`]: each unpaused tick first
+/// drains the handle's re-arm requests (forgetting those IPs from the
+/// de-bounce set), then probes — so a still-connected camera whose offload
+/// failed re-fires `CameraFound` and gets retried.
+pub async fn poll_for_camera_with_rearm(
+    tx: UnboundedSender<CameraFound>,
+    paused: Arc<AtomicBool>,
+    handle: DetectorHandle,
+) {
     let mut present: HashSet<IpAddr> = HashSet::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
@@ -139,6 +204,7 @@ pub async fn poll_for_camera(tx: UnboundedSender<CameraFound>, paused: Arc<Atomi
         if paused.load(Ordering::Relaxed) {
             continue; // an offload holds the camera; don't probe concurrently
         }
+        handle.apply(&mut present);
         poll_once(&host_ipv4s, &base_for, &mut present, &tx).await;
         if tx.is_closed() {
             return; // receiver dropped -> stop
@@ -253,8 +319,9 @@ mod tests {
     #[test]
     fn edge_reports_only_newly_present_ips() {
         let before: HashSet<IpAddr> = [v4(172, 26, 122, 51)].into_iter().collect();
-        let now: HashSet<IpAddr> =
-            [v4(172, 26, 122, 51), v4(172, 21, 7, 51)].into_iter().collect();
+        let now: HashSet<IpAddr> = [v4(172, 26, 122, 51), v4(172, 21, 7, 51)]
+            .into_iter()
+            .collect();
         let mut appeared = probe_edge(&before, &now);
         appeared.sort();
         assert_eq!(appeared, vec![v4(172, 21, 7, 51)]);
@@ -274,10 +341,7 @@ mod tests {
         // camera leaves -> nothing newly present
         assert!(probe_edge(&present, &gone).is_empty());
         // camera returns -> fires again
-        assert_eq!(
-            probe_edge(&gone, &present),
-            vec![v4(172, 26, 122, 51)]
-        );
+        assert_eq!(probe_edge(&gone, &present), vec![v4(172, 26, 122, 51)]);
     }
 
     #[test]
@@ -338,9 +402,7 @@ mod tests {
         let info_body = br#"{"model_name":"HERO12 Black","serial_number":"C3575424520622","firmware_version":"H23.01.02.10.00"}"#.to_vec();
         Mock::given(wm_method("GET"))
             .and(wm_path("/gopro/camera/info"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(info_body, "application/json"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(info_body, "application/json"))
             .mount(&server)
             .await;
 
@@ -355,7 +417,9 @@ mod tests {
 
         // Tick 1: absent -> present edge -> exactly one CameraFound.
         poll_once(&ip_src, &build_base, &mut present, &tx).await;
-        let found = rx.try_recv().expect("expected a CameraFound on the first tick");
+        let found = rx
+            .try_recv()
+            .expect("expected a CameraFound on the first tick");
         assert_eq!(found.ip, IpAddr::V4(Ipv4Addr::new(172, 26, 122, 51)));
         assert_eq!(
             found.info,
@@ -370,6 +434,64 @@ mod tests {
         // Tick 2: still present -> de-bounced -> nothing sent.
         poll_once(&ip_src, &build_base, &mut present, &tx).await;
         assert!(rx.try_recv().is_err(), "present camera must not re-fire");
+    }
+
+    #[tokio::test]
+    async fn rearm_refires_camera_found_for_still_present_camera() {
+        // A camera whose offload failed stays connected and de-bounced: without a
+        // re-arm it would never produce another absent→present edge. This drives
+        // the exact per-tick sequence of poll_for_camera_with_rearm
+        // (handle.apply -> poll_once) against a mock camera.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"version":"2.0"}"#.to_vec(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let info_body = br#"{"model_name":"HERO12 Black","serial_number":"C3575424520622","firmware_version":"H23.01.02.10.00"}"#.to_vec();
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(info_body, "application/json"))
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let host_ips = vec![Ipv4Addr::new(172, 26, 122, 56)];
+        let ip_src = || host_ips.clone();
+        let build_base = |_ip: IpAddr| base.clone();
+        let camera = v4(172, 26, 122, 51);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CameraFound>();
+        let mut present: HashSet<IpAddr> = HashSet::new();
+        let handle = DetectorHandle::new();
+
+        // Tick 1: camera appears -> fires once.
+        handle.apply(&mut present);
+        poll_once(&ip_src, &build_base, &mut present, &tx).await;
+        assert_eq!(rx.try_recv().expect("first appearance fires").ip, camera);
+
+        // Tick 2 (no re-arm): still present -> de-bounced; apply() must not disturb that.
+        handle.apply(&mut present);
+        poll_once(&ip_src, &build_base, &mut present, &tx).await;
+        assert!(rx.try_recv().is_err(), "no rearm -> still de-bounced");
+
+        // Offload failed -> the consumer re-arms the IP. Tick 3 re-fires without
+        // any unplug/replug.
+        handle.rearm(camera);
+        handle.apply(&mut present);
+        poll_once(&ip_src, &build_base, &mut present, &tx).await;
+        assert_eq!(
+            rx.try_recv().expect("re-armed camera must re-fire").ip,
+            camera
+        );
+
+        // Tick 4: the re-arm was one-shot -> de-bounced again (no infinite loop).
+        handle.apply(&mut present);
+        poll_once(&ip_src, &build_base, &mut present, &tx).await;
+        assert!(rx.try_recv().is_err(), "rearm is consumed by one tick");
     }
 
     #[tokio::test]

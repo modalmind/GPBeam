@@ -83,9 +83,10 @@ app_password = "test-app-pw"
 
     let mut lines: Vec<String> = Vec::new();
     let flags = gpbeam_cli::SafetyFlags::default();
-    gpbeam_cli::run_mirror(&dest, Some(&cfg_path), &flags, &mut |l| lines.push(l))
+    let failed = gpbeam_cli::run_mirror(&dest, Some(&cfg_path), &flags, &mut |l| lines.push(l))
         .await
         .expect("on-demand mirror flush ok");
+    assert_eq!(failed, 0, "fully-clean flush reports zero failures");
 
     assert!(
         lines.iter().any(|l| l.contains("[mirrored]")),
@@ -97,5 +98,9 @@ app_password = "test-app-pw"
     let done = ledger.list_cloud_jobs(Some(JobState::Done)).unwrap();
     assert_eq!(done.len(), 1, "exactly one job reached Done: {done:?}");
     assert_eq!(done[0].id, job_id, "the seeded job is the one that flushed");
-    assert_eq!(ledger.pending_cloud_count().unwrap(), 0, "nothing left pending");
+    assert_eq!(
+        ledger.pending_cloud_count().unwrap(),
+        0,
+        "nothing left pending"
+    );
 }
