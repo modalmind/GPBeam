@@ -106,6 +106,14 @@ Produce a distributable bundle:
 cargo tauri build
 ```
 
+Install the latest build into `/Applications` as the single registered copy
+(macOS — builds, installs, and removes the `target/` build artifact so Launchpad
+and Spotlight never show a duplicate):
+
+```bash
+./scripts/macos-install.sh
+```
+
 GPBeam runs in the menu bar / system tray. On first launch (no config yet) it opens a short
 wizard: pick a destination folder, optionally connect Nextcloud, then it collapses to the tray.
 
