@@ -294,7 +294,8 @@ impl GoProClient {
     /// length via a `Range: bytes=<part_len>-` request. The body is streamed
     /// chunk-by-chunk straight into the `.part` (append on a confirmed-offset 206
     /// resume, truncate otherwise) while an incremental BLAKE3 covers the full
-    /// on-disk file (a resumed prefix is re-hashed first, on the blocking pool). A
+    /// on-disk file (a resumed prefix is re-hashed on the blocking pool BEFORE the
+    /// request is sent, so the camera connection is never left idle — see below). A
     /// `.part` already at the advertised size skips the network entirely and is
     /// only re-hashed. A 416, or a 206 whose `Content-Range` start differs from
     /// the resume offset, marks the `.part` stale: it is discarded and the
@@ -349,6 +350,29 @@ impl GoProClient {
         }
 
         let url = self.media_url(m);
+
+        // Local prep BEFORE opening the camera connection. The resume re-hash
+        // re-reads the entire existing `.part` (multi-GB) to seed BLAKE3 and can
+        // take minutes over a slow/network destination. Doing it AFTER sending
+        // the ranged GET left the camera connection idle — and a wired GoPro
+        // drops an idle connection (reproduced live: ~4 MB delivered, then EOF
+        // after ~90 s of no reads), which surfaced as "end of file before message
+        // length reached" and failed every retry. So create the parent dir and
+        // compute the resume seed FIRST, then connect and start reading at once.
+        if let Some(parent) = part_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| CoreError::Io {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
+        }
+        let resume_seed = if already > 0 {
+            Some(hash_part_prefix(part_path).await?)
+        } else {
+            None
+        };
+
         let mut restarted = false;
         let (mut resp, resume) = loop {
             // Bound only the HEADERS with the control timeout; the body gets a
@@ -409,22 +433,13 @@ impl GoProClient {
             break (resp, false);
         };
 
-        // Templates may include subfolders (e.g. `{date}/...`), so make the parent exist.
-        if let Some(parent) = part_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| CoreError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-        }
-
-        // Hash the WHOLE on-disk file: seed with the resumed prefix (re-read on
-        // the blocking pool — it can be multi-GB), then the streamed bytes.
-        let (mut hasher, mut total) = if resume {
-            (hash_part_prefix(part_path).await?, already)
-        } else {
-            (blake3::Hasher::new(), 0u64)
+        // Hash the WHOLE on-disk file. Use the prefix seed computed before
+        // connecting (above) on a confirmed resume; otherwise — a fresh download,
+        // or a 200/416/wrong-offset restart that reset `already` to 0 and
+        // truncates — start from an empty hasher over the streamed bytes.
+        let (mut hasher, mut total) = match resume_seed {
+            Some(seed) if resume => (seed, already),
+            _ => (blake3::Hasher::new(), 0u64),
         };
 
         let mut file = tokio::fs::OpenOptions::new()
