@@ -6,7 +6,7 @@
 //! download, and delete. Built incrementally across Phase 2; mirrors the
 //! reqwest + wiremock style of `crate::cloud::nextcloud`.
 
-use crate::error::{io_at, CoreError, Result};
+use crate::error::{io_at, is_retryable, CoreError, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::net::IpAddr;
@@ -24,6 +24,21 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// declared stalled and fails with a retryable transport error. Downloads get
 /// NO whole-request timeout — multi-GB clips take arbitrarily long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default total attempts for a single file download (1 initial + N-1 retries).
+/// GoPro's IP-over-USB HTTP server routinely drops the body connection mid-clip;
+/// because `download_attempt` resumes from the `.part` via Range, each retry picks
+/// up where the last left off, so a flaky transfer completes within one run
+/// instead of failing the whole file. Only retryable transport/server errors
+/// (see [`crate::error::is_retryable`]) consume an attempt — a 404/416/auth fails
+/// immediately.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
+/// Default base delay between download retries. The actual wait grows
+/// exponentially per attempt (`base * 2^(n-1)`) up to [`RETRY_BACKOFF_MAX`],
+/// giving the camera escalating breathing room to recover.
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Ceiling on the per-retry backoff so the exponential never parks an in-run
+/// download for minutes.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Identity of a connected camera, from `GET /gopro/camera/info`.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +66,10 @@ pub struct GoProClient {
     base: String,
     control_timeout: Duration,
     idle_timeout: Duration,
+    /// Total download attempts per file (1 initial + retries on retryable errors).
+    max_download_attempts: u32,
+    /// Base delay for the exponential between-retry backoff (0 = retry instantly).
+    retry_backoff_base: Duration,
 }
 
 impl GoProClient {
@@ -75,6 +94,8 @@ impl GoProClient {
             base,
             control_timeout: CONTROL_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
+            max_download_attempts: MAX_DOWNLOAD_ATTEMPTS,
+            retry_backoff_base: RETRY_BACKOFF_BASE,
         }
     }
 
@@ -84,6 +105,16 @@ impl GoProClient {
     pub fn with_timeouts(mut self, control: Duration, idle: Duration) -> Self {
         self.control_timeout = control;
         self.idle_timeout = idle;
+        self
+    }
+
+    /// Override the download retry policy (default: [`MAX_DOWNLOAD_ATTEMPTS`] total
+    /// attempts, [`RETRY_BACKOFF_BASE`] base backoff). Tests use `(1, ZERO)` to
+    /// pin single-attempt behavior or a zero backoff for instant retries.
+    /// `max_attempts` is clamped to at least 1 (always one attempt).
+    pub fn with_download_retry(mut self, max_attempts: u32, backoff_base: Duration) -> Self {
+        self.max_download_attempts = max_attempts.max(1);
+        self.retry_backoff_base = backoff_base;
         self
     }
 
@@ -214,11 +245,56 @@ impl GoProClient {
         parse_media_list(&text)
     }
 
-    /// Download `m` into `part_path`, resuming from its current byte length via a
-    /// `Range: bytes=<part_len>-` request. The body is streamed chunk-by-chunk
-    /// straight into the `.part` (append on a confirmed-offset 206 resume,
-    /// truncate otherwise) while an incremental BLAKE3 covers the full on-disk
-    /// file (a resumed prefix is re-hashed first, on the blocking pool). A
+    /// Download `m` into `part_path`, retrying transient failures within the run.
+    ///
+    /// Wraps [`Self::download_attempt`] in a bounded retry loop: a retryable error
+    /// ([`crate::error::is_retryable`] — transport drops, body stalls, 5xx/429/408)
+    /// re-runs the attempt after an exponential backoff, up to
+    /// `max_download_attempts` total tries. Because each attempt resumes from the
+    /// `.part` via `Range`, retries pick up where the dropped transfer left off,
+    /// so a flaky camera connection completes the file inside one run instead of
+    /// failing it. A non-retryable error (404 / 416-exhausted / auth) returns
+    /// immediately. Returns `(total_bytes_on_disk, blake3_hex)`.
+    pub async fn download_resumable(
+        &self,
+        m: &RemoteMedia,
+        part_path: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(u64, String)> {
+        let mut attempt = 0u32;
+        loop {
+            match self.download_attempt(m, part_path, progress).await {
+                Ok(done) => return Ok(done),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt < self.max_download_attempts && is_retryable(&e) {
+                        let delay = self.retry_delay(attempt);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Exponential backoff for retry number `attempt` (1-based): the configured
+    /// base doubled per attempt, capped at [`RETRY_BACKOFF_MAX`]. A zero base
+    /// (tests) yields zero delay.
+    fn retry_delay(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+        self.retry_backoff_base
+            .saturating_mul(factor)
+            .min(RETRY_BACKOFF_MAX)
+    }
+
+    /// One download attempt of `m` into `part_path`, resuming from its current byte
+    /// length via a `Range: bytes=<part_len>-` request. The body is streamed
+    /// chunk-by-chunk straight into the `.part` (append on a confirmed-offset 206
+    /// resume, truncate otherwise) while an incremental BLAKE3 covers the full
+    /// on-disk file (a resumed prefix is re-hashed first, on the blocking pool). A
     /// `.part` already at the advertised size skips the network entirely and is
     /// only re-hashed. A 416, or a 206 whose `Content-Range` start differs from
     /// the resume offset, marks the `.part` stale: it is discarded and the
@@ -230,7 +306,7 @@ impl GoProClient {
     /// camera original — immediately after). `progress` is called with the
     /// cumulative bytes on disk. Returns `(total_bytes_on_disk, blake3_hex)`.
     /// Other non-2xx -> `Http`.
-    pub async fn download_resumable(
+    async fn download_attempt(
         &self,
         m: &RemoteMedia,
         part_path: &Path,
@@ -541,8 +617,29 @@ fn with_query(base: &str, params: &[(&str, &str)]) -> Result<String> {
 fn transport_err(e: reqwest::Error) -> CoreError {
     CoreError::Http {
         status: None,
-        msg: e.to_string(),
+        msg: error_chain(&e),
     }
+}
+
+/// Render an error with its full `source()` chain, joined by `": "`. reqwest's
+/// top-level `Display` is famously terse — a body-stream failure is just
+/// "error decoding response body", hiding the real cause (e.g. "connection
+/// closed before message completed" / "connection reset"). Walking the chain
+/// keeps the diagnostic the user/log actually needs. A source already textually
+/// contained in the accumulated message is skipped so errors whose `Display`
+/// already embeds their cause don't read as "X: X".
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let s_str = s.to_string();
+        if !msg.contains(&s_str) {
+            msg.push_str(": ");
+            msg.push_str(&s_str);
+        }
+        src = s.source();
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -550,8 +647,30 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method as wm_method, path as wm_path, query_param};
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// A responder that returns `fail_status` for the first `fails` requests, then
+    /// serves a 206 with `body` for every request after — letting a test exercise
+    /// "transient failure, then success" deterministically without relying on mock
+    /// registration precedence. `calls` counts every request it answered.
+    struct FailThenServe {
+        fails: usize,
+        fail_status: u16,
+        body: Vec<u8>,
+        calls: AtomicUsize,
+    }
+    impl Respond for FailThenServe {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fails {
+                ResponseTemplate::new(self.fail_status)
+            } else {
+                ResponseTemplate::new(206).set_body_bytes(self.body.clone())
+            }
+        }
+    }
 
     /// Match a GET whose `Range` header starts at exactly `from` (`bytes=<from>-`).
     struct RangeFrom {
@@ -1231,10 +1350,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
 
-        let c = GoProClient::with_base(format!("http://{addr}")).with_timeouts(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_millis(200),
-        );
+        // Pin to a single attempt: this test's raw server accepts ONE connection,
+        // and the assertion is that a stall MAPS to a retryable Http error (the
+        // retry loop itself is covered by the download_retries_* tests below).
+        let c = GoProClient::with_base(format!("http://{addr}"))
+            .with_timeouts(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(200),
+            )
+            .with_download_retry(1, std::time::Duration::ZERO);
         let m = RemoteMedia {
             dir: "100GOPRO".into(),
             name: "GX010001.MP4".into(),
@@ -1257,6 +1381,172 @@ mod tests {
         );
         assert!(crate::error::is_retryable(&err), "stall must be retryable");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_retries_retryable_error_then_succeeds() {
+        // A camera that drops the connection (here a transient 503) on the first
+        // attempt must be retried, not failed: the retry re-requests and the
+        // file completes within a single run. `expect(2)` asserts exactly one
+        // retry happened.
+        let server = MockServer::start().await;
+        let full = b"hello gopro wired download".to_vec();
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .respond_with(FailThenServe {
+                fails: 1,
+                fail_status: 503,
+                body: full.clone(),
+                calls: AtomicUsize::new(0),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri())
+            .with_download_retry(5, std::time::Duration::ZERO);
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: full.len() as u64,
+            captured_unix: 0,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        let mut cb = |_n: u64| {};
+        let (total, hash) = c.download_resumable(&m, &part, &mut cb).await.unwrap();
+        assert_eq!(total, full.len() as u64);
+        assert_eq!(hash, blake3_hex(&full));
+        assert_eq!(std::fs::read(&part).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn download_gives_up_after_max_attempts() {
+        // A persistently failing retryable status must stop after the configured
+        // attempt budget instead of looping forever; the final error surfaces.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri())
+            .with_download_retry(3, std::time::Duration::ZERO);
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: 10,
+            captured_unix: 0,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        let mut cb = |_n: u64| {};
+        let err = c.download_resumable(&m, &part, &mut cb).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Http {
+                    status: Some(503),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_does_not_retry_non_retryable_status() {
+        // A 404 is a permanent client error: it must fail on the first attempt
+        // without burning the retry budget. `expect(1)` asserts no retry.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = GoProClient::with_base(server.uri())
+            .with_download_retry(5, std::time::Duration::ZERO);
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: 10,
+            captured_unix: 0,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        let mut cb = |_n: u64| {};
+        let err = c.download_resumable(&m, &part, &mut cb).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Http {
+                    status: Some(404),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_chain_appends_each_source() {
+        // A 2-level source chain must render top -> middle -> leaf, joined by
+        // ": " — so a terse reqwest body error surfaces its real transport cause.
+        #[derive(Debug)]
+        struct Layer {
+            msg: &'static str,
+            src: Option<Box<dyn std::error::Error + 'static>>,
+        }
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.src.as_deref()
+            }
+        }
+        let leaf = Layer {
+            msg: "connection reset",
+            src: None,
+        };
+        let mid = Layer {
+            msg: "connection error",
+            src: Some(Box::new(leaf)),
+        };
+        let top = Layer {
+            msg: "error decoding response body",
+            src: Some(Box::new(mid)),
+        };
+        assert_eq!(
+            error_chain(&top),
+            "error decoding response body: connection error: connection reset"
+        );
+    }
+
+    #[test]
+    fn error_chain_skips_source_already_in_message() {
+        // Some errors' Display already embeds the cause; don't render "X: X".
+        #[derive(Debug)]
+        struct Wrapper(Box<dyn std::error::Error + 'static>);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "outer: {}", self.0)
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.0.as_ref())
+            }
+        }
+        let inner = std::io::Error::other("disk gone");
+        let w = Wrapper(Box::new(inner));
+        assert_eq!(error_chain(&w), "outer: disk gone");
     }
 
     #[tokio::test]
