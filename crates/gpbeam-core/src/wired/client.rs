@@ -478,9 +478,15 @@ impl GoProClient {
     /// camera by its on-card path. 200 -> Ok(()); any other status -> `Http`.
     /// The Phase 4 caller treats an Err as non-fatal.
     pub async fn delete_path(&self, dir: &str, name: &str) -> Result<()> {
-        let base = format!("{}/gopro/media/delete", self.base);
-        let path_param = format!("{dir}/{name}");
-        let url = with_query(&base, &[("path", path_param.as_str())])?;
+        // The Open GoPro delete endpoint requires a LITERAL '/' between dir and
+        // name (`path=100GOPRO/GX010212.MP4`); a percent-encoded `%2F` is rejected
+        // with HTTP 400 (verified live on Mission 1 Pro fw H26.x via the read-only
+        // media/info endpoint). So build the query directly with a literal slash,
+        // exactly as `media_url` builds the (working) download URL. GoPro media
+        // dir/names are camera-generated URL-safe ASCII (`[A-Z0-9.]`), so no
+        // escaping is needed — and `with_query`'s form-urlencoding (correct for
+        // the slash-free `p=1` control param) would re-introduce the `%2F` bug.
+        let url = format!("{}/gopro/media/delete?path={}/{}", self.base, dir, name);
         let resp = self
             .http
             .get(url.clone())
@@ -735,6 +741,31 @@ mod tests {
         Mock::given(wm_method("GET"))
             .and(wm_path("/gopro/media/delete"))
             .and(query_param("path", "100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = GoProClient::with_base(server.uri());
+        c.delete_path("100GOPRO", "GX010001.MP4").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_path_sends_literal_slash_not_percent_encoded() {
+        // Regression: the Open GoPro delete endpoint rejects a percent-encoded
+        // slash (`%2F`) with HTTP 400 — the dir/name separator must arrive as a
+        // literal '/' (`path=100GOPRO/GX010001.MP4`), exactly like the download
+        // URL. The standard `query_param` matcher DECODES `%2F`, so it cannot
+        // catch this; assert on the RAW query string instead.
+        struct RawQueryIs(&'static str);
+        impl Match for RawQueryIs {
+            fn matches(&self, req: &Request) -> bool {
+                req.url.query() == Some(self.0)
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/delete"))
+            .and(RawQueryIs("path=100GOPRO/GX010001.MP4"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
