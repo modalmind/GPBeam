@@ -440,10 +440,12 @@ impl GoProClient {
             })?;
 
         // Stream chunk-by-chunk: bounded memory (no full-file buffering), live progress,
-        // and an incremental BLAKE3 — essential for multi-GB GoPro clips. Each chunk
-        // must arrive within the idle timeout: a camera stalling with the TCP
-        // connection open would otherwise hang the offload (and the shared offload
-        // lock blocking SD ingest) forever.
+        // and an incremental BLAKE3 — essential for multi-GB GoPro clips. BOTH legs
+        // get the idle timeout: the camera read (a camera stalling with the TCP
+        // connection open) AND the destination write (a hung network share — e.g. an
+        // SMB mount whose `write_all`/`fsync` blocks indefinitely). Either stall would
+        // otherwise wedge the offload and the shared offload lock forever; instead each
+        // fails with a retryable transport error so the retry-with-resume loop recovers.
         use tokio::io::AsyncWriteExt;
         loop {
             let chunk = tokio::time::timeout(self.idle_timeout, resp.chunk())
@@ -451,25 +453,37 @@ impl GoProClient {
                 .map_err(|_| timeout_err(&url, "body stalled", self.idle_timeout))?
                 .map_err(transport_err)?;
             let Some(chunk) = chunk else { break };
-            file.write_all(&chunk).await.map_err(|e| CoreError::Io {
-                path: part_path.to_path_buf(),
-                source: e,
-            })?;
+            dest_io_guarded(
+                file.write_all(&chunk),
+                self.idle_timeout,
+                &url,
+                "destination write stalled",
+                part_path,
+            )
+            .await?;
             hasher.update(&chunk);
             total += chunk.len() as u64;
             progress(total);
         }
-        file.flush().await.map_err(|e| CoreError::Io {
-            path: part_path.to_path_buf(),
-            source: e,
-        })?;
+        dest_io_guarded(
+            file.flush(),
+            self.idle_timeout,
+            &url,
+            "destination flush stalled",
+            part_path,
+        )
+        .await?;
         // Durability before the caller renames/verifies/ledger-commits (and possibly
         // deletes the camera original): flush only reaches the page cache. Matches
         // the SD path's `stream_hash_to_part` (flush THEN sync_all).
-        file.sync_all().await.map_err(|e| CoreError::Io {
-            path: part_path.to_path_buf(),
-            source: e,
-        })?;
+        dest_io_guarded(
+            file.sync_all(),
+            self.idle_timeout,
+            &url,
+            "destination fsync stalled",
+            part_path,
+        )
+        .await?;
 
         Ok((total, hasher.finalize().to_hex().to_string()))
     }
@@ -541,6 +555,31 @@ fn timeout_err(url: &str, what: &str, after: Duration) -> CoreError {
         status: None,
         msg: format!("GET {url}: {what} timed out after {after:?}"),
     }
+}
+
+/// Run a destination-file I/O future under the idle timeout. A stall (the future
+/// not completing in time) becomes a RETRYABLE transport-style error so
+/// `download_resumable`'s retry loop can recover — a hung network destination
+/// (observed: an SMB mount blocking `write_all`/`fsync` indefinitely) must not
+/// wedge the offload and the shared offload lock. A genuine I/O error stays a
+/// (non-retryable) `Io`, exactly as the unguarded calls reported before.
+async fn dest_io_guarded<F>(
+    fut: F,
+    after: Duration,
+    url: &str,
+    what: &str,
+    part_path: &Path,
+) -> Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::time::timeout(after, fut)
+        .await
+        .map_err(|_| timeout_err(url, what, after))?
+        .map_err(|e| CoreError::Io {
+            path: part_path.to_path_buf(),
+            source: e,
+        })
 }
 
 /// Parse a `/gopro/media/list` JSON body into a flat `Vec<RemoteMedia>`.
@@ -1412,6 +1451,76 @@ mod tests {
         );
         assert!(crate::error::is_retryable(&err), "stall must be retryable");
         server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_stalled_destination_write_times_out_as_retryable_http() {
+        // A destination that accepts the file open but then stops draining makes
+        // file.write_all block forever — observed live with a hung SMB mount,
+        // which wedged the offload while the camera socket backed up (Recv-Q) and
+        // the process sat in uninterruptible I/O wait. The dest write must trip
+        // the idle timeout and fail with a RETRYABLE transport error, not hang.
+        // Simulated with a FIFO whose reader never drains it (so writes block
+        // once the pipe buffer fills) — the dest analogue of the body-stall test.
+        let server = MockServer::start().await;
+        let big = vec![7u8; 1 << 20]; // 1 MiB > pipe buffer, so write_all blocks
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/videos/DCIM/100GOPRO/GX010001.MP4"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(big.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("GX010001.MP4.part");
+        // Make the .part a FIFO so writes block once its buffer fills.
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&part)
+            .status()
+            .expect("spawn mkfifo")
+            .success();
+        assert!(ok, "mkfifo failed");
+
+        // A reader that opens the FIFO (so the writer's open succeeds) but never
+        // drains it, so write_all blocks once the pipe buffer is full.
+        let reader_path = part.clone();
+        let _reader = std::thread::spawn(move || {
+            let _f = std::fs::File::open(&reader_path); // blocks until the writer opens
+            // Hold the FIFO open past the 300ms write timeout (so the write stalls
+            // rather than getting EPIPE), then release: closing the read end lets
+            // the abandoned blocking write() finish so the tokio runtime — which
+            // waits on its blocking pool at shutdown — doesn't drag the test out.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+
+        let c = GoProClient::with_base(server.uri())
+            .with_timeouts(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(300),
+            )
+            .with_download_retry(1, std::time::Duration::ZERO);
+        let m = RemoteMedia {
+            dir: "100GOPRO".into(),
+            name: "GX010001.MP4".into(),
+            size: big.len() as u64,
+            captured_unix: 0,
+        };
+        let mut cb = |_n: u64| {};
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c.download_resumable(&m, &part, &mut cb),
+        )
+        .await
+        .expect("a stalled destination write must fail fast, not hang the offload")
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Http { status: None, .. }),
+            "got {err:?}"
+        );
+        assert!(
+            crate::error::is_retryable(&err),
+            "dest-write stall must be retryable"
+        );
     }
 
     #[tokio::test]
