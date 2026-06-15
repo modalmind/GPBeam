@@ -6,7 +6,7 @@
 use crate::capture::Captured;
 use crate::config::{Config, MirrorMode};
 use crate::diskguard;
-use crate::error::{io_at, CoreError, Result};
+use crate::error::{io_at, is_retryable, CoreError, Result};
 use crate::gopro::classify;
 use crate::ledger::Ledger;
 use crate::naming::{render_name, resolve_collision};
@@ -74,6 +74,18 @@ fn plan_wired(
     Ok((plan, skipped))
 }
 
+/// Abort the run after this many CONSECUTIVE files whose download failed with a
+/// *retryable* error (camera unreachable, a body stall, or a persistent 5xx that
+/// exhausted [`GoProClient`]'s per-file retry budget). That budget already spends
+/// ~15s+ of attempts and backoff per file, so without this cap a camera unplugged
+/// mid-run would grind the entire remaining plan at that rate before the run ends.
+/// A non-retryable per-file error (404 / size mismatch / local IO) fails fast and
+/// resets the streak, and any completed download resets it too — so an occasional
+/// flaky clip never trips it; only a sustained, run-wide outage does. On trip the
+/// run returns `Err` (like the `InsufficientSpace` guard); the un-attempted files
+/// are never ledger-recorded, so a later connect re-plans and resumes them.
+const MAX_CONSECUTIVE_OFFLINE_FILES: usize = 3;
+
 /// Offload a USB-connected GoPro (reachable via `client`) into `cfg.dest_root`, reusing the
 /// shared verify/ledger/cloud pipeline. Emits `RunEvent`s. Non-destructive unless
 /// `cfg.delete_after_verify` is set (then each verified file is deleted from the CAMERA via
@@ -131,6 +143,11 @@ pub async fn run_wired_offload(
         .unwrap_or(MirrorMode::Off);
     let total = plan.len();
     let (mut copied, mut failed, mut bytes, mut queued) = (0usize, 0usize, 0u64, 0usize);
+    // Consecutive files whose download failed with a retryable error. Reset by any
+    // file the camera serves (success OR a fast non-retryable error); a sustained
+    // streak means the camera is gone for this run -> abort (see
+    // [`MAX_CONSECUTIVE_OFFLINE_FILES`]).
+    let mut offline_streak = 0usize;
 
     for (i, p) in plan.iter().enumerate() {
         emit(RunEvent::Copying {
@@ -163,6 +180,9 @@ pub async fn run_wired_offload(
         };
         match outcome {
             Ok((nbytes, hash)) => {
+                // The camera served a complete body -> it is responding; clear the
+                // offline streak even if the file later fails size/rename/verify.
+                offline_streak = 0;
                 if nbytes != p.media.size {
                     failed += 1;
                     emit(RunEvent::Failed {
@@ -299,6 +319,32 @@ pub async fn run_wired_offload(
                     error: e.to_string(),
                 });
                 // `.part` retained on disk -> resumes via Range on the next run.
+
+                // Circuit breaker: a retryable failure is the *expensive* one — it
+                // exhausted the per-file retry budget (camera unreachable / body
+                // stall / persistent 5xx). A non-retryable error (404 / local IO)
+                // fails fast and clears the streak. Once MAX_CONSECUTIVE_OFFLINE_FILES
+                // files in a row hit the expensive path, the camera is effectively
+                // gone for this run: abort now instead of grinding the rest of the
+                // plan at ~full-backoff each. The remaining files are not
+                // ledger-recorded, so a later connect re-plans and resumes them; the
+                // run's `Err` re-arms the detector (capped) just like any failure.
+                if is_retryable(&e) {
+                    offline_streak += 1;
+                    if offline_streak >= MAX_CONSECUTIVE_OFFLINE_FILES {
+                        let remaining = total - (i + 1);
+                        return Err(CoreError::Http {
+                            status: None,
+                            msg: format!(
+                                "camera offline: {offline_streak} consecutive downloads \
+                                 failed without completing; aborting run \
+                                 ({remaining} file(s) left to retry on reconnect)"
+                            ),
+                        });
+                    }
+                } else {
+                    offline_streak = 0;
+                }
             }
         }
     }
@@ -1086,5 +1132,134 @@ mod tests {
             0,
             "nothing downloaded"
         );
+    }
+
+    #[tokio::test]
+    async fn run_aborts_after_consecutive_offline_downloads() {
+        // A camera that stops responding mid-run makes every remaining file
+        // exhaust the per-file retry budget (~the full backoff each), so without a
+        // circuit breaker a disconnected camera grinds the whole plan before the
+        // run ends. After MAX_CONSECUTIVE_OFFLINE_FILES files in a row fail with a
+        // *retryable* error the run must abort with an Err instead of continuing.
+        // Pin retries to a single attempt so the test never actually sleeps.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model_name": "M", "serial_number": "C357", "firmware_version": "1" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/gopro/camera/control/wired_usb"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // Four planned files (> the streak cap) so "stopped early" is unambiguous.
+        Mock::given(method("GET")).and(path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": [ { "d": "100GOPRO", "fs": [
+                    { "n": "GX010001.MP4", "s": "10", "cre": "1", "mod": "1" },
+                    { "n": "GX010002.MP4", "s": "10", "cre": "1", "mod": "1" },
+                    { "n": "GX010003.MP4", "s": "10", "cre": "1", "mod": "1" },
+                    { "n": "GX010004.MP4", "s": "10", "cre": "1", "mod": "1" }
+                ] } ] })))
+            .mount(&server).await;
+        // Every download returns a retryable 503 (camera-unreachable stand-in:
+        // wiremock cannot drop the connection, and any retryable error trips the
+        // breaker the same way a transport `Http { status: None }` would).
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/videos/DCIM/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri())
+            .with_download_retry(1, std::time::Duration::ZERO);
+
+        let mut events = Vec::new();
+        let res = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e)).await;
+
+        assert!(
+            matches!(res, Err(CoreError::Http { status: None, .. })),
+            "got {res:?}"
+        );
+        let copying = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::Copying { .. }))
+            .count();
+        assert_eq!(
+            copying, MAX_CONSECUTIVE_OFFLINE_FILES,
+            "aborted at the streak cap, not after grinding the whole plan"
+        );
+        // A hard abort returns Err -> no RunComplete is emitted (mirrors the
+        // InsufficientSpace fatal-run path).
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, RunEvent::RunComplete { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_completed_download_resets_the_offline_streak() {
+        // The breaker counts CONSECUTIVE failures: one file the camera serves in
+        // the middle of a flaky stretch resets the streak, so an intermittently
+        // failing (but alive) camera is never aborted. Pattern fail, OK, fail, fail
+        // -> streak 1,0,1,2 (max 2 < cap) so the run completes all four files.
+        // Without the reset it would read as 1,1,2,3 and wrongly abort.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gopro/camera/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model_name": "M", "serial_number": "C357", "firmware_version": "1" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/gopro/camera/control/wired_usb"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ok_body = vec![7u8; 16];
+        Mock::given(method("GET")).and(path("/gopro/media/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media": [ { "d": "100GOPRO", "fs": [
+                    { "n": "GX010001.MP4", "s": "10", "cre": "1", "mod": "1" },
+                    { "n": "GX010002.MP4", "s": ok_body.len().to_string(), "cre": "1", "mod": "1" },
+                    { "n": "GX010003.MP4", "s": "10", "cre": "1", "mod": "1" },
+                    { "n": "GX010004.MP4", "s": "10", "cre": "1", "mod": "1" }
+                ] } ] })))
+            .mount(&server).await;
+        // Explicit per-file mocks (no overlap): only file 2 succeeds.
+        Mock::given(method("GET"))
+            .and(path("/videos/DCIM/100GOPRO/GX010002.MP4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ok_body.clone()))
+            .mount(&server)
+            .await;
+        for n in ["GX010001.MP4", "GX010003.MP4", "GX010004.MP4"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/videos/DCIM/100GOPRO/{n}")))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+        }
+
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dest.path().to_path_buf());
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        let client = GoProClient::with_base(server.uri())
+            .with_download_retry(1, std::time::Duration::ZERO);
+
+        let mut events = Vec::new();
+        let summary = run_wired_offload(&client, &cfg, &mut ledger, &mut |e| events.push(e))
+            .await
+            .expect("an intermittent failure must not abort the run");
+        assert_eq!(summary.copied, 1);
+        assert_eq!(summary.failed, 3);
+        let copying = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::Copying { .. }))
+            .count();
+        assert_eq!(copying, 4, "all four files attempted; no early abort");
     }
 }
