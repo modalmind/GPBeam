@@ -144,6 +144,26 @@ describe("Popover (working state)", () => {
     }
   });
 
+  it("shows the live transfer speed (bytes/elapsed) in the run meta", () => {
+    // Freeze the clock so elapsed is exactly 100s: 300 MiB over 100s -> 3.0 MiB/s.
+    vi.useFakeTimers();
+    try {
+      appStateStore.set({
+        ...WORKING,
+        run: {
+          ...WORKING.run!,
+          bytesDone: 300 * 1024 * 1024,
+          bytesTotal: 1024 * 1024 * 1024,
+          startedAtUnix: Math.floor(Date.now() / 1000) - 100,
+        },
+      });
+      const { getByTestId } = render(Popover);
+      expect(getByTestId("speed").textContent).toContain("3.0 MiB/s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("renders the cloud card counts and toggles pause via the binding", async () => {
     appStateStore.set(WORKING);
     const { getByTestId } = render(Popover);

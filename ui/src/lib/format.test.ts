@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { humanBytes, etaHuman, percent, bytesToGiB, giBToBytes } from "./format";
+import { humanBytes, humanRate, etaHuman, percent, bytesToGiB, giBToBytes } from "./format";
 
 describe("humanBytes", () => {
   it("formats zero and sub-KiB without decimals", () => {
@@ -18,6 +18,22 @@ describe("humanBytes", () => {
   it("clamps negatives to 0 B", () => {
     expect(humanBytes(-1)).toBe("0 B");
     expect(humanBytes(-1024)).toBe("0 B");
+  });
+});
+
+describe("humanRate", () => {
+  it("renders non-positive/non-finite rates as an em dash", () => {
+    expect(humanRate(0)).toBe("—");
+    expect(humanRate(-1)).toBe("—");
+    expect(humanRate(Number.NaN)).toBe("—");
+    expect(humanRate(Number.POSITIVE_INFINITY)).toBe("—");
+  });
+
+  it("formats a byte rate with a /s suffix, scaling like humanBytes", () => {
+    expect(humanRate(512)).toBe("512 B/s");
+    expect(humanRate(1024)).toBe("1.0 KiB/s");
+    expect(humanRate(1.5 * 1024 * 1024)).toBe("1.5 MiB/s");
+    expect(humanRate(2 * 1024 * 1024 * 1024)).toBe("2.0 GiB/s");
   });
 });
 

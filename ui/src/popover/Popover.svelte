@@ -11,7 +11,7 @@
   } from "../lib/bindings";
   import type { RunProgress } from "../lib/bindings";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { humanBytes, etaHuman, percent } from "../lib/format";
+  import { humanBytes, humanRate, etaHuman, percent } from "../lib/format";
 
   // Live application snapshot. Store is the single source of truth (design §4.1).
   $: state = $appState;
@@ -23,19 +23,25 @@
   // counts down between events. The store carries startedAtUnix + byte totals; the math
   // mirrors AppState::eta_secs on the Rust side but only for display.
   let nowUnix = Math.floor(Date.now() / 1000);
-  // Takes (run, now) as args so Svelte's reactive `$: eta` tracks BOTH — otherwise a
-  // no-arg call hides the `nowUnix` dependency and the ETA never counts down on the tick.
-  function etaSecs(r: RunProgress | null, now: number): number | null {
+  // Observed average throughput: bytes transferred so far / wall-clock elapsed.
+  // Shared by the speed readout and the ETA so the two never disagree. null until
+  // it is measurable (some bytes done AND a positive elapsed). Takes (run, now) so
+  // Svelte's reactive deps track BOTH — a no-arg call would hide `nowUnix` and the
+  // readouts would freeze instead of updating on the tick.
+  function rateBytesPerSec(r: RunProgress | null, now: number): number | null {
     if (!r) return null;
     const elapsed = now - r.startedAtUnix;
-    if (r.bytesDone <= 0 || elapsed <= 0 || r.bytesDone >= r.bytesTotal) {
-      return null;
-    }
+    if (r.bytesDone <= 0 || elapsed <= 0) return null;
     const rate = r.bytesDone / elapsed;
-    if (rate <= 0) return null;
+    return rate > 0 ? rate : null;
+  }
+  function etaSecs(r: RunProgress | null, now: number): number | null {
+    const rate = rateBytesPerSec(r, now);
+    if (!r || rate === null || r.bytesDone >= r.bytesTotal) return null;
     return Math.ceil((r.bytesTotal - r.bytesDone) / rate);
   }
   $: eta = etaSecs(run, nowUnix);
+  $: speed = rateBytesPerSec(run, nowUnix);
 
   // Reactive (not a no-arg function) so it re-derives whenever `state.status` changes;
   // a `{statusWord()}` call would be computed once and never update after hydrate.
@@ -108,6 +114,7 @@
     <div class="run-meta">
       <span data-testid="file-count">file {Math.min(run.filesDone + 1, run.filesTotal)} of {run.filesTotal}</span>
       <span data-testid="bytes">{humanBytes(run.bytesDone)} / {humanBytes(run.bytesTotal)}</span>
+      <span data-testid="speed">{humanRate(speed ?? 0)}</span>
       <span data-testid="eta">ETA {etaHuman(eta)}</span>
     </div>
   </section>
@@ -244,8 +251,9 @@
   }
   .run-meta {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
-    gap: 8px;
+    gap: 4px 8px;
     margin-top: 7px;
     font-size: 11px;
     color: #bbb;

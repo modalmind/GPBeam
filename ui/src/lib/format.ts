@@ -24,6 +24,13 @@ export function humanBytes(bytes: number): string {
   return `${value.toFixed(1)} ${UNITS[unit]}`;
 }
 
+/** Human-readable transfer rate, e.g. "12.3 MiB/s". Non-positive or non-finite
+ *  rates (idle / not-yet-measurable) render as an em dash, matching etaHuman. */
+export function humanRate(bytesPerSec: number): string {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "—";
+  return `${humanBytes(bytesPerSec)}/s`;
+}
+
 /** Human ETA from a seconds count. null/undefined/negative -> em dash.
  *  Sub-hour: M:SS (zero-padded seconds). One hour and up: H:MM:SS. */
 export function etaHuman(secs: number | null | undefined): string {
