@@ -503,9 +503,16 @@ impl GoProClient {
         Ok((total, hasher.finalize().to_hex().to_string()))
     }
 
-    /// `GET /gopro/media/delete?path={dir}/{name}` — delete a file from the
+    /// `GET /gopro/media/delete/file?path={dir}/{name}` — delete a file from the
     /// camera by its on-card path. 200 -> Ok(()); any other status -> `Http`.
     /// The Phase 4 caller treats an Err as non-fatal.
+    ///
+    /// The route MUST be `/gopro/media/delete/file` (the `/file` suffix is
+    /// required): the bare `/gopro/media/delete` is not a defined Open GoPro route
+    /// and the camera answers it with HTTP 404. Confirmed against gopro/OpenGoPro's
+    /// own SDKs — Python `endpoint="gopro/media/delete/file"` and Kotlin
+    /// `path("gopro/media/delete/file")`. (Group/all deletes live under a separate
+    /// legacy `/gp/gpControl/command/storage/delete/...` namespace; not used here.)
     pub async fn delete_path(&self, dir: &str, name: &str) -> Result<()> {
         // The Open GoPro delete endpoint requires a LITERAL '/' between dir and
         // name (`path=100GOPRO/GX010212.MP4`); a percent-encoded `%2F` is rejected
@@ -515,7 +522,7 @@ impl GoProClient {
         // dir/names are camera-generated URL-safe ASCII (`[A-Z0-9.]`), so no
         // escaping is needed — and `with_query`'s form-urlencoding (correct for
         // the slash-free `p=1` control param) would re-introduce the `%2F` bug.
-        let url = format!("{}/gopro/media/delete?path={}/{}", self.base, dir, name);
+        let url = format!("{}/gopro/media/delete/file?path={}/{}", self.base, dir, name);
         let resp = self
             .http
             .get(url.clone())
@@ -793,7 +800,7 @@ mod tests {
     async fn delete_path_hits_media_delete_endpoint() {
         let server = MockServer::start().await;
         Mock::given(wm_method("GET"))
-            .and(wm_path("/gopro/media/delete"))
+            .and(wm_path("/gopro/media/delete/file"))
             .and(query_param("path", "100GOPRO/GX010001.MP4"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
@@ -801,6 +808,27 @@ mod tests {
             .await;
         let c = GoProClient::with_base(server.uri());
         c.delete_path("100GOPRO", "GX010001.MP4").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_path_targets_open_gopro_delete_file_route() {
+        // Regression for a live-camera HTTP 404: the Open GoPro single-file delete
+        // route is `/gopro/media/delete/file` — the bare `/gopro/media/delete` is
+        // NOT a defined route and 404s. Confirmed against gopro/OpenGoPro's own
+        // Python SDK (`endpoint="gopro/media/delete/file"`) and Kotlin SDK
+        // (`path("gopro/media/delete/file")`). This mock ONLY matches the spec path
+        // with the `/file` suffix, so it fails if the client drops it.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/gopro/media/delete/file"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A bare `/gopro/media/delete` (the old buggy path) 404s here, mirroring
+        // the camera: any request that misses the mock returns 404, failing delete.
+        let c = GoProClient::with_base(server.uri());
+        c.delete_path("100GOPRO", "GX010216.MP4").await.unwrap();
     }
 
     #[tokio::test]
@@ -818,7 +846,7 @@ mod tests {
         }
         let server = MockServer::start().await;
         Mock::given(wm_method("GET"))
-            .and(wm_path("/gopro/media/delete"))
+            .and(wm_path("/gopro/media/delete/file"))
             .and(RawQueryIs("path=100GOPRO/GX010001.MP4"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
@@ -1740,7 +1768,7 @@ mod tests {
     async fn delete_sends_path_query_and_succeeds() {
         let server = MockServer::start().await;
         Mock::given(wm_method("GET"))
-            .and(wm_path("/gopro/media/delete"))
+            .and(wm_path("/gopro/media/delete/file"))
             .and(query_param("path", "100GOPRO/GX010001.MP4"))
             .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "application/json"))
             .expect(1)
@@ -1761,7 +1789,7 @@ mod tests {
     async fn delete_500_is_http_error() {
         let server = MockServer::start().await;
         Mock::given(wm_method("GET"))
-            .and(wm_path("/gopro/media/delete"))
+            .and(wm_path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;

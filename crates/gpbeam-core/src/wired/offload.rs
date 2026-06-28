@@ -763,7 +763,7 @@ mod tests {
         .await;
         // Expect exactly one delete call for the file.
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -798,7 +798,7 @@ mod tests {
         )
         .await;
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
@@ -836,7 +836,7 @@ mod tests {
         )
         .await;
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -868,7 +868,7 @@ mod tests {
         .await;
         // The camera delete must happen exactly once, on the SECOND connect.
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .and(query_param("path", "100GOPRO/GX010198.MP4"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
@@ -933,13 +933,13 @@ mod tests {
         let server = MockServer::start().await;
         // A.MP4 deletes cleanly (200); B.MP4 is already gone (404).
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .and(query_param("path", "100GOPRO/A.MP4"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .and(query_param("path", "100GOPRO/B.MP4"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
@@ -985,7 +985,7 @@ mod tests {
         // can hold a brand-new, un-uploaded recording. The reap must NOT delete it.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
@@ -1027,7 +1027,7 @@ mod tests {
         // (matching the SD/cloud path's opt-out); markers stay for a later re-enable.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/gopro/media/delete"))
+            .and(path("/gopro/media/delete/file"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
