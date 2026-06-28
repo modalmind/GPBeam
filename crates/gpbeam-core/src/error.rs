@@ -22,6 +22,13 @@ pub enum CoreError {
     /// received; `None` means a transport-level error (no response).
     #[error("http error {status:?}: {msg}")]
     Http { status: Option<u16>, msg: String },
+    /// A run was deliberately aborted mid-plan by a guard (e.g. the wired
+    /// offload circuit breaker tripping when the camera goes offline). It is a
+    /// control signal, NOT a network error — `Display` is the bare message so it
+    /// reaches the user without an `http error None:` prefix, and it is
+    /// non-retryable (the run stopped on purpose; the caller re-arms instead).
+    #[error("{0}")]
+    RunAborted(String),
     /// 401 / invalid app-password. Non-retryable; surfaced to the user with
     /// guidance to generate a Nextcloud app password.
     #[error("cloud auth error: {0}")]
@@ -102,6 +109,15 @@ mod tests {
             };
             assert!(!is_retryable(&e), "status {s} should NOT be retryable");
         }
+    }
+
+    #[test]
+    fn run_aborted_is_not_retryable_and_displays_bare_message() {
+        let e = CoreError::RunAborted("camera offline: aborting run".into());
+        // A deliberate abort must never be re-driven as a transient error.
+        assert!(!is_retryable(&e));
+        // And it must NOT carry the "http error None:" prefix into the toast.
+        assert_eq!(e.to_string(), "camera offline: aborting run");
     }
 
     #[test]
